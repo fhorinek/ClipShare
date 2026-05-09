@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClipShare</title>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.x/css/materialdesignicons.min.css" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #f5f5f5;
+    --surface: #ffffff;
+    --border: #e0e0e0;
+    --text: #202124;
+    --text-secondary: #5f6368;
+    --accent: #1a73e8;
+    --danger: #d93025;
+    --radius: 14px;
+    --shadow: 0 1px 3px rgba(0,0,0,.12), 0 2px 6px rgba(0,0,0,.08);
+    --shadow-hover: 0 4px 12px rgba(0,0,0,.15);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1e1e;
+      --surface: #2d2d2d;
+      --border: #444;
+      --text: #e8eaed;
+      --text-secondary: #9aa0a6;
+    }
+  }
+
+  body {
+    font-family: 'Google Sans', Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── Token screen ─────────────────────────────────────── */
+  #token-screen {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    gap: 16px;
+    padding: 24px;
+  }
+
+  #token-screen h1 { font-size: 2rem; font-weight: 400; margin-bottom: 8px; }
+  #token-screen p { color: var(--text-secondary); margin-bottom: 24px; text-align: center; }
+
+  .token-box {
+    background: var(--surface);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 32px;
+    width: 100%;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .token-box input {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 1.1rem;
+    background: var(--bg);
+    color: var(--text);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .token-box input:focus { border-color: var(--accent); }
+
+  .btn-row { display: flex; gap: 8px; }
+
+  button {
+    padding: 10px 18px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: .9rem;
+    font-weight: 500;
+    transition: background .15s, transform .1s;
+  }
+  button:active { transform: scale(0.97); }
+
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #1557b0; }
+  .btn-row > * { flex: 1; }
+  .btn-secondary {
+    background: var(--border);
+    color: var(--text);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-secondary:hover { filter: brightness(0.9); }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    font-size: .8rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-ghost:hover { background: var(--border); }
+  .btn-icon {
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 6px 8px;
+    border-radius: 50%;
+    font-size: 1rem;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .btn-icon:hover { background: var(--border); color: var(--text); }
+
+  /* Lucide icons */
+  .lucide { width: 15px; height: 15px; flex-shrink: 0; }
+  .btn-icon .lucide { width: 16px; height: 16px; }
+  .file-type-icon { font-size: 2.6rem; flex-shrink: 0; line-height: 1; }
+  .empty-icon .lucide { width: 52px; height: 52px; opacity: .3; stroke-width: 1.2; }
+
+  /* ── Main app ─────────────────────────────────────────── */
+  #app { display: none; flex-direction: column; min-height: 100vh; }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+
+  .logo { font-size: 1.2rem; font-weight: 500; }
+  .logo span { color: var(--accent); }
+
+  .token-chip {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: .85rem;
+    letter-spacing: 1px;
+    font-family: monospace;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+    user-select: none;
+  }
+  .token-chip:hover { background: var(--border); border-color: var(--accent); color: var(--text); }
+
+  .peer-count {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: .82rem;
+    color: var(--text-secondary);
+  }
+  .peer-count .lucide { width: 14px; height: 14px; }
+
+  .ws-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #bbb;
+    flex-shrink: 0;
+  }
+  .ws-dot.connected { background: #34a853; }
+  .ws-dot.error { background: var(--danger); }
+
+  .spacer { flex: 1; }
+
+  #https-warning {
+    background: #fef7e0;
+    color: #8a6914;
+    padding: 8px 20px;
+    font-size: .85rem;
+    border-bottom: 1px solid #f1d98a;
+    display: none;
+  }
+
+  /* ── Card grid ────────────────────────────────────────── */
+  #cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+    gap: 16px;
+    padding: 16px;
+    align-items: start;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: box-shadow .2s;
+    animation: pop-in .2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .card:hover { box-shadow: var(--shadow-hover); }
+  .card.removing {
+    animation: pop-out .18s ease-in forwards;
+    pointer-events: none;
+  }
+
+  @keyframes pop-in {
+    from { opacity: 0; transform: scale(0.88); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+  @keyframes pop-out {
+    from { opacity: 1; transform: scale(1); }
+    to   { opacity: 0; transform: scale(0.88); }
+  }
+
+  .card-body { padding: 14px; flex: 1; overflow: hidden; }
+
+  .text-content {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: .88rem;
+    font-family: inherit;
+    line-height: 1.5;
+    outline: none;
+    min-height: 1.5em;
+    max-height: 96px;
+    overflow: hidden;
+    cursor: text;
+    transition: max-height .2s;
+  }
+  .text-content:focus {
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .card-image img {
+    width: 100%;
+    border-radius: 8px;
+    display: block;
+    max-height: 180px;
+    object-fit: cover;
+  }
+
+  .card-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .file-info { overflow: hidden; flex: 1; min-width: 0; }
+  .file-name {
+    font-size: .88rem;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .file-size { font-size: .78rem; color: var(--text-secondary); margin-top: 2px; }
+
+  .progress-wrap {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    margin: 8px 0 3px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    width: 0%;
+    transition: width .1s linear;
+  }
+  .progress-label { font-size: .72rem; color: var(--accent); }
+
+  .card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    padding: 4px 8px 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .card-time {
+    flex: 1;
+    font-size: .72rem;
+    color: var(--text-secondary);
+    padding-left: 6px;
+  }
+
+  /* ── Empty state ──────────────────────────────────────── */
+  #empty {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex: 1;
+    padding: 60px 20px;
+    color: var(--text-secondary);
+  }
+  #empty .empty-icon { display: flex; align-items: center; justify-content: center; }
+  #empty p { font-size: 1rem; }
+
+  /* ── Toast ────────────────────────────────────────────── */
+  #toast-container {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 999;
+    pointer-events: none;
+  }
+  .toast {
+    background: #323232;
+    color: #fff;
+    padding: 10px 20px;
+    border-radius: 24px;
+    font-size: .88rem;
+    box-shadow: 0 4px 12px rgba(0,0,0,.3);
+    animation: slide-up .2s ease-out, fade-out .3s ease-in 1.7s forwards;
+  }
+  @keyframes slide-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fade-out {
+    to { opacity: 0; }
+  }
+
+  /* ── Mobile ───────────────────────────────────────────── */
+  @media (max-width: 600px) {
+    header {
+      padding: 0 12px;
+      gap: 8px;
+      height: auto;
+      min-height: 56px;
+      flex-wrap: wrap;
+      padding-top: 8px;
+      padding-bottom: 8px;
+    }
+    .logo { font-size: 1rem; }
+    .token-chip { font-size: .75rem; padding: 3px 10px; }
+    .peer-count { display: none; }
+
+    /* Action buttons wrap below logo row on narrow screens */
+    header .spacer:first-of-type { display: none; }
+    header .spacer:last-of-type { display: none; }
+    #btn-paste, #btn-upload, #btn-new-text {
+      flex: 1;
+      justify-content: center;
+      font-size: .8rem;
+      padding: 8px 10px;
+    }
+    #btn-leave { padding: 6px 10px; font-size: .78rem; }
+
+    #cards {
+      padding: 12px;
+      gap: 12px;
+    }
+
+    .token-box { padding: 20px; }
+    #token-screen h1 { font-size: 1.5rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Token entry screen -->
+<div id="token-screen">
+  <h1>ClipShare</h1>
+  <p>Share clipboard items across devices in real-time.<br>Enter a token to join, or create a new space.</p>
+  <div class="token-box">
+    <input id="token-input" type="text" placeholder="Enter token…" maxlength="20" autocomplete="off" spellcheck="false">
+    <div class="btn-row">
+      <button class="btn-primary" id="btn-join">Join</button>
+      <button class="btn-secondary" id="btn-create">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app">
+  <header>
+    <div class="logo">Clip<span>Share</span></div>
+    <div class="token-chip" id="header-token" onclick="copyToken()" title="Click to copy token"></div>
+    <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
+    <div class="peer-count" id="peer-count"><i data-lucide="users"></i><span id="peer-count-num">1</span></div>
+    <div class="spacer"></div>
+    <button class="btn-secondary" id="btn-paste"><i data-lucide="clipboard-paste"></i> Paste</button>
+    <button class="btn-secondary" id="btn-upload"><i data-lucide="upload"></i> Upload</button>
+    <button class="btn-secondary" id="btn-new-text"><i data-lucide="pencil-line"></i> Text</button>
+    <input type="file" id="file-input" multiple style="display:none">
+    <div class="spacer"></div>
+    <button class="btn-ghost" id="btn-leave"><i data-lucide="log-out"></i> Leave</button>
+  </header>
+
+  <div id="https-warning">
+    ⚠️ Clipboard read/write requires HTTPS. Paste buttons may not work over plain HTTP on this device.
+  </div>
+
+  <div style="display:flex;flex-direction:column;flex:1">
+    <div id="cards"></div>
+    <div id="empty">
+      <div class="empty-icon"><i data-lucide="clipboard"></i></div>
+      <p>Nothing shared yet — paste or drop something!</p>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+// ── Utilities ────────────────────────────────────────────────────────
+function randomUUID() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c =>
+    (+c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> +c / 4).toString(16)
+  );
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function humanSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+function timeAgo(ts) {
+  const diff = Math.floor((Date.now() - ts) / 1000);
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function escAttr(str) {
+  return String(str || '').replace(/"/g, '&quot;');
+}
+
+// Returns an MDI icon span with Ubuntu-style coloring
+function fileTypeIcon(mime) {
+  const m = mime || '';
+  if (m.startsWith('image/'))   return '<span class="mdi mdi-file-image file-type-icon" style="color:#26a69a"></span>';
+  if (m.startsWith('video/'))   return '<span class="mdi mdi-file-video file-type-icon" style="color:#5c6bc0"></span>';
+  if (m.startsWith('audio/'))   return '<span class="mdi mdi-file-music file-type-icon" style="color:#ec407a"></span>';
+  if (m === 'application/pdf')  return '<span class="mdi mdi-file-pdf-box file-type-icon" style="color:#ef5350"></span>';
+  if (m.includes('zip') || m.includes('tar') || m.includes('gz') || m.includes('7z') || m.includes('rar'))
+    return '<span class="mdi mdi-zip-box file-type-icon" style="color:#ffa726"></span>';
+  if (m.includes('word') || m.includes('msword') || m.includes('document'))
+    return '<span class="mdi mdi-file-word file-type-icon" style="color:#1565c0"></span>';
+  if (m.includes('sheet') || m.includes('excel') || m.includes('spreadsheet'))
+    return '<span class="mdi mdi-file-excel file-type-icon" style="color:#2e7d32"></span>';
+  if (m.includes('presentation') || m.includes('powerpoint'))
+    return '<span class="mdi mdi-file-powerpoint file-type-icon" style="color:#bf360c"></span>';
+  if (m.startsWith('text/'))
+    return '<span class="mdi mdi-file-document file-type-icon" style="color:#455a64"></span>';
+  return '<span class="mdi mdi-file file-type-icon" style="color:#78909c"></span>';
+}
+
+function showToast(msg) {
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => toast.remove(), 2100);
+}
+
+function refreshIcons() {
+  if (window.lucide) lucide.createIcons();
+}
+
+function updatePeerCount() {
+  const el = document.getElementById('peer-count-num');
+  if (el) el.textContent = clientCount;
+}
+
+async function copyToken() {
+  if (!token) return;
+  try {
+    await navigator.clipboard.writeText(token);
+    showToast('Token copied!');
+  } catch {
+    showToast(token);
+  }
+}
+
+// ── State ───────────────────────────────────────────────────────────
+const clientId = randomUUID();
+let token = null;
+let ws = null;
+let wsRetryDelay = 1000;
+let wsRetryTimer = null;
+const items = new Map();
+const fileTransfers = new Map();
+const editTimers = new Map();
+const CHUNK_SIZE = 65536;
+let clientCount = 0;
+let draggingInternal = false;
+
+// ── Startup ─────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+    document.getElementById('https-warning').style.display = 'block';
+  }
+
+  document.getElementById('btn-join').addEventListener('click', joinFromInput);
+  document.getElementById('btn-create').addEventListener('click', createAndJoin);
+  document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
+  document.getElementById('btn-leave').addEventListener('click', leaveSpace);
+  document.getElementById('btn-paste').addEventListener('click', paste);
+  document.getElementById('btn-upload').addEventListener('click', () => document.getElementById('file-input').click());
+  document.getElementById('btn-new-text').addEventListener('click', createTextCard);
+  document.getElementById('file-input').addEventListener('change', e => handleFiles(e.target.files));
+
+  document.getElementById('app').addEventListener('dragstart', () => { draggingInternal = true; });
+  document.addEventListener('dragend', () => { draggingInternal = false; });
+  document.body.addEventListener('dragover', e => e.preventDefault());
+  document.body.addEventListener('drop', e => {
+    e.preventDefault();
+    if (draggingInternal) return;
+    handleFiles(e.dataTransfer.files);
+  });
+
+  const saved = localStorage.getItem('clipshare_token');
+  if (saved) setToken(saved);
+  refreshIcons();
+});
+
+// ── Token management ────────────────────────────────────────────────
+function createAndJoin() {
+  const t = randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+  setToken(t);
+}
+
+function joinFromInput() {
+  const t = document.getElementById('token-input').value.trim().toUpperCase();
+  if (!t) return;
+  setToken(t);
+}
+
+function setToken(t) {
+  token = t;
+  localStorage.setItem('clipshare_token', t);
+  document.getElementById('token-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  document.getElementById('header-token').textContent = t;
+  connectWS();
+}
+
+function leaveSpace() {
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+  token = null;
+  localStorage.removeItem('clipshare_token');
+  items.clear();
+  fileTransfers.clear();
+  editTimers.forEach(clearTimeout);
+  editTimers.clear();
+  clientCount = 0;
+  updatePeerCount();
+  document.getElementById('cards').innerHTML = '';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('token-screen').style.display = 'flex';
+  document.getElementById('token-input').value = '';
+  setDot('disconnected');
+  updateEmpty();
+}
+
+// ── WebSocket ────────────────────────────────────────────────────────
+function connectWS() {
+  if (!token) return;
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => { wsRetryDelay = 1000; setDot('connected'); };
+  ws.onmessage = e => { try { handleServerMessage(JSON.parse(e.data)); } catch {} };
+  ws.onclose = () => {
+    setDot('disconnected');
+    wsRetryTimer = setTimeout(connectWS, wsRetryDelay);
+    wsRetryDelay = Math.min(wsRetryDelay * 2, 30000);
+  };
+  ws.onerror = () => setDot('error');
+}
+
+function setDot(state) {
+  const dot = document.getElementById('ws-dot');
+  dot.className = 'ws-dot' + (state === 'connected' ? ' connected' : state === 'error' ? ' error' : '');
+  dot.title = state === 'connected' ? 'Connected' : state === 'error' ? 'Error' : 'Reconnecting…';
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// ── Message handling ─────────────────────────────────────────────────
+function handleServerMessage(msg) {
+  if (msg.type === 'welcome') {
+    clientCount = msg.peerCount + 1;
+    updatePeerCount();
+  } else if (msg.type === 'peer_joined') {
+    clientCount++;
+    updatePeerCount();
+    sendSyncState(msg.clientId);
+  } else if (msg.type === 'peer_left') {
+    clientCount = Math.max(1, clientCount - 1);
+    updatePeerCount();
+  } else if (msg.type === 'relay') {
+    handlePayload(msg.payload);
+  }
+}
+
+function handlePayload(payload) {
+  if (!payload) return;
+
+  if (payload.type === 'sync_state') {
+    (payload.items || []).forEach(item => { if (!items.has(item.id)) items.set(item.id, item); });
+    renderAll();
+
+  } else if (payload.type === 'item_added') {
+    const item = payload.item;
+    if (item && !items.has(item.id)) {
+      items.set(item.id, item);
+      prependCard(item);
+      updateEmpty();
+    }
+
+  } else if (payload.type === 'item_deleted') {
+    items.delete(payload.itemId);
+    fileTransfers.delete(payload.itemId);
+    removeCardAnimated(payload.itemId, updateEmpty);
+
+  } else if (payload.type === 'item_updated') {
+    const item = items.get(payload.itemId);
+    if (!item || item.type !== 'text') return;
+    item.content = payload.content;
+    const el = document.querySelector(`#card-${payload.itemId} .text-content`);
+    if (el && document.activeElement !== el) el.textContent = payload.content;
+
+  } else if (payload.type === 'file_chunk') {
+    handleFileChunk(payload);
+  }
+}
+
+// ── Sync ─────────────────────────────────────────────────────────────
+function sendSyncState(targetClientId) {
+  const completeItems = [...items.values()].filter(i => i.type === 'text' || i.dataUrl);
+  wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: completeItems } });
+}
+
+// ── Adding items ─────────────────────────────────────────────────────
+async function paste() {
+  try {
+    const clipItems = await navigator.clipboard.read();
+    for (const ci of clipItems) {
+      const imageType = ci.types.find(t => t.startsWith('image/'));
+      if (imageType) {
+        const blob = await ci.getType(imageType);
+        const dataUrl = await blobToDataUrl(blob);
+        addAndBroadcast({ id: randomUUID(), type: 'image', dataUrl, filename: 'clipboard-image.' + imageType.split('/')[1], mimeType: imageType, size: blob.size, addedAt: Date.now() });
+        return;
+      }
+      if (ci.types.includes('text/plain')) {
+        const blob = await ci.getType('text/plain');
+        const content = await blob.text();
+        if (content) { addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() }); return; }
+      }
+    }
+  } catch {
+    try {
+      const content = await navigator.clipboard.readText();
+      if (content) addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() });
+    } catch (err) {
+      showToast('Could not read clipboard: ' + (err.message || err));
+    }
+  }
+}
+
+async function handleFiles(files) {
+  for (const file of files) {
+    const dataUrl = await blobToDataUrl(file);
+    const itemType = file.type.startsWith('image/') ? 'image' : 'file';
+    addAndBroadcast({ id: randomUUID(), type: itemType, dataUrl, filename: file.name, mimeType: file.type, size: file.size, addedAt: Date.now() });
+  }
+}
+
+function createTextCard() {
+  const item = { id: randomUUID(), type: 'text', content: '', addedAt: Date.now() };
+  addAndBroadcast(item);
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`#card-${item.id} .text-content`);
+    if (el) el.focus();
+  });
+}
+
+function addAndBroadcast(item) {
+  items.set(item.id, item);
+  prependCard(item);
+  updateEmpty();
+
+  if (item.type === 'text') {
+    wsSend({ type: 'relay', payload: { type: 'item_added', item } });
+  } else {
+    const { dataUrl, ...meta } = item;
+    wsSend({ type: 'relay', payload: { type: 'item_added', item: meta } });
+    sendFileChunks(item);
+  }
+}
+
+// ── Chunked file sending ─────────────────────────────────────────────
+async function sendFileChunks(item) {
+  const comma = item.dataUrl.indexOf(',');
+  const prefix = item.dataUrl.slice(0, comma + 1);
+  const b64 = item.dataUrl.slice(comma + 1);
+  const totalChunks = Math.ceil(b64.length / CHUNK_SIZE) || 1;
+
+  for (let i = 0; i < totalChunks; i++) {
+    wsSend({
+      type: 'relay',
+      payload: {
+        type: 'file_chunk',
+        itemId: item.id,
+        chunkIndex: i,
+        totalChunks,
+        prefix: i === 0 ? prefix : undefined,
+        data: b64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+      },
+    });
+    if (i % 50 === 49) await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+// ── Chunked file receiving ───────────────────────────────────────────
+function handleFileChunk({ itemId, chunkIndex, totalChunks, prefix, data }) {
+  if (!fileTransfers.has(itemId)) {
+    fileTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), received: 0, totalChunks, prefix: '' });
+  }
+  const t = fileTransfers.get(itemId);
+  if (prefix) t.prefix = prefix;
+  if (t.chunks[chunkIndex] === null) { t.chunks[chunkIndex] = data; t.received++; }
+
+  updateTransferProgress(itemId, t.received / t.totalChunks);
+
+  if (t.received === t.totalChunks) {
+    const dataUrl = t.prefix + t.chunks.join('');
+    fileTransfers.delete(itemId);
+    finalizeTransfer(itemId, dataUrl);
+  }
+}
+
+function updateTransferProgress(itemId, fraction) {
+  const pct = Math.round(fraction * 100);
+  const fill = document.querySelector(`#card-${itemId} .progress-fill`);
+  if (fill) fill.style.width = pct + '%';
+  const label = document.querySelector(`#card-${itemId} .progress-label`);
+  if (label) label.textContent = pct + '%';
+}
+
+function finalizeTransfer(itemId, dataUrl) {
+  const item = items.get(itemId);
+  if (!item) return;
+  item.dataUrl = dataUrl;
+  const card = document.getElementById('card-' + itemId);
+  if (card) card.replaceWith(buildCard(item));
+  refreshIcons();
+}
+
+// ── Text editing ─────────────────────────────────────────────────────
+function onTextEdit(id, el) {
+  const item = items.get(id);
+  if (!item) return;
+  item.content = el.innerText;
+  clearTimeout(editTimers.get(id));
+  editTimers.set(id, setTimeout(() => {
+    wsSend({ type: 'relay', payload: { type: 'item_updated', itemId: id, content: item.content } });
+  }, 500));
+}
+
+// ── Delete with animation ─────────────────────────────────────────────
+function removeCardAnimated(id, done) {
+  const el = document.getElementById('card-' + id);
+  if (!el) { done?.(); return; }
+  el.classList.add('removing');
+  el.addEventListener('animationend', () => { el.remove(); done?.(); }, { once: true });
+}
+
+function deleteItem(id) {
+  items.delete(id);
+  fileTransfers.delete(id);
+  wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } });
+  removeCardAnimated(id, updateEmpty);
+}
+
+// ── Rendering ────────────────────────────────────────────────────────
+function renderAll() {
+  const container = document.getElementById('cards');
+  container.innerHTML = '';
+  [...items.values()].sort((a, b) => b.addedAt - a.addedAt).forEach(item => container.appendChild(buildCard(item)));
+  updateEmpty();
+  refreshIcons();
+}
+
+function prependCard(item) {
+  const container = document.getElementById('cards');
+  container.insertBefore(buildCard(item), container.firstChild);
+  refreshIcons();
+}
+
+function buildCard(item) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'card-' + item.id;
+
+  let bodyHtml = '';
+  let footerActions = '';
+
+  if (item.type === 'text') {
+    bodyHtml = `<div class="card-text">
+      <div class="text-content" contenteditable="true" spellcheck="false"
+           oninput="onTextEdit('${item.id}', this)">${escHtml(item.content)}</div>
+    </div>`;
+    footerActions = `<button class="btn-icon" title="Copy" onclick="copyText('${item.id}')"><i data-lucide="copy"></i></button>`;
+
+  } else if (item.dataUrl) {
+    if (item.type === 'image') {
+      bodyHtml = `<div class="card-image"><img src="${item.dataUrl}" alt="${escAttr(item.filename || 'image')}"></div>`;
+    } else {
+      bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
+        <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
+        <div class="file-size">${humanSize(item.size)}</div>
+      </div></div>`;
+    }
+    footerActions = `<button class="btn-icon" title="Download" onclick="downloadItem('${item.id}')"><i data-lucide="download"></i></button>`;
+
+  } else {
+    bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
+      <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
+      <div class="file-size">${humanSize(item.size)}</div>
+      <div class="progress-wrap"><div class="progress-fill"></div></div>
+      <div class="progress-label">0%</div>
+    </div></div>`;
+  }
+
+  card.innerHTML = `
+    <div class="card-body">${bodyHtml}</div>
+    <div class="card-footer">
+      <span class="card-time">${timeAgo(item.addedAt)}</span>
+      ${footerActions}
+      <button class="btn-icon" title="Delete" onclick="deleteItem('${item.id}')"><i data-lucide="trash-2"></i></button>
+    </div>`;
+
+  return card;
+}
+
+function updateEmpty() {
+  const empty = document.getElementById('empty');
+  const cards = document.getElementById('cards');
+  const hasCards = cards.children.length > 0;
+  empty.style.display = hasCards ? 'none' : 'flex';
+  cards.style.display = hasCards ? 'flex' : 'none';
+}
+
+// ── Clipboard / download ─────────────────────────────────────────────
+async function copyText(id) {
+  const item = items.get(id);
+  if (!item) return;
+  try {
+    await navigator.clipboard.writeText(item.content);
+    showToast('Copied to clipboard!');
+  } catch {
+    showToast('Could not copy — try HTTPS');
+  }
+}
+
+function downloadItem(id) {
+  const item = items.get(id);
+  if (!item || !item.dataUrl) return;
+  const a = document.createElement('a');
+  a.href = item.dataUrl;
+  a.download = item.filename || 'download';
+  a.click();
+}
+</script>
+</body>
+</html>
