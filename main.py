@@ -78,6 +78,11 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/{token_path:path}")
+async def index_with_token(token_path: str):
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.websocket("/ws/{token}")
 async def websocket_endpoint(ws: WebSocket, token: str, clientId: Optional[str] = None):
     client_id = clientId or str(uuid.uuid4())
