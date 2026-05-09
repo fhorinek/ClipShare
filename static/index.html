@@ -853,7 +853,7 @@ function handlePayload(payload) {
     if (!item || item.type !== 'text') return;
     item.content = payload.content;
     const el = document.querySelector(`#card-${payload.itemId} .text-content`);
-    if (el && document.activeElement !== el) el.textContent = payload.content;
+    if (el && document.activeElement !== el) el.innerText = payload.content;
 
   } else if (payload.type === 'file_chunk') {
     handleFileChunk(payload);
@@ -997,8 +997,16 @@ function onTextEdit(id, el) {
   item.content = el.innerText;
   clearTimeout(editTimers.get(id));
   editTimers.set(id, setTimeout(() => {
-    wsSend({ type: 'relay', payload: { type: 'item_updated', itemId: id, content: item.content } });
-  }, 500));
+    flushTextUpdate(id);
+  }, 180));
+}
+
+function flushTextUpdate(id) {
+  const item = items.get(id);
+  if (!item || item.type !== 'text') return;
+  clearTimeout(editTimers.get(id));
+  editTimers.delete(id);
+  wsSend({ type: 'relay', payload: { type: 'item_updated', itemId: id, content: item.content } });
 }
 
 // ── Delete with animation ─────────────────────────────────────────────
@@ -1042,7 +1050,8 @@ function buildCard(item) {
   if (item.type === 'text') {
     bodyHtml = `<div class="card-text">
       <div class="text-content" contenteditable="true" spellcheck="false"
-           oninput="onTextEdit('${item.id}', this)">${escHtml(item.content)}</div>
+           oninput="onTextEdit('${item.id}', this)"
+           onblur="flushTextUpdate('${item.id}')">${escHtml(item.content)}</div>
     </div>`;
     footerActions = `<button class="btn-icon" title="Copy" onclick="copyText('${item.id}')"><i data-lucide="copy"></i></button>`;
 
