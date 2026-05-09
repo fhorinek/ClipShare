@@ -2,19 +2,24 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
+from typing import Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+app.mount("/vendor", StaticFiles(directory=STATIC_DIR / "vendor"), name="vendor")
+app.mount("/fonts", StaticFiles(directory=STATIC_DIR / "fonts"), name="fonts")
+
 
 class ConnectionManager:
     def __init__(self):
         # {token: {clientId: WebSocket}}
-        self.connections: dict[str, dict[str, WebSocket]] = {}
+        self.connections: Dict[str, Dict[str, WebSocket]] = {}
 
     async def connect(self, token: str, client_id: str, ws: WebSocket):
         await ws.accept()
@@ -58,7 +63,7 @@ class ConnectionManager:
         except Exception:
             pass
 
-    async def _broadcast(self, token: str, msg: dict, exclude: str | None = None):
+    async def _broadcast(self, token: str, msg: dict, exclude: Optional[str] = None):
         peers = self.connections.get(token, {})
         await asyncio.gather(
             *[self._send(ws, msg) for cid, ws in peers.items() if cid != exclude]
@@ -74,7 +79,7 @@ async def index():
 
 
 @app.websocket("/ws/{token}")
-async def websocket_endpoint(ws: WebSocket, token: str, clientId: str | None = None):
+async def websocket_endpoint(ws: WebSocket, token: str, clientId: Optional[str] = None):
     client_id = clientId or str(uuid.uuid4())
     await manager.connect(token, client_id, ws)
     try:

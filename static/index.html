@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ClipShare</title>
-<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
-<link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.x/css/materialdesignicons.min.css" rel="stylesheet">
+<script src="/vendor/lucide.min.js"></script>
+<link href="/vendor/materialdesignicons.min.css" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -37,6 +37,7 @@
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
+    overflow-x: hidden;
   }
 
   /* ── Token screen ─────────────────────────────────────── */
@@ -189,6 +190,15 @@
 
   .spacer { flex: 1; }
 
+  .action-bar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 16px;
+    display: flex;
+    gap: 8px;
+  }
+  .action-bar button { flex: 1; justify-content: center; }
+
   #https-warning {
     background: #fef7e0;
     color: #8a6914;
@@ -200,11 +210,10 @@
 
   /* ── Card grid ────────────────────────────────────────── */
   #cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
-    gap: 16px;
+    column-width: 260px;
+    column-gap: 16px;
     padding: 16px;
-    align-items: start;
+    width: 100%;
   }
 
   .card {
@@ -217,6 +226,10 @@
     overflow: hidden;
     transition: box-shadow .2s;
     animation: pop-in .2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    break-inside: avoid;
+    display: inline-block;
+    width: 100%;
+    margin-bottom: 16px;
   }
   .card:hover { box-shadow: var(--shadow-hover); }
   .card.removing {
@@ -243,14 +256,7 @@
     line-height: 1.5;
     outline: none;
     min-height: 1.5em;
-    max-height: 96px;
-    overflow: hidden;
     cursor: text;
-    transition: max-height .2s;
-  }
-  .text-content:focus {
-    max-height: 300px;
-    overflow-y: auto;
   }
 
   .card-image img {
@@ -274,7 +280,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .file-size { font-size: .78rem; color: var(--text-secondary); margin-top: 2px; }
+  .file-type { font-size: .75rem; color: var(--text-secondary); margin-top: 1px; }
+  .file-size { font-size: .75rem; color: var(--text-secondary); margin-top: 1px; }
 
   .progress-wrap {
     height: 4px;
@@ -353,35 +360,12 @@
 
   /* ── Mobile ───────────────────────────────────────────── */
   @media (max-width: 600px) {
-    header {
-      padding: 0 12px;
-      gap: 8px;
-      height: auto;
-      min-height: 56px;
-      flex-wrap: wrap;
-      padding-top: 8px;
-      padding-bottom: 8px;
-    }
+    header { padding: 0 12px; gap: 8px; }
     .logo { font-size: 1rem; }
     .token-chip { font-size: .75rem; padding: 3px 10px; }
     .peer-count { display: none; }
-
-    /* Action buttons wrap below logo row on narrow screens */
-    header .spacer:first-of-type { display: none; }
-    header .spacer:last-of-type { display: none; }
-    #btn-paste, #btn-upload, #btn-new-text {
-      flex: 1;
-      justify-content: center;
-      font-size: .8rem;
-      padding: 8px 10px;
-    }
-    #btn-leave { padding: 6px 10px; font-size: .78rem; }
-
-    #cards {
-      padding: 12px;
-      gap: 12px;
-    }
-
+    #cards { columns: 1; column-gap: 0; padding: 12px; }
+    .card { margin-bottom: 12px; }
     .token-box { padding: 20px; }
     #token-screen h1 { font-size: 1.5rem; }
   }
@@ -410,24 +394,24 @@
     <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
     <div class="peer-count" id="peer-count"><i data-lucide="users"></i><span id="peer-count-num">1</span></div>
     <div class="spacer"></div>
+    <button class="btn-ghost" id="btn-leave"><i data-lucide="log-out"></i> Leave</button>
+  </header>
+
+  <div class="action-bar">
     <button class="btn-secondary" id="btn-paste"><i data-lucide="clipboard-paste"></i> Paste</button>
     <button class="btn-secondary" id="btn-upload"><i data-lucide="upload"></i> Upload</button>
     <button class="btn-secondary" id="btn-new-text"><i data-lucide="pencil-line"></i> Text</button>
     <input type="file" id="file-input" multiple style="display:none">
-    <div class="spacer"></div>
-    <button class="btn-ghost" id="btn-leave"><i data-lucide="log-out"></i> Leave</button>
-  </header>
+  </div>
 
   <div id="https-warning">
     ⚠️ Clipboard read/write requires HTTPS. Paste buttons may not work over plain HTTP on this device.
   </div>
 
-  <div style="display:flex;flex-direction:column;flex:1">
-    <div id="cards"></div>
-    <div id="empty">
-      <div class="empty-icon"><i data-lucide="clipboard"></i></div>
-      <p>Nothing shared yet — paste or drop something!</p>
-    </div>
+  <div id="cards"></div>
+  <div id="empty">
+    <div class="empty-icon"><i data-lucide="clipboard"></i></div>
+    <p>Nothing shared yet — paste or drop something!</p>
   </div>
 </div>
 
@@ -475,6 +459,31 @@ function escAttr(str) {
 }
 
 // Returns an MDI icon span with Ubuntu-style coloring
+function fileTypeName(mime) {
+  if (!mime) return 'File';
+  const [type, sub] = mime.split('/');
+  if (type === 'image') return (sub.split('+')[0].toUpperCase()) + ' Image';
+  if (type === 'video') return (sub.split('+')[0].toUpperCase()) + ' Video';
+  if (type === 'audio') {
+    return ({ mpeg: 'MP3', ogg: 'OGG Audio', wav: 'WAV Audio', flac: 'FLAC Audio', aac: 'AAC Audio' }[sub] ?? (sub.toUpperCase() + ' Audio'));
+  }
+  if (type === 'text') {
+    return ({ plain: 'Plain Text', html: 'HTML Document', css: 'CSS File', javascript: 'JavaScript', csv: 'CSV File', xml: 'XML File', markdown: 'Markdown' }[sub] ?? (sub.toUpperCase() + ' File'));
+  }
+  if (mime === 'application/pdf') return 'PDF Document';
+  if (mime.includes('wordprocessingml') || mime.includes('msword')) return 'Word Document';
+  if (mime.includes('spreadsheetml') || mime.includes('excel')) return 'Excel Spreadsheet';
+  if (mime.includes('presentationml') || mime.includes('powerpoint')) return 'PowerPoint Presentation';
+  if (mime.includes('zip')) return 'ZIP Archive';
+  if (mime.includes('tar')) return 'TAR Archive';
+  if (mime.includes('gzip') || mime.includes('.gz')) return 'GZip Archive';
+  if (mime.includes('7z')) return '7-Zip Archive';
+  if (mime.includes('rar')) return 'RAR Archive';
+  if (mime.includes('json')) return 'JSON File';
+  if (mime.includes('xml')) return 'XML File';
+  return 'File';
+}
+
 function fileTypeIcon(mime) {
   const m = mime || '';
   if (m.startsWith('image/'))   return '<span class="mdi mdi-file-image file-type-icon" style="color:#26a69a"></span>';
@@ -694,6 +703,7 @@ async function paste() {
       const imageType = ci.types.find(t => t.startsWith('image/'));
       if (imageType) {
         const blob = await ci.getType(imageType);
+        if (blob.size > MAX_FILE_BYTES) { showToast('Clipboard image exceeds the 128 MB limit'); return; }
         const dataUrl = await blobToDataUrl(blob);
         addAndBroadcast({ id: randomUUID(), type: 'image', dataUrl, filename: 'clipboard-image.' + imageType.split('/')[1], mimeType: imageType, size: blob.size, addedAt: Date.now() });
         return;
@@ -714,8 +724,14 @@ async function paste() {
   }
 }
 
+const MAX_FILE_BYTES = 128 * 1024 * 1024;
+
 async function handleFiles(files) {
   for (const file of files) {
+    if (file.size > MAX_FILE_BYTES) {
+      showToast(`"${file.name}" exceeds the 128 MB limit`);
+      continue;
+    }
     const dataUrl = await blobToDataUrl(file);
     const itemType = file.type.startsWith('image/') ? 'image' : 'file';
     addAndBroadcast({ id: randomUUID(), type: itemType, dataUrl, filename: file.name, mimeType: file.type, size: file.size, addedAt: Date.now() });
@@ -865,6 +881,7 @@ function buildCard(item) {
     } else {
       bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
         <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
+        <div class="file-type">${fileTypeName(item.mimeType)}</div>
         <div class="file-size">${humanSize(item.size)}</div>
       </div></div>`;
     }
@@ -873,6 +890,7 @@ function buildCard(item) {
   } else {
     bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
       <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
+      <div class="file-type">${fileTypeName(item.mimeType)}</div>
       <div class="file-size">${humanSize(item.size)}</div>
       <div class="progress-wrap"><div class="progress-fill"></div></div>
       <div class="progress-label">0%</div>
@@ -895,7 +913,7 @@ function updateEmpty() {
   const cards = document.getElementById('cards');
   const hasCards = cards.children.length > 0;
   empty.style.display = hasCards ? 'none' : 'flex';
-  cards.style.display = hasCards ? 'flex' : 'none';
+  cards.style.display = hasCards ? 'block' : 'none';
 }
 
 // ── Clipboard / download ─────────────────────────────────────────────
