@@ -6,6 +6,7 @@
 <title>ClipShare</title>
 <script src="/vendor/lucide.min.js"></script>
 <link href="/vendor/materialdesignicons.min.css" rel="stylesheet">
+<script src="/vendor/qrcode.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -358,6 +359,72 @@
     to { opacity: 0; }
   }
 
+  /* ── Token modal ───────────────────────────────────────── */
+  #token-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1200;
+  }
+  #token-modal.open { display: flex; }
+  .token-modal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-hover);
+    width: 100%;
+    max-width: 420px;
+    padding: 16px;
+  }
+  .token-modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .token-modal-title { font-size: 1rem; font-weight: 500; }
+  .token-modal-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .token-modal-value {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: .86rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .token-value { letter-spacing: 1px; font-family: monospace; text-transform: uppercase; }
+  .token-modal-qr {
+    margin-top: 8px;
+    display: flex;
+    justify-content: center;
+  }
+  #token-modal-qr-code {
+    width: 180px;
+    height: 180px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #token-modal-qr-code img,
+  #token-modal-qr-code canvas {
+    border-radius: 6px;
+  }
+
   /* ── Mobile ───────────────────────────────────────────── */
   @media (max-width: 600px) {
     header { padding: 0 12px; gap: 8px; }
@@ -390,7 +457,7 @@
 <div id="app">
   <header>
     <div class="logo">Clip<span>Share</span></div>
-    <div class="token-chip" id="header-token" onclick="copyToken()" title="Click to copy token"></div>
+    <div class="token-chip" id="header-token" title="Share token"></div>
     <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
     <div class="peer-count" id="peer-count"><i data-lucide="users"></i><span id="peer-count-num">1</span></div>
     <div class="spacer"></div>
@@ -416,6 +483,25 @@
 </div>
 
 <div id="toast-container"></div>
+<div id="token-modal" aria-hidden="true">
+  <div class="token-modal-card" role="dialog" aria-modal="true" aria-labelledby="token-modal-title">
+    <div class="token-modal-head">
+      <div class="token-modal-title" id="token-modal-title">Share Space</div>
+      <button class="btn-icon" id="token-modal-close" title="Close"><i data-lucide="x"></i></button>
+    </div>
+    <div class="token-modal-row">
+      <div class="token-modal-value token-value" id="token-modal-token"></div>
+      <button class="btn-icon" id="copy-token-btn" title="Copy token"><i data-lucide="copy"></i></button>
+    </div>
+    <div class="token-modal-row">
+      <div class="token-modal-value" id="token-modal-url"></div>
+      <button class="btn-icon" id="copy-url-btn" title="Copy URL"><i data-lucide="copy"></i></button>
+    </div>
+    <div class="token-modal-qr">
+      <div id="token-modal-qr-code" aria-label="QR code for share URL"></div>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── Utilities ────────────────────────────────────────────────────────
@@ -456,6 +542,19 @@ function escHtml(str) {
 
 function escAttr(str) {
   return String(str || '').replace(/"/g, '&quot;');
+}
+
+function normalizeToken(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 20);
+}
+
+function tokenFromPath() {
+  const seg = decodeURIComponent(location.pathname || '/').replace(/^\/+|\/+$/g, '');
+  return normalizeToken(seg);
+}
+
+function tokenShareUrl(t) {
+  return `${location.origin}/${encodeURIComponent(t)}`;
 }
 
 // Returns an MDI icon span with Ubuntu-style coloring
@@ -531,6 +630,24 @@ async function copyToken() {
   }
 }
 
+async function copyShareUrl() {
+  if (!token) return;
+  const url = tokenShareUrl(token);
+  try {
+    await navigator.clipboard.writeText(url);
+    showToast('URL copied!');
+  } catch {
+    showToast(url);
+  }
+}
+
+function isEditableTarget(el) {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  const tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
 // ── State ───────────────────────────────────────────────────────────
 const clientId = randomUUID();
 let token = null;
@@ -543,6 +660,7 @@ const editTimers = new Map();
 const CHUNK_SIZE = 65536;
 let clientCount = 0;
 let draggingInternal = false;
+let tokenQr = null;
 
 // ── Startup ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -558,6 +676,20 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-upload').addEventListener('click', () => document.getElementById('file-input').click());
   document.getElementById('btn-new-text').addEventListener('click', createTextCard);
   document.getElementById('file-input').addEventListener('change', e => handleFiles(e.target.files));
+  document.getElementById('header-token').addEventListener('click', openTokenModal);
+  document.getElementById('token-modal-close').addEventListener('click', closeTokenModal);
+  document.getElementById('token-modal').addEventListener('click', e => { if (e.target.id === 'token-modal') closeTokenModal(); });
+  document.getElementById('copy-token-btn').addEventListener('click', copyToken);
+  document.getElementById('copy-url-btn').addEventListener('click', copyShareUrl);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTokenModal(); });
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+      const appVisible = document.getElementById('app').style.display !== 'none';
+      if (!appVisible || isEditableTarget(e.target)) return;
+      e.preventDefault();
+      paste();
+    }
+  });
 
   document.getElementById('app').addEventListener('dragstart', () => { draggingInternal = true; });
   document.addEventListener('dragend', () => { draggingInternal = false; });
@@ -568,8 +700,13 @@ document.addEventListener('DOMContentLoaded', () => {
     handleFiles(e.dataTransfer.files);
   });
 
-  const saved = localStorage.getItem('clipshare_token');
-  if (saved) setToken(saved);
+  const pathToken = tokenFromPath();
+  if (pathToken) {
+    setToken(pathToken);
+  } else {
+    const saved = localStorage.getItem('clipshare_token');
+    if (saved) setToken(saved);
+  }
   refreshIcons();
 });
 
@@ -586,11 +723,13 @@ function joinFromInput() {
 }
 
 function setToken(t) {
-  token = t;
-  localStorage.setItem('clipshare_token', t);
+  token = normalizeToken(t);
+  if (!token) return;
+  localStorage.setItem('clipshare_token', token);
+  history.replaceState({}, '', `/${encodeURIComponent(token)}`);
   document.getElementById('token-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
-  document.getElementById('header-token').textContent = t;
+  document.getElementById('header-token').textContent = token;
   connectWS();
 }
 
@@ -609,8 +748,40 @@ function leaveSpace() {
   document.getElementById('app').style.display = 'none';
   document.getElementById('token-screen').style.display = 'flex';
   document.getElementById('token-input').value = '';
+  history.replaceState({}, '', '/');
   setDot('disconnected');
   updateEmpty();
+}
+
+function openTokenModal() {
+  if (!token) return;
+  const url = tokenShareUrl(token);
+  document.getElementById('token-modal-token').textContent = token;
+  document.getElementById('token-modal-url').textContent = url;
+  const qrEl = document.getElementById('token-modal-qr-code');
+  qrEl.innerHTML = '';
+  if (window.QRCode) {
+    tokenQr = new QRCode(qrEl, {
+      text: url,
+      width: 170,
+      height: 170,
+      colorDark: "#111111",
+      colorLight: "#ffffff",
+      correctLevel: QRCode.CorrectLevel.M
+    });
+  } else {
+    qrEl.textContent = 'QR unavailable';
+  }
+  const modal = document.getElementById('token-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  refreshIcons();
+}
+
+function closeTokenModal() {
+  const modal = document.getElementById('token-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
 }
 
 // ── WebSocket ────────────────────────────────────────────────────────
