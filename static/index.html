@@ -403,6 +403,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: center;
   }
   .token-value { letter-spacing: 1px; font-family: monospace; text-transform: uppercase; }
   .token-modal-qr {
@@ -424,6 +425,43 @@
   #token-modal-qr-code canvas {
     border-radius: 6px;
   }
+  .token-url-wrap {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .token-url-wrap .token-modal-value {
+    white-space: normal;
+    word-break: break-all;
+  }
+
+  /* ── Confirm modals ───────────────────────────────────── */
+  .confirm-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1200;
+  }
+  .confirm-modal.open { display: flex; }
+  .confirm-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-hover);
+    width: 100%;
+    max-width: 360px;
+    padding: 16px;
+  }
+  .confirm-title { font-size: 1rem; font-weight: 500; margin-bottom: 8px; }
+  .confirm-text { color: var(--text-secondary); font-size: .9rem; margin-bottom: 14px; }
+  .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-danger:hover { filter: brightness(0.9); }
 
   /* ── Mobile ───────────────────────────────────────────── */
   @media (max-width: 600px) {
@@ -461,6 +499,7 @@
     <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
     <div class="peer-count" id="peer-count"><i data-lucide="users"></i><span id="peer-count-num">1</span></div>
     <div class="spacer"></div>
+    <button class="btn-ghost" id="btn-clear"><i data-lucide="eraser"></i> Clear</button>
     <button class="btn-ghost" id="btn-leave"><i data-lucide="log-out"></i> Leave</button>
   </header>
 
@@ -493,12 +532,32 @@
       <div class="token-modal-value token-value" id="token-modal-token"></div>
       <button class="btn-icon" id="copy-token-btn" title="Copy token"><i data-lucide="copy"></i></button>
     </div>
-    <div class="token-modal-row">
+    <div class="token-modal-qr">
+      <div id="token-modal-qr-code" aria-label="QR code for share URL"></div>
+    </div>
+    <div class="token-url-wrap">
       <div class="token-modal-value" id="token-modal-url"></div>
       <button class="btn-icon" id="copy-url-btn" title="Copy URL"><i data-lucide="copy"></i></button>
     </div>
-    <div class="token-modal-qr">
-      <div id="token-modal-qr-code" aria-label="QR code for share URL"></div>
+  </div>
+</div>
+<div id="clear-modal" class="confirm-modal" aria-hidden="true">
+  <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="clear-modal-title">
+    <div class="confirm-title" id="clear-modal-title">Clear All Cards</div>
+    <div class="confirm-text">This will remove all cards for everyone in this space.</div>
+    <div class="confirm-actions">
+      <button class="btn-secondary" id="clear-cancel">Cancel</button>
+      <button class="btn-danger" id="clear-confirm">Clear</button>
+    </div>
+  </div>
+</div>
+<div id="leave-modal" class="confirm-modal" aria-hidden="true">
+  <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="leave-modal-title">
+    <div class="confirm-title" id="leave-modal-title">Leave Space</div>
+    <div class="confirm-text">You will disconnect and return to the token screen.</div>
+    <div class="confirm-actions">
+      <button class="btn-secondary" id="leave-cancel">Cancel</button>
+      <button class="btn-danger" id="leave-confirm">Leave</button>
     </div>
   </div>
 </div>
@@ -671,7 +730,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-join').addEventListener('click', joinFromInput);
   document.getElementById('btn-create').addEventListener('click', createAndJoin);
   document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
-  document.getElementById('btn-leave').addEventListener('click', leaveSpace);
+  document.getElementById('btn-clear').addEventListener('click', openClearModal);
+  document.getElementById('btn-leave').addEventListener('click', openLeaveModal);
   document.getElementById('btn-paste').addEventListener('click', paste);
   document.getElementById('btn-upload').addEventListener('click', () => document.getElementById('file-input').click());
   document.getElementById('btn-new-text').addEventListener('click', createTextCard);
@@ -681,7 +741,13 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('token-modal').addEventListener('click', e => { if (e.target.id === 'token-modal') closeTokenModal(); });
   document.getElementById('copy-token-btn').addEventListener('click', copyToken);
   document.getElementById('copy-url-btn').addEventListener('click', copyShareUrl);
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTokenModal(); });
+  document.getElementById('clear-modal').addEventListener('click', e => { if (e.target.id === 'clear-modal') closeClearModal(); });
+  document.getElementById('leave-modal').addEventListener('click', e => { if (e.target.id === 'leave-modal') closeLeaveModal(); });
+  document.getElementById('clear-cancel').addEventListener('click', closeClearModal);
+  document.getElementById('clear-confirm').addEventListener('click', () => { closeClearModal(); clearAllItems(); });
+  document.getElementById('leave-cancel').addEventListener('click', closeLeaveModal);
+  document.getElementById('leave-confirm').addEventListener('click', () => { closeLeaveModal(); leaveSpace(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeAllModals(); });
   document.addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
       const appVisible = document.getElementById('app').style.display !== 'none';
@@ -751,6 +817,51 @@ function leaveSpace() {
   history.replaceState({}, '', '/');
   setDot('disconnected');
   updateEmpty();
+}
+
+function openClearModal() {
+  if (!items.size) return;
+  const modal = document.getElementById('clear-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeClearModal() {
+  const modal = document.getElementById('clear-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function openLeaveModal() {
+  const modal = document.getElementById('leave-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeLeaveModal() {
+  const modal = document.getElementById('leave-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function closeAllModals() {
+  closeTokenModal();
+  closeClearModal();
+  closeLeaveModal();
+}
+
+function clearAllItems() {
+  if (!items.size) return;
+  for (const id of [...items.keys()]) {
+    wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } });
+  }
+  items.clear();
+  fileTransfers.clear();
+  editTimers.forEach(clearTimeout);
+  editTimers.clear();
+  document.getElementById('cards').innerHTML = '';
+  updateEmpty();
+  showToast('All cards cleared');
 }
 
 function openTokenModal() {
