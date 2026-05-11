@@ -65,17 +65,49 @@
       <button class="btn-secondary" id="btn-paste"><i data-lucide="clipboard-paste"></i> Paste</button>
       <button class="btn-secondary" id="btn-upload"><i data-lucide="upload"></i> Upload</button>
       <button class="btn-secondary" id="btn-new-text"><i data-lucide="pencil-line"></i> Text</button>
+      <button class="btn-secondary" id="btn-chat"><i data-lucide="messages-square"></i> Chat<span class="chat-unread" id="chat-unread">0</span></button>
       <input type="file" id="file-input" multiple style="display:none">
     </div>
 
-    <div id="https-warning">
-      ⚠️ Clipboard read/write requires HTTPS. Paste buttons may not work over plain HTTP on this device.
-    </div>
+    <div class="app-workspace">
+      <main class="share-main">
+        <div id="https-warning">
+          ⚠️ Clipboard read/write requires HTTPS. Paste buttons may not work over plain HTTP on this device.
+        </div>
 
-    <div id="cards"></div>
-    <div id="empty">
-      <div class="empty-icon"><i data-lucide="clipboard"></i></div>
-      <p>Nothing shared yet — paste or drop something!</p>
+        <div id="cards"></div>
+        <div id="empty">
+          <div class="empty-icon"><i data-lucide="clipboard"></i></div>
+          <p>Nothing shared yet — paste or drop something!</p>
+        </div>
+      </main>
+
+      <aside id="chat-panel" aria-hidden="true">
+        <div class="chat-head">
+          <div class="chat-title"><i data-lucide="messages-square"></i><span>Chat</span></div>
+          <div class="chat-actions">
+            <button class="btn-icon" id="chat-archive" title="Archive chat as shared card"><i data-lucide="archive"></i></button>
+            <button class="btn-icon" id="chat-clear" title="Clear chat"><i data-lucide="eraser"></i></button>
+            <button class="btn-icon" id="chat-close" title="Close chat"><i data-lucide="panel-right-close"></i></button>
+          </div>
+        </div>
+        <div id="chat-messages"></div>
+        <div class="chat-compose">
+          <div class="chat-reply-target" id="chat-reply-target" style="display:none"></div>
+          <div class="chat-input-row">
+            <div class="chat-input-tools">
+              <button class="btn-icon chat-card-add" id="chat-card-add" type="button" title="Add card" aria-label="Add card"><i data-lucide="plus"></i></button>
+              <div class="chat-emote-picker">
+                <button class="btn-icon chat-emote-toggle" type="button" title="Emoji" aria-label="Emoji" aria-haspopup="true"><i data-lucide="smile"></i></button>
+                <div class="chat-emotes" id="chat-emotes" role="menu"></div>
+              </div>
+            </div>
+            <textarea id="chat-input" rows="2" placeholder="Message" maxlength="2000" spellcheck="true"></textarea>
+            <button class="btn-primary" id="chat-send" title="Send"><i data-lucide="send"></i></button>
+            <input type="file" id="chat-file-input" multiple style="display:none">
+          </div>
+        </div>
+      </aside>
     </div>
   </div>
 
@@ -147,6 +179,26 @@
       <div class="confirm-actions">
         <button class="btn-secondary" id="clear-cancel">Cancel</button>
         <button class="btn-danger" id="clear-confirm">Clear</button>
+      </div>
+    </div>
+  </div>
+  <div id="chat-archive-modal" class="confirm-modal" aria-hidden="true">
+    <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="chat-archive-modal-title">
+      <div class="confirm-title" id="chat-archive-modal-title">Archive Chat</div>
+      <div class="confirm-text">Archive this conversation as a shared card, then clear the chat for everyone.</div>
+      <div class="confirm-actions">
+        <button class="btn-secondary" id="chat-archive-cancel">Cancel</button>
+        <button class="btn-warning" id="chat-archive-confirm">Archive</button>
+      </div>
+    </div>
+  </div>
+  <div id="chat-clear-modal" class="confirm-modal" aria-hidden="true">
+    <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="chat-clear-modal-title">
+      <div class="confirm-title" id="chat-clear-modal-title">Clear Chat</div>
+      <div class="confirm-text">This will remove the conversation for everyone in this space.</div>
+      <div class="confirm-actions">
+        <button class="btn-secondary" id="chat-clear-cancel">Cancel</button>
+        <button class="btn-danger" id="chat-clear-confirm">Clear</button>
       </div>
     </div>
   </div>

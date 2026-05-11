@@ -668,6 +668,7 @@ function updatePeerCount() {
   container.innerHTML = html;
   container.title = `${clientCount} connected user${clientCount === 1 ? '' : 's'}`;
   refreshIcons();
+  if (chatPanelOpen) renderChatMessages();
 }
 
 async function copyToken() {
@@ -718,6 +719,10 @@ let dataWsRetryDelay = 1000;
 let wsRetryTimer = null;
 let dataWsRetryTimer = null;
 const items = new Map();
+const chatMessages = [];
+let chatPanelOpen = false;
+let unreadChatCount = 0;
+let chatReplyTargetId = null;
 const fileTransfers = new Map();   // base64/encrypted path: itemId -> {chunks,received,totalChunks,prefix}
 const binaryTransfers = new Map(); // binary path: itemId -> {chunks,received,totalChunks}
 const editTimers = new Map();
@@ -731,6 +736,23 @@ let tokenQr = null;
 let startQr = null;
 let encryptedMessageSeq = 0;
 let lastForegroundCheckAt = 0;
+
+const CHAT_EMOTES = [
+  { token: 'smile', icon: 'smile', color: '#fbbc04' },
+  { token: 'sad', icon: 'frown', color: '#fbbc04' },
+  { token: 'annoyed', icon: 'annoyed', color: '#fbbc04' },
+  { token: 'laughing', icon: 'laugh', color: '#fbbc04' },
+  { token: 'heart', icon: 'heart', color: '#d93025' },
+  { token: 'thumbs-up', icon: 'thumbs-up', color: '#1a73e8' },
+  { token: 'thumbs-down', icon: 'thumbs-down', color: '#d93025' },
+  { token: 'party-popper', icon: 'party-popper', color: '#9c27b0' },
+  { token: 'coffee', icon: 'coffee', color: '#795548' },
+  { token: 'zap', icon: 'zap', color: '#fbbc04' },
+  { token: 'flame', icon: 'flame', color: '#e8710a' },
+  { token: 'star', icon: 'star', color: '#fbbc04' },
+  { token: 'check', icon: 'check', color: '#188038' },
+  { token: 'fail', icon: 'x', color: '#d93025' },
+];
 
 // ── Peer identity (color + animal) ───────────────────────────────────
 const PEER_COLORS = [
@@ -787,6 +809,490 @@ function buildPeerIdentityMap() {
 }
 function peerPillHtml(identity, extraClass = '') {
   return `<div class="peer-pill${extraClass ? ' ' + extraClass : ''}" style="background:${identity.bg}"><i data-lucide="${identity.animalIcon}" style="color:${identity.iconColor}"></i></div>`;
+}
+
+function fallbackPeerIdentity(peerId) {
+  return {
+    bg: 'var(--bg)',
+    iconColor: 'var(--text-secondary)',
+    animalIcon: 'user',
+    fullName: peerId ? `Guest ${String(peerId).slice(0, 6)}` : 'Unknown',
+  };
+}
+
+function chatAuthorIdentity(message) {
+  const current = buildPeerIdentityMap().get(message.authorId);
+  if (current) return current;
+  if (message.authorIdentity) return message.authorIdentity;
+  return fallbackPeerIdentity(message.authorId);
+}
+
+function chatMessageFromSelf(text) {
+  const identity = buildPeerIdentityMap().get(clientId) || fallbackPeerIdentity(clientId);
+  const replyTo = chatReplyTargetId ? chatReplyPayload(chatReplyTargetId) : null;
+  return {
+    id: randomUUID(),
+    authorId: clientId,
+    authorIdentity: identity,
+    text: String(text || '').slice(0, 2000),
+    replyTo,
+    reactions: {},
+    addedAt: Date.now(),
+  };
+}
+
+function chatMessageFromCard(item) {
+  const identity = buildPeerIdentityMap().get(clientId) || fallbackPeerIdentity(clientId);
+  return {
+    id: randomUUID(),
+    authorId: clientId,
+    authorIdentity: identity,
+    text: '',
+    replyTo: null,
+    card: chatCardPayload(item),
+    reactions: {},
+    addedAt: Date.now(),
+  };
+}
+
+function normalizeChatMessage(message) {
+  const card = normalizeChatCard(message?.card);
+  if (!message?.id || (!message.text && !card)) return null;
+  return {
+    id: String(message.id),
+    authorId: String(message.authorId || ''),
+    authorIdentity: message.authorIdentity || null,
+    text: String(message.text).slice(0, 2000),
+    replyTo: normalizeChatReply(message.replyTo),
+    card,
+    reactions: normalizeChatReactions(message.reactions),
+    addedAt: Number(message.addedAt) || Date.now(),
+  };
+}
+
+function normalizeChatReply(replyTo) {
+  if (!replyTo?.id) return null;
+  const card = normalizeChatCard(replyTo.card);
+  return {
+    id: String(replyTo.id),
+    authorName: String(replyTo.authorName || 'Unknown').slice(0, 80),
+    text: String(replyTo.text || '').slice(0, 240),
+    card,
+  };
+}
+
+function chatCardPayload(item) {
+  if (!item?.id) return null;
+  return {
+    id: String(item.id),
+    type: String(item.type || 'file').slice(0, 24),
+    filename: String(item.filename || item.content || 'Card').slice(0, 160),
+    mimeType: String(item.mimeType || '').slice(0, 120),
+    size: Number(item.size) || 0,
+  };
+}
+
+function normalizeChatCard(card) {
+  if (!card?.id) return null;
+  return {
+    id: String(card.id),
+    type: String(card.type || 'file').slice(0, 24),
+    filename: String(card.filename || 'Card').slice(0, 160),
+    mimeType: String(card.mimeType || '').slice(0, 120),
+    size: Number(card.size) || 0,
+  };
+}
+
+function normalizeChatReactions(reactions = {}) {
+  const normalized = {};
+  for (const [token, reactors] of Object.entries(reactions || {})) {
+    if (!chatEmoteByToken(token) || !Array.isArray(reactors)) continue;
+    const ids = [...new Set(reactors.map(String).filter(Boolean))];
+    if (ids.length) normalized[token] = ids;
+  }
+  return normalized;
+}
+
+function chatMessageById(messageId) {
+  return chatMessages.find(message => message.id === messageId) || null;
+}
+
+function chatEmoteByToken(token) {
+  return CHAT_EMOTES.find(emote => emote.token === token) || null;
+}
+
+function chatReplyPayload(messageId) {
+  const message = chatMessageById(messageId);
+  if (!message) return null;
+  const identity = chatAuthorIdentity(message);
+  return {
+    id: message.id,
+    authorName: identity.fullName,
+    text: message.text,
+    card: message.card || null,
+  };
+}
+
+function appendChatMessage(message, { broadcast = false } = {}) {
+  const normalized = normalizeChatMessage(message);
+  if (!normalized || chatMessages.some(m => m.id === normalized.id)) return;
+  chatMessages.push(normalized);
+  chatMessages.sort((a, b) => a.addedAt - b.addedAt);
+  if (chatMessages.length > 500) chatMessages.splice(0, chatMessages.length - 500);
+  if (!chatPanelOpen && normalized.authorId !== clientId) {
+    unreadChatCount++;
+    updateChatUnreadBadge();
+  }
+  saveChatMessages();
+  renderChatMessages();
+  if (broadcast) {
+    wsSend({ type: 'relay', payload: { type: 'chat_line', message: normalized } });
+  }
+}
+
+function updateChatUnreadBadge() {
+  const badge = document.getElementById('chat-unread');
+  if (!badge) return;
+  badge.textContent = unreadChatCount > 99 ? '99+' : String(unreadChatCount);
+  badge.classList.toggle('visible', unreadChatCount > 0);
+}
+
+function chatStorageKey() {
+  return token ? `clipshare_chat_${token}` : '';
+}
+
+function saveChatMessages() {
+  const key = chatStorageKey();
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(chatMessages));
+  } catch { }
+}
+
+function loadChatMessages() {
+  const key = chatStorageKey();
+  if (!key) return;
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || '[]');
+    chatMessages.length = 0;
+    (Array.isArray(stored) ? stored : []).forEach(message => {
+      const normalized = normalizeChatMessage(message);
+      if (normalized && !chatMessages.some(m => m.id === normalized.id)) chatMessages.push(normalized);
+    });
+    chatMessages.sort((a, b) => a.addedAt - b.addedAt);
+  } catch {
+    chatMessages.length = 0;
+  }
+  renderChatMessages();
+}
+
+function renderChatText(text) {
+  const emoteMap = new Map(CHAT_EMOTES.map(e => [e.token, e]));
+  const source = String(text || '');
+  const parts = [];
+  let lastIndex = 0;
+  source.replace(/:([a-z0-9-]+):/g, (match, token, index) => {
+    parts.push(escHtml(source.slice(lastIndex, index)));
+    const emote = emoteMap.get(token);
+    parts.push(emote ? `<i data-lucide="${emote.icon}" title="${escAttr(match)}" style="color:${escAttr(emote.color)}"></i>` : escHtml(match));
+    lastIndex = index + match.length;
+    return match;
+  });
+  parts.push(escHtml(source.slice(lastIndex)));
+  return parts.join('');
+}
+
+function renderReactionIcon(token) {
+  const emote = chatEmoteByToken(token);
+  if (!emote) return '';
+  return `<i data-lucide="${emote.icon}" style="color:${escAttr(emote.color)}"></i>`;
+}
+
+function renderChatReplyPreview(replyTo) {
+  if (!replyTo) return '';
+  return `<div class="chat-reply-preview"><span>${escHtml(replyTo.authorName)}</span>${renderChatCardMention(replyTo.card, 'chat-card-mention-compact')}<div>${renderChatText(replyTo.text || (replyTo.card ? replyTo.card.filename : ''))}</div></div>`;
+}
+
+function renderChatCardMention(card, extraClass = '') {
+  if (!card) return '';
+  const typeLabel = card.type === 'image' ? 'Image' : fileTypeName(card.mimeType);
+  const sizeLabel = card.size ? humanSize(card.size) : 'Card';
+  const className = `chat-card-mention${extraClass ? ' ' + extraClass : ''}`;
+  return `<button class="${escAttr(className)}" data-action="show-card" data-card-id="${escAttr(card.id)}" title="Show card">${fileTypeIcon(card.mimeType)}<span><strong>${escHtml(card.filename)}</strong><small>${escHtml(typeLabel)} · ${escHtml(sizeLabel)}</small></span></button>`;
+}
+
+function renderChatReactions(message) {
+  const reactions = normalizeChatReactions(message.reactions);
+  const chips = Object.entries(reactions).map(([token, reactors]) => {
+    const mine = reactors.includes(clientId);
+    return `<button class="chat-reaction-chip${mine ? ' mine' : ''}" data-action="react" data-message-id="${escAttr(message.id)}" data-token="${escAttr(token)}" title=":${escAttr(token)}:">
+  ${renderReactionIcon(token)}<span>${reactors.length}</span>
+</button>`;
+  }).join('');
+  return chips ? `<div class="chat-reactions">${chips}</div>` : '';
+}
+
+function renderChatMessageActions(message) {
+  const reactionOptions = CHAT_EMOTES.map(({ token }) =>
+    `<button class="chat-reaction-option" data-action="react" data-message-id="${escAttr(message.id)}" data-token="${escAttr(token)}" title="React :${escAttr(token)}:" aria-label="React :${escAttr(token)}:">
+  ${renderReactionIcon(token)}
+</button>`
+  ).join('');
+  return `<div class="chat-message-actions">
+  <div class="chat-reaction-dropdown">
+    <button class="btn-icon chat-message-action" type="button" data-action="toggle-reactions" title="React" aria-label="React" aria-haspopup="true"><i data-lucide="smile"></i></button>
+    <div class="chat-reaction-menu" role="menu">
+      ${reactionOptions}
+    </div>
+  </div>
+  <button class="btn-icon chat-message-action" data-action="reply" data-message-id="${escAttr(message.id)}" title="Reply"><i data-lucide="reply"></i></button>
+</div>`;
+}
+
+function isEmoteOnlyChat(text) {
+  const emoteTokens = new Set(CHAT_EMOTES.map(e => e.token));
+  const source = String(text || '');
+  let stripped = source.replace(/:([a-z0-9-]+):/g, (match, token) => emoteTokens.has(token) ? '' : match);
+  try {
+    stripped = stripped.replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, '');
+    return !stripped.trim() && /(?::[a-z0-9-]+:|[\p{Extended_Pictographic}])/u.test(source);
+  } catch {
+    return !stripped.trim() && /:([a-z0-9-]+):/.test(source);
+  }
+}
+
+function scrollChatToLatest() {
+  const list = document.getElementById('chat-messages');
+  if (!list) return;
+  list.scrollTop = list.scrollHeight;
+  requestAnimationFrame(() => {
+    list.scrollTop = list.scrollHeight;
+  });
+}
+
+function renderChatMessages() {
+  const list = document.getElementById('chat-messages');
+  if (!list) return;
+  if (!chatMessages.length) {
+    list.innerHTML = '<div class="chat-empty">No messages yet</div>';
+    refreshIcons();
+    return;
+  }
+  list.innerHTML = chatMessages.map(message => {
+    const identity = chatAuthorIdentity(message);
+    const isSelf = message.authorId === clientId;
+    const emoteOnly = isEmoteOnlyChat(message.text);
+    return `<div class="chat-line${isSelf ? ' chat-line-self' : ''}" style="--chat-user-bg:${escAttr(identity.bg)};--chat-user-accent:${escAttr(identity.iconColor)}">
+  ${peerPillHtml(identity, 'peer-pill-sm')}
+  <div class="chat-bubble-wrap">
+    <div class="chat-meta"><span>${escHtml(identity.fullName)}${isSelf ? ' (You)' : ''}</span><span>${timeAgo(message.addedAt)}</span></div>
+    <div class="chat-bubble${emoteOnly ? ' chat-bubble-emote-only' : ''}">${renderChatReplyPreview(message.replyTo)}${renderChatCardMention(message.card)}${renderChatText(message.text)}</div>
+    ${renderChatReactions(message)}
+    ${renderChatMessageActions(message)}
+  </div>
+</div>`;
+  }).join('');
+  refreshIcons();
+  scrollChatToLatest();
+}
+
+function renderChatEmotes() {
+  const wrap = document.getElementById('chat-emotes');
+  if (!wrap) return;
+  wrap.innerHTML = CHAT_EMOTES.map(e =>
+    `<button class="btn-icon chat-emote" data-token="${escAttr(e.token)}" title=":${escAttr(e.token)}:"><i data-lucide="${e.icon}" style="color:${escAttr(e.color)}"></i></button>`
+  ).join('');
+  wrap.querySelectorAll('.chat-emote').forEach(btn => {
+    btn.addEventListener('click', () => insertChatEmote(btn.dataset.token));
+  });
+  refreshIcons();
+}
+
+function renderChatReplyTarget() {
+  const wrap = document.getElementById('chat-reply-target');
+  if (!wrap) return;
+  const replyTo = chatReplyTargetId ? chatReplyPayload(chatReplyTargetId) : null;
+  if (!replyTo) {
+    wrap.innerHTML = '';
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+  wrap.innerHTML = `<div class="chat-reply-target-card">
+  <div><span>${escHtml(replyTo.authorName)}</span><div>${renderChatText(replyTo.text || (replyTo.card ? replyTo.card.filename : ''))}</div></div>
+  <button class="btn-icon" id="chat-reply-cancel" title="Cancel reply"><i data-lucide="x"></i></button>
+</div>`;
+  document.getElementById('chat-reply-cancel')?.addEventListener('click', clearChatReplyTarget);
+  refreshIcons();
+}
+
+function setChatReplyTarget(messageId) {
+  if (!chatMessageById(messageId)) return;
+  chatReplyTargetId = messageId;
+  renderChatReplyTarget();
+  toggleChatPanel(true);
+}
+
+function clearChatReplyTarget() {
+  chatReplyTargetId = null;
+  renderChatReplyTarget();
+}
+
+function toggleChatReaction(messageId, token, { broadcast = true, reactorId = clientId } = {}) {
+  const message = chatMessageById(messageId);
+  if (!message || !chatEmoteByToken(token)) return;
+  const id = String(reactorId || clientId);
+  message.reactions = normalizeChatReactions(message.reactions);
+  const reactors = new Set(message.reactions[token] || []);
+  if (reactors.has(id)) reactors.delete(id);
+  else reactors.add(id);
+  if (reactors.size) message.reactions[token] = [...reactors];
+  else delete message.reactions[token];
+  saveChatMessages();
+  renderChatMessages();
+  if (broadcast) {
+    wsSend({ type: 'relay', payload: { type: 'chat_reaction', messageId, token, reactorId: id } });
+  }
+}
+
+function handleChatMessageClick(event) {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  if (button.dataset.action === 'toggle-reactions') {
+    const dropdown = button.closest('.chat-reaction-dropdown');
+    document.querySelectorAll('.chat-reaction-dropdown.open').forEach(el => {
+      if (el !== dropdown) el.classList.remove('open');
+    });
+    dropdown?.classList.toggle('open');
+    return;
+  }
+  const messageId = button.dataset.messageId;
+  if (button.dataset.action === 'react') {
+    button.closest('.chat-reaction-dropdown')?.classList.remove('open');
+    toggleChatReaction(messageId, button.dataset.token);
+  } else if (button.dataset.action === 'reply') {
+    setChatReplyTarget(messageId);
+  } else if (button.dataset.action === 'show-card') {
+    focusCard(button.dataset.cardId);
+  }
+}
+
+function insertChatEmote(tokenName) {
+  const input = document.getElementById('chat-input');
+  if (!input || !tokenName) return;
+  document.querySelector('.chat-emote-picker')?.classList.remove('open');
+  const tokenText = `:${tokenName}:`;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  const before = input.value.slice(0, start);
+  const after = input.value.slice(end);
+  const spacerBefore = before && !/\s$/.test(before) ? ' ' : '';
+  const spacerAfter = after && !/^\s/.test(after) ? ' ' : '';
+  input.value = before + spacerBefore + tokenText + spacerAfter + after;
+  const pos = before.length + spacerBefore.length + tokenText.length + spacerAfter.length;
+  input.focus();
+  input.setSelectionRange(pos, pos);
+}
+
+function focusCard(itemId) {
+  const card = document.getElementById('card-' + itemId);
+  if (!card) {
+    showToast('Card is not available yet');
+    return;
+  }
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  clearTimeout(card._flashTimer);
+  card.classList.remove('card-flash');
+  void card.offsetWidth;
+  card.classList.add('card-flash');
+  card._flashTimer = setTimeout(() => {
+    card.classList.remove('card-flash');
+    card._flashTimer = null;
+  }, 1000);
+}
+
+function toggleChatPanel(forceOpen = null) {
+  chatPanelOpen = forceOpen === null ? !chatPanelOpen : !!forceOpen;
+  const app = document.getElementById('app');
+  const panel = document.getElementById('chat-panel');
+  const btn = document.getElementById('btn-chat');
+  app?.classList.toggle('chat-open', chatPanelOpen);
+  panel?.setAttribute('aria-hidden', chatPanelOpen ? 'false' : 'true');
+  btn?.classList.toggle('active', chatPanelOpen);
+  if (chatPanelOpen) {
+    unreadChatCount = 0;
+    updateChatUnreadBadge();
+    updateChatViewportHeight();
+    renderChatMessages();
+    scrollChatToLatest();
+    setTimeout(() => document.getElementById('chat-input')?.focus(), 150);
+  }
+}
+
+function updateChatViewportHeight() {
+  const panel = document.getElementById('chat-panel');
+  if (!panel || !window.visualViewport) return;
+  panel.style.setProperty('--chat-viewport-height', `${window.visualViewport.height}px`);
+}
+
+function sendChatMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input?.value.trim();
+  if (!text) return;
+  appendChatMessage(chatMessageFromSelf(text), { broadcast: true });
+  clearChatReplyTarget();
+  input.value = '';
+}
+
+function clearChat({ broadcast = false } = {}) {
+  if (!chatMessages.length) return;
+  chatMessages.length = 0;
+  chatReplyTargetId = null;
+  unreadChatCount = 0;
+  updateChatUnreadBadge();
+  saveChatMessages();
+  renderChatReplyTarget();
+  renderChatMessages();
+  if (broadcast) wsSend({ type: 'relay', payload: { type: 'chat_cleared', clearedAt: Date.now() } });
+}
+
+function chatTranscriptText() {
+  return chatMessages.map(message => {
+    const identity = chatAuthorIdentity(message);
+    const stamp = new Date(message.addedAt).toLocaleString();
+    const reply = message.replyTo ? ` reply to ${message.replyTo.authorName}: "${message.replyTo.text}"` : '';
+    const text = message.text || (message.card ? `[card: ${message.card.filename}]` : '');
+    return `[${stamp}] ${identity.fullName}${message.authorId === clientId ? ' (You)' : ''}${reply}: ${text}`;
+  }).join('\n');
+}
+
+function archiveChatAsCard() {
+  if (!chatMessages.length) {
+    showToast('No chat to archive');
+    return;
+  }
+  const item = {
+    id: randomUUID(),
+    type: 'text',
+    content: chatTranscriptText(),
+    addedAt: Date.now(),
+  };
+  addAndBroadcast(item);
+  showToast('Chat archived as a shared card');
+}
+
+function archiveAndClearChat() {
+  if (!chatMessages.length) {
+    showToast('No chat to archive');
+    return;
+  }
+  archiveChatAsCard();
+  clearChat({ broadcast: true });
+}
+
+function sendChatHistory(targetClientId) {
+  if (!targetClientId || !chatMessages.length) return;
+  wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: [], chatMessages } });
 }
 
 // ── Transfer scheduling & outbound tracking ──────────────────────────
@@ -867,7 +1373,36 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-paste').addEventListener('click', paste);
   document.getElementById('btn-upload').addEventListener('click', () => document.getElementById('file-input').click());
   document.getElementById('btn-new-text').addEventListener('click', createTextCard);
+  document.getElementById('btn-chat').addEventListener('click', () => toggleChatPanel());
+  document.getElementById('chat-close').addEventListener('click', () => toggleChatPanel(false));
+  document.getElementById('chat-archive').addEventListener('click', openChatArchiveModal);
+  document.getElementById('chat-clear').addEventListener('click', openChatClearModal);
+  document.getElementById('chat-send').addEventListener('click', sendChatMessage);
+  document.getElementById('chat-card-add').addEventListener('click', () => document.getElementById('chat-file-input').click());
+  document.querySelector('.chat-emote-toggle')?.addEventListener('click', e => {
+    e.stopPropagation();
+    document.querySelector('.chat-emote-picker')?.classList.toggle('open');
+  });
+  document.getElementById('chat-messages').addEventListener('click', handleChatMessageClick);
+  document.getElementById('chat-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
   document.getElementById('file-input').addEventListener('change', e => handleFiles(e.target.files));
+  document.getElementById('chat-file-input').addEventListener('change', e => {
+    handleFiles(e.target.files, { mentionInChat: true });
+    e.target.value = '';
+  });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('.chat-emote-picker')) {
+      document.querySelector('.chat-emote-picker')?.classList.remove('open');
+    }
+    if (!e.target.closest('.chat-reaction-dropdown')) {
+      document.querySelectorAll('.chat-reaction-dropdown.open').forEach(el => el.classList.remove('open'));
+    }
+  });
   document.getElementById('header-token').addEventListener('click', openTokenModal);
   document.getElementById('encryption-control').addEventListener('click', () => openPassphraseModal());
   document.getElementById('peer-pills').addEventListener('click', openPeersModal);
@@ -884,9 +1419,15 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('peers-modal-close').addEventListener('click', closePeersModal);
   document.getElementById('peers-modal').addEventListener('click', e => { if (e.target.id === 'peers-modal') closePeersModal(); });
   document.getElementById('clear-modal').addEventListener('click', e => { if (e.target.id === 'clear-modal') closeClearModal(); });
+  document.getElementById('chat-archive-modal').addEventListener('click', e => { if (e.target.id === 'chat-archive-modal') closeChatArchiveModal(); });
+  document.getElementById('chat-clear-modal').addEventListener('click', e => { if (e.target.id === 'chat-clear-modal') closeChatClearModal(); });
   document.getElementById('leave-modal').addEventListener('click', e => { if (e.target.id === 'leave-modal') closeLeaveModal(); });
   document.getElementById('clear-cancel').addEventListener('click', closeClearModal);
   document.getElementById('clear-confirm').addEventListener('click', () => { closeClearModal(); clearAllItems(); });
+  document.getElementById('chat-archive-cancel').addEventListener('click', closeChatArchiveModal);
+  document.getElementById('chat-archive-confirm').addEventListener('click', () => { closeChatArchiveModal(); archiveAndClearChat(); });
+  document.getElementById('chat-clear-cancel').addEventListener('click', closeChatClearModal);
+  document.getElementById('chat-clear-confirm').addEventListener('click', () => { closeChatClearModal(); clearChat({ broadcast: true }); });
   document.getElementById('leave-cancel').addEventListener('click', closeLeaveModal);
   document.getElementById('leave-confirm').addEventListener('click', () => { closeLeaveModal(); leaveSpace(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeAllModals(); });
@@ -902,6 +1443,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!document.hidden) checkForegroundFreshness();
   });
   window.addEventListener('focus', checkForegroundFreshness);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', updateChatViewportHeight);
+    window.visualViewport.addEventListener('scroll', updateChatViewportHeight);
+  }
 
   document.getElementById('app').addEventListener('dragstart', () => { draggingInternal = true; });
   document.addEventListener('dragend', () => { draggingInternal = false; });
@@ -921,7 +1466,14 @@ document.addEventListener('DOMContentLoaded', () => {
   } else {
     loadTokenInputsFromStorage();
   }
-  setInterval(refreshCardTimes, 30000);
+  renderChatEmotes();
+  renderChatMessages();
+  renderChatReplyTarget();
+  updateChatUnreadBadge();
+  setInterval(() => {
+    refreshCardTimes();
+    if (chatPanelOpen) renderChatMessages();
+  }, 30000);
   refreshIcons();
 });
 
@@ -1001,6 +1553,8 @@ function setToken(t) {
   document.getElementById('app').style.display = 'flex';
   document.getElementById('header-token').textContent = token;
   updateEmpty();
+  loadChatMessages();
+  updateChatUnreadBadge();
   connectWS();
 }
 
@@ -1009,8 +1563,15 @@ function leaveSpace() {
   if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
   if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
   if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
+  const chatKey = chatStorageKey();
   token = null;
   items.clear();
+  if (chatKey) localStorage.removeItem(chatKey);
+  chatMessages.length = 0;
+  unreadChatCount = 0;
+  updateChatUnreadBadge();
+  renderChatMessages();
+  toggleChatPanel(false);
   cardEncryptionKeys.clear();
   peerCardMetadata.clear();
   fileTransfers.clear();
@@ -1038,6 +1599,32 @@ function openClearModal() {
 
 function closeClearModal() {
   const modal = document.getElementById('clear-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function openChatArchiveModal() {
+  if (!chatMessages.length) return;
+  const modal = document.getElementById('chat-archive-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeChatArchiveModal() {
+  const modal = document.getElementById('chat-archive-modal');
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function openChatClearModal() {
+  if (!chatMessages.length) return;
+  const modal = document.getElementById('chat-clear-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeChatClearModal() {
+  const modal = document.getElementById('chat-clear-modal');
   modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
 }
@@ -1268,7 +1855,10 @@ function closeAllModals() {
   closePassphraseModal();
   closePeersModal();
   closeClearModal();
+  closeChatArchiveModal();
+  closeChatClearModal();
   closeLeaveModal();
+  toggleChatPanel(false);
 }
 
 function clearAllItems() {
@@ -1523,6 +2113,27 @@ function encryptedMetaForMessage(msg) {
       itemId: payload.itemId,
       chunkIndex: payload.chunkIndex,
       totalChunks: payload.totalChunks
+    };
+  }
+  if (payload.type === 'chat_line') {
+    return {
+      messageType: 'relay',
+      payloadType: 'chat_line',
+      addedAt: payload.message?.addedAt
+    };
+  }
+  if (payload.type === 'chat_cleared') {
+    return {
+      messageType: 'relay',
+      payloadType: 'chat_cleared',
+      addedAt: payload.clearedAt
+    };
+  }
+  if (payload.type === 'sync_state' && payload.chatMessages?.length) {
+    return {
+      messageType: 'relay',
+      payloadType: 'sync_state',
+      addedAt: Date.now()
     };
   }
   return {
@@ -1803,6 +2414,7 @@ async function handleServerMessage(msg) {
     peerCounter = Math.max(peerCounter + 1, Number(msg.peerNumber) || 0);
     connectedPeers.set(msg.clientId, { label: String(msg.peerNumber || peerCounter), ip: msg.ip || '' });
     updatePeerCount();
+    sendSyncState(msg.clientId);
   } else if (msg.type === 'peer_left') {
     clientCount = Math.max(1, clientCount - 1);
     connectedPeers.delete(msg.clientId);
@@ -1864,7 +2476,8 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
   if (!payload) return;
 
   if (payload.type === 'sync_state') {
-    debugLog('retrieve-sync-state', { senderId, items: payload.items?.length || 0, encrypted: receivedEncrypted });
+    debugLog('retrieve-sync-state', { senderId, items: payload.items?.length || 0, chatMessages: payload.chatMessages?.length || 0, encrypted: receivedEncrypted });
+    (payload.chatMessages || []).forEach(message => appendChatMessage(message));
     if (senderId) {
       const cards = new Map();
       (payload.items || []).forEach(item => {
@@ -1922,6 +2535,12 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
     handleFileChunk(payload, senderId);
   } else if (payload.type === 'chunk_ack') {
     handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
+  } else if (payload.type === 'chat_line') {
+    appendChatMessage(payload.message);
+  } else if (payload.type === 'chat_reaction') {
+    toggleChatReaction(payload.messageId, payload.token, { broadcast: false, reactorId: payload.reactorId });
+  } else if (payload.type === 'chat_cleared') {
+    clearChat();
   }
 }
 
@@ -1930,7 +2549,16 @@ function sendSyncState(targetClientId) {
   const sendableItems = [...items.values()].filter(i =>
     i.type === 'text' || i.rawBuffer || (i.dataUrl && i.dataUrl.startsWith('data:'))
   );
-  debugLog('retrieve-send-state', { targetClientId, items: sendableItems.length });
+  const syncItems = sendableItems
+    .filter(item => !cardEncryptionKeys.get(item.id))
+    .map(item => {
+      const { dataUrl, rawBuffer, ...meta } = item;
+      return item.type === 'text' ? item : meta;
+    });
+  debugLog('retrieve-send-state', { targetClientId, items: sendableItems.length, chatMessages: chatMessages.length });
+  if (syncItems.length || chatMessages.length) {
+    wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: syncItems, chatMessages } });
+  }
   sendableItems.forEach(item => {
     const cardKey = cardEncryptionKeys.get(item.id);
     debugLog('starting', { itemId: item.id, targetClientId, type: item.type, filename: item.filename, size: item.size, encrypted: !!cardKey, source: 'sync' });
@@ -1996,7 +2624,7 @@ async function paste() {
 
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 
-async function handleFiles(files) {
+async function handleFiles(files, { mentionInChat = false } = {}) {
   for (const file of files) {
     if (file.size > MAX_FILE_BYTES) {
       showToast(`"${file.name}" exceeds the 128 MB limit`);
@@ -2010,6 +2638,7 @@ async function handleFiles(files) {
     item.dataUrl = URL.createObjectURL(file);
     await prepareImageThumbnail(item, file);
     addAndBroadcast(item);
+    if (mentionInChat) appendChatMessage(chatMessageFromCard(item), { broadcast: true });
   }
 }
 
