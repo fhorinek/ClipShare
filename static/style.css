@@ -163,6 +163,16 @@ button:active {
   background: var(--border);
 }
 
+#btn-leave {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+}
+
+#btn-leave:hover {
+  filter: brightness(0.9);
+}
+
 .btn-icon {
   background: transparent;
   color: var(--text-secondary);
@@ -576,6 +586,10 @@ header {
   display: block;
   max-height: 180px;
   object-fit: cover;
+}
+
+.card-image-meta {
+  margin-top: 10px;
 }
 
 .card-file {

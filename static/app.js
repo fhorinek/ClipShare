@@ -47,8 +47,414 @@ function escAttr(str) {
   return String(str || '').replace(/"/g, '&quot;');
 }
 
+const ESTIMATED_MIME_BY_EXTENSION = {
+  asm: 'text/assembly',
+  bash: 'text/bash',
+  bat: 'text/batch',
+  bazel: 'text/starlark',
+  bin: 'application/octet-stream',
+  bzl: 'text/starlark',
+  c: 'text/c',
+  cc: 'text/c++',
+  cfg: 'text/config',
+  clj: 'text/clojure',
+  cmake: 'text/cmake',
+  conf: 'text/config',
+  cpp: 'text/c++',
+  cpio: 'application/cpio',
+  cs: 'text/csharp',
+  css: 'text/css',
+  csv: 'text/csv',
+  cxx: 'text/c++',
+  dart: 'text/dart',
+  db: 'application/vnd.sqlite3',
+  deb: 'application/vnd.debian.binary-package',
+  desktop: 'application/x-desktop',
+  diff: 'text/patch',
+  dmesg: 'text/plain',
+  dockerfile: 'text/dockerfile',
+  dwg: 'image/vnd.dwg',
+  dxf: 'image/vnd.dxf',
+  erl: 'text/erlang',
+  ex: 'text/elixir',
+  exs: 'text/elixir',
+  f: 'text/fortran',
+  f90: 'text/fortran',
+  fish: 'text/fish',
+  flatpak: 'application/vnd.flatpak',
+  flatpakref: 'application/vnd.flatpak.ref',
+  flatpakrepo: 'application/vnd.flatpak.repo',
+  gd: 'text/gdscript',
+  gcode: 'text/g-code',
+  gerber: 'application/vnd.gerber',
+  go: 'text/go',
+  gradle: 'text/gradle',
+  groovy: 'text/groovy',
+  h: 'text/c',
+  hpp: 'text/c++',
+  hs: 'text/haskell',
+  htm: 'text/html',
+  html: 'text/html',
+  hxx: 'text/c++',
+  iges: 'model/iges',
+  igs: 'model/iges',
+  ini: 'text/config',
+  ino: 'text/arduino',
+  ipynb: 'application/vnd.jupyter',
+  java: 'text/java',
+  jl: 'text/julia',
+  js: 'text/javascript',
+  json: 'application/json',
+  json5: 'application/json5',
+  jsonc: 'application/jsonc',
+  jsx: 'text/jsx',
+  kicad_mod: 'application/vnd.kicad.module',
+  kicad_pcb: 'application/vnd.kicad.pcb',
+  kicad_sch: 'application/vnd.kicad.schematic',
+  kts: 'text/kotlin',
+  kt: 'text/kotlin',
+  lhs: 'text/haskell',
+  list: 'text/plain',
+  lock: 'text/plain',
+  log: 'text/plain',
+  lua: 'text/lua',
+  m: 'text/objective-c',
+  make: 'text/makefile',
+  markdown: 'text/markdown',
+  md: 'text/markdown',
+  mjs: 'text/javascript',
+  mm: 'text/objective-c++',
+  net: 'text/spice',
+  nim: 'text/nim',
+  obj: 'model/obj',
+  patch: 'text/patch',
+  php: 'application/php',
+  pl: 'text/perl',
+  plist: 'application/xml',
+  pm: 'text/perl',
+  policy: 'text/selinux-policy',
+  proto: 'text/protobuf',
+  ps1: 'text/powershell',
+  psm1: 'text/powershell',
+  py: 'text/python',
+  pyw: 'text/python',
+  r: 'text/r',
+  rb: 'text/ruby',
+  rpm: 'application/x-rpm',
+  rs: 'text/rust',
+  scala: 'text/scala',
+  scad: 'text/openscad',
+  scm: 'text/scheme',
+  sh: 'text/bash',
+  service: 'text/systemd-unit',
+  spice: 'text/spice',
+  sql: 'application/sql',
+  sqlite: 'application/vnd.sqlite3',
+  sqlite3: 'application/vnd.sqlite3',
+  step: 'model/step',
+  stp: 'model/step',
+  stl: 'model/stl',
+  sv: 'text/systemverilog',
+  svelte: 'text/svelte',
+  swap: 'application/octet-stream',
+  swift: 'text/swift',
+  tcl: 'text/tcl',
+  tex: 'text/tex',
+  text: 'text/plain',
+  tf: 'text/hcl',
+  toml: 'application/toml',
+  ts: 'text/typescript',
+  tsx: 'text/tsx',
+  txt: 'text/plain',
+  v: 'text/verilog',
+  vapi: 'text/vala',
+  vala: 'text/vala',
+  vhd: 'text/vhdl',
+  vhdl: 'text/vhdl',
+  vue: 'text/vue',
+  xml: 'application/xml',
+  xsession: 'text/bash',
+  yaml: 'application/yaml',
+  yml: 'application/yaml',
+  zig: 'text/zig',
+  zsh: 'text/zsh',
+};
+
+const ESTIMATED_MIME_BY_BASENAME = {
+  '.clang-format': 'text/yaml',
+  '.dockerignore': 'text/plain',
+  '.editorconfig': 'text/config',
+  '.env': 'text/environment',
+  '.env.example': 'text/environment',
+  '.gtkrc-2.0': 'text/config',
+  '.gitattributes': 'text/plain',
+  '.gitignore': 'text/plain',
+  '.gitmodules': 'text/config',
+  '.inputrc': 'text/readline-config',
+  '.profile': 'text/bash',
+  '.prettierrc': 'application/json',
+  '.xinitrc': 'text/bash',
+  '.xprofile': 'text/bash',
+  '.xresources': 'text/xresources',
+  '.zprofile': 'text/zsh',
+  'authorized_keys': 'text/ssh-authorized-keys',
+  'bash.bashrc': 'text/bash',
+  'bashrc': 'text/bash',
+  'crontab': 'text/cron',
+  'fstab': 'text/fstab',
+  'group': 'text/passwd',
+  'hosts': 'text/hosts',
+  'hostname': 'text/plain',
+  'interfaces': 'text/network-interfaces',
+  'ld.so.conf': 'text/config',
+  'locale.conf': 'text/config',
+  'mime.types': 'text/mime-types',
+  'modules': 'text/plain',
+  'motd': 'text/plain',
+  'nsswitch.conf': 'text/config',
+  'os-release': 'text/os-release',
+  'passwd': 'text/passwd',
+  'profile': 'text/bash',
+  'resolv.conf': 'text/resolv-conf',
+  'shadow': 'text/passwd',
+  'shells': 'text/plain',
+  'sudoers': 'text/sudoers',
+  'sysctl.conf': 'text/sysctl-conf',
+  'tmpfiles.conf': 'text/tmpfiles-conf',
+  'udev.conf': 'text/udev-rules',
+  'cmakelists.txt': 'text/cmake',
+  'dockerfile': 'text/dockerfile',
+  'gemfile': 'text/ruby',
+  'go.mod': 'text/go',
+  'go.sum': 'text/plain',
+  'justfile': 'text/makefile',
+  'makefile': 'text/makefile',
+  'package-lock.json': 'application/json',
+  'package.json': 'application/json',
+  'podfile': 'text/ruby',
+  'procfile': 'text/plain',
+  'rakefile': 'text/ruby',
+  'requirements.txt': 'text/plain',
+  'vagrantfile': 'text/ruby',
+};
+
+const FILE_TYPE_LABELS = {
+  'application/json': 'JSON File',
+  'application/json5': 'JSON5 File',
+  'application/jsonc': 'JSONC File',
+  'application/cpio': 'CPIO Archive',
+  'application/octet-stream': 'Binary File',
+  'application/php': 'PHP Source',
+  'application/sql': 'SQL File',
+  'application/toml': 'TOML File',
+  'application/vnd.gerber': 'Gerber File',
+  'application/vnd.jupyter': 'Jupyter Notebook',
+  'application/vnd.kicad.module': 'KiCad Footprint',
+  'application/vnd.kicad.pcb': 'KiCad PCB',
+  'application/vnd.kicad.schematic': 'KiCad Schematic',
+  'application/vnd.sqlite3': 'SQLite Database',
+  'application/vnd.debian.binary-package': 'Debian Package',
+  'application/vnd.flatpak': 'Flatpak Bundle',
+  'application/vnd.flatpak.ref': 'Flatpak Ref',
+  'application/vnd.flatpak.repo': 'Flatpak Repo',
+  'application/x-desktop': 'Desktop Entry',
+  'application/x-rpm': 'RPM Package',
+  'application/yaml': 'YAML File',
+  'image/vnd.dwg': 'DWG Drawing',
+  'image/vnd.dxf': 'DXF Drawing',
+  'text/arduino': 'Arduino Source',
+  'text/apparmor-profile': 'AppArmor Profile',
+  'text/apt-sources': 'APT Sources',
+  'text/assembly': 'Assembly Source',
+  'text/bash': 'Bash Script',
+  'text/batch': 'Batch Script',
+  'text/c': 'C Source',
+  'text/c++': 'C++ Source',
+  'text/clojure': 'Clojure Source',
+  'text/cmake': 'CMake File',
+  'text/config': 'Config File',
+  'text/cron': 'Cron File',
+  'text/csharp': 'C# Source',
+  'text/dart': 'Dart Source',
+  'text/dockerfile': 'Dockerfile',
+  'text/elixir': 'Elixir Source',
+  'text/environment': 'Environment File',
+  'text/erlang': 'Erlang Source',
+  'text/fish': 'Fish Script',
+  'text/fortran': 'Fortran Source',
+  'text/g-code': 'G-code File',
+  'text/gdscript': 'GDScript Source',
+  'text/go': 'Go Source',
+  'text/gradle': 'Gradle File',
+  'text/groovy': 'Groovy Source',
+  'text/haskell': 'Haskell Source',
+  'text/hcl': 'Terraform File',
+  'text/hosts': 'Hosts File',
+  'text/java': 'Java Source',
+  'text/javascript': 'JavaScript',
+  'text/jsx': 'JSX Source',
+  'text/julia': 'Julia Source',
+  'text/kotlin': 'Kotlin Source',
+  'text/lua': 'Lua Source',
+  'text/makefile': 'Makefile',
+  'text/mime-types': 'MIME Types File',
+  'text/network-interfaces': 'Network Interfaces',
+  'text/nim': 'Nim Source',
+  'text/objective-c': 'Objective-C Source',
+  'text/objective-c++': 'Objective-C++ Source',
+  'text/openscad': 'OpenSCAD File',
+  'text/patch': 'Patch File',
+  'text/perl': 'Perl Source',
+  'text/passwd': 'Account Database',
+  'text/powershell': 'PowerShell Script',
+  'text/protobuf': 'Protocol Buffer',
+  'text/python': 'Python Source',
+  'text/r': 'R Source',
+  'text/ruby': 'Ruby Source',
+  'text/rust': 'Rust Source',
+  'text/readline-config': 'Readline Config',
+  'text/resolv-conf': 'Resolver Config',
+  'text/scala': 'Scala Source',
+  'text/scheme': 'Scheme Source',
+  'text/selinux-policy': 'SELinux Policy',
+  'text/ssh-authorized-keys': 'SSH Authorized Keys',
+  'text/starlark': 'Starlark File',
+  'text/spice': 'SPICE Netlist',
+  'text/sudoers': 'Sudoers File',
+  'text/svelte': 'Svelte Component',
+  'text/swift': 'Swift Source',
+  'text/sysctl-conf': 'Sysctl Config',
+  'text/systemverilog': 'SystemVerilog Source',
+  'text/systemd-unit': 'Systemd Unit',
+  'text/tcl': 'Tcl Script',
+  'text/tex': 'TeX File',
+  'text/tmpfiles-conf': 'Tmpfiles Config',
+  'text/tsx': 'TSX Source',
+  'text/typescript': 'TypeScript',
+  'text/udev-rules': 'Udev Rules',
+  'text/vala': 'Vala Source',
+  'text/verilog': 'Verilog Source',
+  'text/vhdl': 'VHDL Source',
+  'text/vue': 'Vue Component',
+  'text/xresources': 'X Resources',
+  'text/yaml': 'YAML File',
+  'text/zig': 'Zig Source',
+  'text/zsh': 'Zsh Script',
+  'model/iges': 'IGES Model',
+  'model/obj': 'OBJ Model',
+  'model/step': 'STEP Model',
+  'model/stl': 'STL Model',
+};
+
+function filenameExtension(filename = '') {
+  const clean = String(filename).toLowerCase().split(/[?#]/)[0];
+  const dot = clean.lastIndexOf('.');
+  return dot >= 0 ? clean.slice(dot + 1) : '';
+}
+
+function isGenericFileMime(mime = '') {
+  const m = String(mime).toLowerCase();
+  return !m || m === 'application/octet-stream';
+}
+
+function normalizeKnownFileMime(mime = '') {
+  const m = String(mime).toLowerCase();
+  if (['text/x-python', 'application/x-python-code'].includes(m)) return 'text/python';
+  if (['application/x-sqlite3', 'application/x-sqlite', 'application/vnd.sqlite3'].includes(m)) return 'application/vnd.sqlite3';
+  if (['text/x-shellscript', 'application/x-sh', 'application/x-shellscript'].includes(m)) return 'text/bash';
+  if (['application/x-ipynb+json', 'application/x-jupyter-notebook'].includes(m)) return 'application/vnd.jupyter';
+  if (m === 'application/x-yaml') return 'application/yaml';
+  if (m === 'application/x-toml') return 'application/toml';
+  if (m === 'text/x-c') return 'text/c';
+  if (['text/x-c++src', 'text/x-c++hdr'].includes(m)) return 'text/c++';
+  if (m === 'text/x-java-source') return 'text/java';
+  if (m === 'text/x-go') return 'text/go';
+  if (m === 'text/x-rustsrc') return 'text/rust';
+  if (m === 'text/x-ruby') return 'text/ruby';
+  if (m === 'text/x-php') return 'application/php';
+  if (m === 'text/x-diff') return 'text/patch';
+  return m;
+}
+
+function estimateMimeTypeFromName(filename = '') {
+  const clean = String(filename).toLowerCase().split(/[?#]/)[0];
+  const basename = clean.split(/[\\/]/).pop();
+  if (ESTIMATED_MIME_BY_BASENAME[basename]) return ESTIMATED_MIME_BY_BASENAME[basename];
+  if (/\.service$|\.socket$|\.timer$|\.mount$|\.automount$|\.target$|\.path$|\.slice$|\.scope$/.test(basename)) return 'text/systemd-unit';
+  if (/\.rules$/.test(basename)) return 'text/udev-rules';
+  if (/\.desktop$/.test(basename)) return 'application/x-desktop';
+  if (/\.apparmor$|^apparmor\./.test(basename)) return 'text/apparmor-profile';
+  if (/^(?:nginx|apache2?|httpd|sshd|ssh|journald|logind|resolved|timesyncd|systemd|pam|modprobe|modules-load|rsyslog|logrotate)\.conf$/.test(basename)) return 'text/config';
+  if (/^(?:sources\.list|.*\.list)$/.test(basename) && /(?:^|[/\\])apt(?:[/\\]|$)/.test(clean)) return 'text/apt-sources';
+  if (/(?:^|[/\\])(?:sysctl\.d|tmpfiles\.d|modules-load\.d|modprobe\.d|sudoers\.d|logrotate\.d|pam\.d|udev[/\\]rules\.d)(?:[/\\]|$)/.test(clean)) return 'text/config';
+  const ext = filenameExtension(filename);
+  return ESTIMATED_MIME_BY_EXTENSION[ext] || '';
+}
+
+function isLikelyText(bytes) {
+  if (!bytes?.length) return false;
+  const sampleLength = Math.min(bytes.length, 4096);
+  let printable = 0;
+  for (let i = 0; i < sampleLength; i++) {
+    const byte = bytes[i];
+    if (byte === 0) return false;
+    if (byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte <= 126) || byte >= 128) printable++;
+  }
+  return printable / sampleLength > 0.92;
+}
+
+async function estimateFileMimeType(file) {
+  const byName = estimateMimeTypeFromName(file.name);
+  if (byName) return byName;
+
+  const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());
+  const sqliteMagic = 'SQLite format 3';
+  if (head.length >= sqliteMagic.length) {
+    const magic = String.fromCharCode(...head.slice(0, sqliteMagic.length));
+    if (magic === sqliteMagic) return 'application/vnd.sqlite3';
+  }
+
+  if (!isLikelyText(head)) return '';
+  const textHead = new TextDecoder('utf-8', { fatal: false }).decode(head);
+  const firstLine = textHead.split(/\r?\n/, 1)[0].toLowerCase();
+  if (firstLine.startsWith('#!')) {
+    if (/\bpython(?:\d(?:\.\d+)?)?\b/.test(firstLine)) return 'text/python';
+    if (/\bnode\b/.test(firstLine)) return 'text/javascript';
+    if (/\bruby\b/.test(firstLine)) return 'text/ruby';
+    if (/\bperl\b/.test(firstLine)) return 'text/perl';
+    if (/\bphp\b/.test(firstLine)) return 'application/php';
+    if (/\bpwsh|powershell\b/.test(firstLine)) return 'text/powershell';
+    if (/\b(?:ba|z|k)?sh\b/.test(firstLine)) return 'text/bash';
+  }
+
+  try {
+    const parsed = JSON.parse(textHead);
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.cells) && parsed.nbformat) {
+      return 'application/vnd.jupyter';
+    }
+    return 'application/json';
+  } catch {}
+
+  if (/^\s*(?:---\s*[\r\n]|[\w.-]+\s*:)/.test(textHead)) return 'application/yaml';
+  if (/^\s*<\?xml\b/.test(textHead) || /^\s*<[\w:-]+[\s>]/.test(textHead)) return 'application/xml';
+  if (/^\s*(?:select|insert|update|delete|create|alter|drop)\b/i.test(textHead)) return 'application/sql';
+  if (/^\s*diff --git\b/m.test(textHead) || /^\s*@@\s+-\d+/m.test(textHead)) return 'text/patch';
+  if (/^\s*\[(?:unit|service|install|socket|timer|mount|automount|path|slice|target)\]\s*$/im.test(textHead)) return 'text/systemd-unit';
+  if (/^\s*\[desktop entry\]\s*$/im.test(textHead)) return 'application/x-desktop';
+  if (/^\s*(?:deb|deb-src)\s+\S+\s+\S+/m.test(textHead)) return 'text/apt-sources';
+  if (/^\s*(?:[A-Za-z0-9_*?-]+(?:==?|!=|:=|\+=|-=)|SUBSYSTEM(?:==|!=)|ACTION(?:==|!=)|KERNEL(?:==|!=))/m.test(textHead)) return 'text/udev-rules';
+  if (/^\s*[\w.-]+\s*=\s*[-\w./: ]+\s*$/m.test(textHead)) return 'text/sysctl-conf';
+  if (/^\s*(?:@(?:reboot|yearly|annually|monthly|weekly|daily|hourly)|(?:\S+\s+){5}\S+)/m.test(textHead)) return 'text/cron';
+  if (/^\s*(?:root|%[\w-]+|\w+)\s+(?:ALL|\S+)=/.test(textHead)) return 'text/sudoers';
+  if (/^\s*(?:\S+\s+){5}\S+\s+\d+\s+\d+\s*$/m.test(textHead)) return 'text/fstab';
+  if (/^\s*(?:\d{1,3}\.){3}\d{1,3}\s+\S+/m.test(textHead) || /^\s*[a-f0-9:]{2,}\s+\S+/im.test(textHead)) return 'text/hosts';
+  if (/^\s*[^:\n]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^:\n]*\s*$/m.test(textHead)) return 'text/passwd';
+
+  return 'text/plain';
+}
+
 const TOKEN_MAX_LENGTH = 40;
-const PASSPHRASE_ADJECTIVES = [
+const TOKEN_ADJECTIVES = [
   'able', 'active', 'blue', 'bold', 'brave', 'bright', 'calm', 'clean',
   'clear', 'clever', 'cool', 'deep', 'dry', 'early', 'easy', 'fair',
   'fast', 'fine', 'fresh', 'gentle', 'glad', 'good', 'grand', 'green',
@@ -67,7 +473,7 @@ const PASSPHRASE_ADJECTIVES = [
   'humble', 'ideal', 'loose', 'normal', 'perfect', 'pretty', 'rare', 'regular',
   'silent', 'slow', 'square', 'stable', 'tough', 'vast', 'whole', 'wild'
 ];
-const PASSPHRASE_NOUNS = [
+const TOKEN_NOUNS = [
   'apple', 'beach', 'bird', 'book', 'bread', 'bridge', 'cloud', 'desk',
   'door', 'dream', 'field', 'fire', 'flower', 'forest', 'friend', 'garden',
   'hill', 'home', 'house', 'key', 'lake', 'leaf', 'light', 'market',
@@ -102,14 +508,19 @@ function normalizeToken(value) {
 }
 
 function formatToken(value) {
-  return normalizeToken(value);
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .slice(0, TOKEN_MAX_LENGTH);
 }
 
 function generateToken() {
   const bytes = new Uint8Array(2);
   crypto.getRandomValues(bytes);
-  const adjective = PASSPHRASE_ADJECTIVES[bytes[0] % PASSPHRASE_ADJECTIVES.length];
-  const noun = PASSPHRASE_NOUNS[bytes[1] % PASSPHRASE_NOUNS.length];
+  const adjective = TOKEN_ADJECTIVES[bytes[0] % TOKEN_ADJECTIVES.length];
+  const noun = TOKEN_NOUNS[bytes[1] % TOKEN_NOUNS.length];
   return `${adjective}-${noun}`;
 }
 
@@ -136,6 +547,7 @@ function tokenShareUrl(t, passphrase = currentPassphrase) {
 // Returns an MDI icon span with Ubuntu-style coloring
 function fileTypeName(mime) {
   if (!mime) return 'File';
+  if (FILE_TYPE_LABELS[mime]) return FILE_TYPE_LABELS[mime];
   const [type, sub] = mime.split('/');
   if (type === 'image') return (sub.split('+')[0].toUpperCase()) + ' Image';
   if (type === 'video') return (sub.split('+')[0].toUpperCase()) + ' Video';
@@ -173,6 +585,10 @@ function fileTypeIcon(mime) {
     return '<span class="mdi mdi-file-excel file-type-icon" style="color:#2e7d32"></span>';
   if (m.includes('presentation') || m.includes('powerpoint'))
     return '<span class="mdi mdi-file-powerpoint file-type-icon" style="color:#bf360c"></span>';
+  if (m === 'application/vnd.sqlite3')
+    return '<span class="mdi mdi-database file-type-icon" style="color:#6d4c41"></span>';
+  if (FILE_TYPE_LABELS[m] || m.startsWith('model/'))
+    return '<span class="mdi mdi-file-code file-type-icon" style="color:#455a64"></span>';
   if (m.startsWith('text/'))
     return '<span class="mdi mdi-file-document file-type-icon" style="color:#455a64"></span>';
   return '<span class="mdi mdi-file file-type-icon" style="color:#78909c"></span>';
@@ -307,6 +723,8 @@ const binaryTransfers = new Map(); // binary path: itemId -> {chunks,received,to
 const editTimers = new Map();
 const CHUNK_SIZE = 65536;        // base64 chars per chunk (encrypted path)
 const BINARY_CHUNK_SIZE = 65536; // bytes per chunk (binary path)
+const CHUNK_RETRY_DELAY_MS = 1200;
+const CHUNK_RETRY_MAX_ATTEMPTS = 3;
 let clientCount = 0;
 let draggingInternal = false;
 let tokenQr = null;
@@ -1503,7 +1921,7 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
     if (receivedEncrypted && payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
     handleFileChunk(payload, senderId);
   } else if (payload.type === 'chunk_ack') {
-    handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks);
+    handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
   }
 }
 
@@ -1584,8 +2002,10 @@ async function handleFiles(files) {
       showToast(`"${file.name}" exceeds the 128 MB limit`);
       continue;
     }
-    const itemType = file.type.startsWith('image/') ? 'image' : 'file';
-    const item = { id: randomUUID(), type: itemType, filename: file.name, mimeType: file.type, size: file.size, addedAt: Date.now() };
+    const providedMimeType = normalizeKnownFileMime(file.type);
+    const mimeType = isGenericFileMime(providedMimeType) ? (await estimateFileMimeType(file)) || providedMimeType : providedMimeType;
+    const itemType = mimeType.startsWith('image/') ? 'image' : 'file';
+    const item = { id: randomUUID(), type: itemType, filename: file.name, mimeType, size: file.size, addedAt: Date.now() };
     item.rawBuffer = await file.arrayBuffer();
     item.dataUrl = URL.createObjectURL(file);
     await prepareImageThumbnail(item, file);
@@ -1629,6 +2049,37 @@ function addAndBroadcast(item) {
 
 // ── Chunked file sending (data-url path) ────────────────────────────
 
+async function sendDataUrlChunk(item, keyOverride, targetClientId, chunkIndex, totalChunks, prefix, b64) {
+  if (!items.has(item.id)) return;
+  if (!await waitForDataWS()) return;
+  await drainWS();
+  await wsSend({
+    type: 'relay',
+    targetId: targetClientId || undefined,
+    payload: {
+      type: 'file_chunk',
+      itemId: item.id,
+      chunkIndex,
+      totalChunks,
+      ...(chunkIndex === 0 ? { prefix } : {}),
+      data: b64.slice(chunkIndex * CHUNK_SIZE, (chunkIndex + 1) * CHUNK_SIZE),
+    },
+  }, keyOverride, false, true);
+}
+
+async function resendDataUrlChunks(item, keyOverride, targetClientId, chunkIndexes) {
+  const dataUrl = item.dataUrl && item.dataUrl.startsWith('data:') ? item.dataUrl : null;
+  if (!dataUrl) return;
+  const comma = dataUrl.indexOf(',');
+  const prefix = dataUrl.slice(0, comma + 1);
+  const b64 = dataUrl.slice(comma + 1);
+  const totalChunks = Math.ceil(b64.length / CHUNK_SIZE) || 1;
+  for (const i of chunkIndexes) {
+    if (i < 0 || i >= totalChunks) continue;
+    await sendDataUrlChunk(item, keyOverride, targetClientId, i, totalChunks, prefix, b64);
+  }
+}
+
 async function* fileChunkGenerator(item, keyOverride, targetClientId, onProgress) {
   // Get base64 content: from dataUrl (base64 form) only — rawBuffer items use binary path
   const dataUrl = item.dataUrl && item.dataUrl.startsWith('data:') ? item.dataUrl : null;
@@ -1641,31 +2092,21 @@ async function* fileChunkGenerator(item, keyOverride, targetClientId, onProgress
 
   for (let i = 0; i < totalChunks; i++) {
     if (!items.has(item.id)) return;
-    if (!await waitForDataWS()) return;
-    await drainWS();
-    await wsSend({
-      type: 'relay',
-      targetId: targetClientId || undefined,
-      payload: {
-        type: 'file_chunk',
-        itemId: item.id,
-        chunkIndex: i,
-        totalChunks,
-        ...(i === 0 ? { prefix } : {}),
-        data: b64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
-      },
-    }, keyOverride, false, true);
+    await sendDataUrlChunk(item, keyOverride, targetClientId, i, totalChunks, prefix, b64);
     onProgress(i + 1, totalChunks);
     debugProgress('progress-send', item.id, i + 1, totalChunks, { targetClientId: targetClientId || 'broadcast', path: keyOverride ? 'encrypted-base64' : 'base64' });
     yield;
   }
+  if (targetClientId) markOutboundInitialDone(item.id, [targetClientId]);
+  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
   debugLog('finish-send', { itemId: item.id, targetClientId: targetClientId || 'broadcast', path: keyOverride ? 'encrypted-base64' : 'base64', totalChunks });
 }
 
 function sendFileChunks(item, keyOverride = null, targetClientId = null) {
   if (targetClientId) {
     // Targeted send — single row
-    const onProgress = clientCount > 1 ? makeOutboundProgress(item.id, targetClientId) : () => {};
+    const resendMissing = indexes => resendDataUrlChunks(item, keyOverride, targetClientId, indexes);
+    const onProgress = makeOutboundProgress(item.id, targetClientId, resendMissing);
     chunkScheduler.enqueue(item.id, -(item.size || 0),
       () => fileChunkGenerator(item, keyOverride, targetClientId, onProgress));
     return;
@@ -1679,24 +2120,17 @@ function sendFileChunks(item, keyOverride = null, targetClientId = null) {
     return;
   }
 
-  if (!outboundTransfers.has(item.id)) outboundTransfers.set(item.id, new Map());
-  const peerMap = outboundTransfers.get(item.id);
-  for (const pid of peerIds) peerMap.set(pid, { sent: 0, total: 0, startTime: Date.now() });
-  refreshOutboundUI(item.id);
+  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendDataUrlChunks(item, keyOverride, pid, indexes));
 
   const onProgress = (sent, total) => {
     const pm = outboundTransfers.get(item.id);
     for (const pid of peerIds) {
       const p = pm?.get(pid);
-      if (p) { p.sent = sent; p.total = total; }
-      updateOutboundRow(item.id, pid, sent, total);
-    }
-    if (sent >= total) {
-      setTimeout(() => {
-        const pm = outboundTransfers.get(item.id);
-        if (pm) { for (const pid of peerIds) pm.delete(pid); if (!pm.size) outboundTransfers.delete(item.id); }
-        refreshOutboundUI(item.id);
-      }, 1500);
+      if (p) {
+        p.total = total;
+        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
+      }
+      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
     }
   };
 
@@ -1739,23 +2173,129 @@ function buildBinaryFrame(targetId, itemId, chunkIndex, totalChunks, chunkBytes)
   return frame.buffer;
 }
 
-function makeOutboundProgress(itemId, trackKey) {
+async function sendBinaryChunk(item, targetId, chunkIndex, totalChunks) {
+  if (!items.has(item.id) || !item.rawBuffer) return;
+  if (!await waitForDataWS()) return;
+  await drainWS();
+  const start = chunkIndex * BINARY_CHUNK_SIZE;
+  const chunk = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
+  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
+    dataWs.send(buildBinaryFrame(targetId, item.id, chunkIndex, totalChunks, chunk));
+  }
+}
+
+async function resendBinaryChunks(item, targetId, chunkIndexes) {
+  if (!item.rawBuffer) return;
+  const totalChunks = Math.ceil(item.rawBuffer.byteLength / BINARY_CHUNK_SIZE) || 1;
+  for (const i of chunkIndexes) {
+    if (i < 0 || i >= totalChunks) continue;
+    await sendBinaryChunk(item, targetId, i, totalChunks);
+  }
+}
+
+function trackOutboundPeer(itemId, trackKey, resendMissing = null) {
   if (!outboundTransfers.has(itemId)) outboundTransfers.set(itemId, new Map());
-  outboundTransfers.get(itemId).set(trackKey, { sent: 0, total: 0, startTime: Date.now() });
+  const peerMap = outboundTransfers.get(itemId);
+  const existing = peerMap.get(trackKey) || {};
+  peerMap.set(trackKey, {
+    sent: existing.sent || 0,
+    total: existing.total || 0,
+    startTime: existing.startTime || Date.now(),
+    ackedChunks: existing.ackedChunks || new Set(),
+    retryAttempts: existing.retryAttempts || 0,
+    retryTimer: existing.retryTimer || null,
+    initialDone: existing.initialDone || false,
+    complete: existing.complete || false,
+    resendMissing: resendMissing || existing.resendMissing || null,
+  });
   refreshOutboundUI(itemId);
+  return peerMap.get(trackKey);
+}
+
+function makeOutboundProgress(itemId, trackKey, resendMissing = null) {
+  trackOutboundPeer(itemId, trackKey, resendMissing);
   return (sent, total) => {
     const peerMap = outboundTransfers.get(itemId);
     const p = peerMap?.get(trackKey);
-    if (p) { p.sent = sent; p.total = total; }
-    updateOutboundRow(itemId, trackKey, sent, total);
-    if (sent >= total) {
-      setTimeout(() => {
-        const pm = outboundTransfers.get(itemId);
-        if (pm) { pm.delete(trackKey); if (!pm.size) outboundTransfers.delete(itemId); }
-        refreshOutboundUI(itemId);
-      }, 1500);
+    if (p) {
+      p.total = total;
+      p.sent = p.resendMissing ? p.ackedChunks.size : sent;
     }
+    updateOutboundRow(itemId, trackKey, p?.sent ?? sent, total);
+    if (p) finishOutboundPeerIfComplete(itemId, trackKey, p);
   };
+}
+
+function trackOutboundPeers(itemId, peerIds, resendMissingForPeer) {
+  if (!outboundTransfers.has(itemId)) outboundTransfers.set(itemId, new Map());
+  for (const pid of peerIds) {
+    trackOutboundPeer(itemId, pid, indexes => resendMissingForPeer(pid, indexes));
+  }
+  refreshOutboundUI(itemId);
+}
+
+function missingAckedChunks(progress) {
+  const total = progress?.total || 0;
+  const acked = progress?.ackedChunks;
+  if (!total || !acked) return [];
+  const missing = [];
+  for (let i = 0; i < total; i++) {
+    if (!acked.has(i)) missing.push(i);
+  }
+  return missing;
+}
+
+function clearChunkRetry(progress) {
+  if (progress?.retryTimer) {
+    clearTimeout(progress.retryTimer);
+    progress.retryTimer = null;
+  }
+}
+
+function finishOutboundPeerIfComplete(itemId, peerId, progress) {
+  if (!progress.total || progress.sent < progress.total) return;
+  if (progress.complete) return;
+  progress.complete = true;
+  clearChunkRetry(progress);
+  setTimeout(() => {
+    const pm = outboundTransfers.get(itemId);
+    if (pm) { pm.delete(peerId); if (!pm.size) outboundTransfers.delete(itemId); }
+    refreshOutboundUI(itemId);
+  }, 1500);
+}
+
+function scheduleChunkRetry(itemId, peerId, progress) {
+  if (!progress?.initialDone || !progress.resendMissing) return;
+  if (progress.sent >= progress.total) return;
+  if (progress.retryTimer) return;
+  if (progress.retryAttempts >= CHUNK_RETRY_MAX_ATTEMPTS) return;
+  progress.retryTimer = setTimeout(() => {
+    progress.retryTimer = null;
+    const current = outboundTransfers.get(itemId)?.get(peerId);
+    if (!current || current.sent >= current.total) return;
+    const missing = missingAckedChunks(current);
+    if (!missing.length) return;
+    current.retryAttempts++;
+    debugLog('retry-chunks', { itemId, peerId, attempt: current.retryAttempts, missing: missing.length });
+    chunkScheduler.enqueue(itemId, -(current.total || 0), () => retryChunkGenerator(itemId, peerId, missing, current.resendMissing));
+  }, CHUNK_RETRY_DELAY_MS);
+}
+
+async function* retryChunkGenerator(itemId, peerId, chunkIndexes, resendMissing) {
+  await resendMissing(chunkIndexes);
+  const progress = outboundTransfers.get(itemId)?.get(peerId);
+  if (progress) scheduleChunkRetry(itemId, peerId, progress);
+}
+
+function markOutboundInitialDone(itemId, peerIds) {
+  const pm = outboundTransfers.get(itemId);
+  if (!pm) return;
+  for (const peerId of peerIds) {
+    const p = pm.get(peerId);
+    if (!p) continue;
+    p.initialDone = true;
+    scheduleChunkRetry(itemId, peerId, p);
+  }
 }
 
 async function* fileChunkGeneratorBinary(item, targetId, onProgress) {
@@ -1768,16 +2308,14 @@ async function* fileChunkGeneratorBinary(item, targetId, onProgress) {
 
   for (let i = 0; i < totalChunks; i++) {
     if (!items.has(item.id)) { if (isBroadcast) activeBroadcasts.delete(item.id); return; }
-    if (!await waitForDataWS()) return;
-    await drainWS();
-    const start = i * BINARY_CHUNK_SIZE;
-    const chunk = new Uint8Array(buf, start, Math.min(BINARY_CHUNK_SIZE, buf.byteLength - start));
-    if (dataWs && dataWs.readyState === WebSocket.OPEN) dataWs.send(buildBinaryFrame(targetId, item.id, i, totalChunks, chunk));
+    await sendBinaryChunk(item, targetId, i, totalChunks);
     if (isBroadcast) activeBroadcasts.set(item.id, { nextChunk: i + 1, totalChunks });
     debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId: targetId || 'broadcast', path: 'binary' });
     yield;
   }
   if (isBroadcast) activeBroadcasts.delete(item.id);
+  if (targetId) markOutboundInitialDone(item.id, [targetId]);
+  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
   debugLog('finish-send', { itemId: item.id, targetId: targetId || 'broadcast', path: 'binary', totalChunks });
 }
 
@@ -1791,21 +2329,19 @@ async function* fileChunkGeneratorBinaryRange(item, targetId, fromChunk, toChunk
 
   for (let i = fromChunk; i < end; i++) {
     if (!items.has(item.id)) return;
-    if (!await waitForDataWS()) return;
-    await drainWS();
-    const start = i * BINARY_CHUNK_SIZE;
-    const chunk = new Uint8Array(buf, start, Math.min(BINARY_CHUNK_SIZE, buf.byteLength - start));
-    if (dataWs && dataWs.readyState === WebSocket.OPEN) dataWs.send(buildBinaryFrame(targetId, item.id, i, totalChunks, chunk));
+    await sendBinaryChunk(item, targetId, i, totalChunks);
     debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId, path: 'binary-range' });
     yield;
   }
+  markOutboundInitialDone(item.id, [targetId]);
   debugLog('finish-send', { itemId: item.id, targetId, path: 'binary-range', fromChunk, toChunk: end, totalChunks });
 }
 
 function sendFileChunksBinary(item, targetId) {
   if (targetId) {
     // Targeted send to one peer — single progress row
-    const onProgress = clientCount > 1 ? makeOutboundProgress(item.id, targetId) : () => {};
+    const resendMissing = indexes => resendBinaryChunks(item, targetId, indexes);
+    const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
     chunkScheduler.enqueue(item.id, -(item.size || 0),
       () => fileChunkGeneratorBinary(item, targetId, onProgress));
     return;
@@ -1819,24 +2355,17 @@ function sendFileChunksBinary(item, targetId) {
     return;
   }
 
-  if (!outboundTransfers.has(item.id)) outboundTransfers.set(item.id, new Map());
-  const peerMap = outboundTransfers.get(item.id);
-  for (const pid of peerIds) peerMap.set(pid, { sent: 0, total: 0, startTime: Date.now() });
-  refreshOutboundUI(item.id);
+  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendBinaryChunks(item, pid, indexes));
 
   const onProgress = (sent, total) => {
     const pm = outboundTransfers.get(item.id);
     for (const pid of peerIds) {
       const p = pm?.get(pid);
-      if (p) { p.sent = sent; p.total = total; }
-      updateOutboundRow(item.id, pid, sent, total);
-    }
-    if (sent >= total) {
-      setTimeout(() => {
-        const pm = outboundTransfers.get(item.id);
-        if (pm) { for (const pid of peerIds) pm.delete(pid); if (!pm.size) outboundTransfers.delete(item.id); }
-        refreshOutboundUI(item.id);
-      }, 1500);
+      if (p) {
+        p.total = total;
+        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
+      }
+      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
     }
   };
 
@@ -1846,14 +2375,44 @@ function sendFileChunksBinary(item, targetId) {
 
 function sendFileChunksBinaryRange(item, targetId, fromChunk, toChunk) {
   if (fromChunk >= toChunk) return;
-  const hasPeers = clientCount > 1;
-  const onProgress = hasPeers ? makeOutboundProgress(item.id, targetId) : () => {};
+  const resendMissing = indexes => resendBinaryChunks(item, targetId, indexes);
+  const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
   // High priority (negative) so catch-up to new peer runs before broadcast continues
   chunkScheduler.enqueue(item.id, -(item.size || 0),
     () => fileChunkGeneratorBinaryRange(item, targetId, fromChunk, toChunk, onProgress));
 }
 
 // ── Chunked file sending (encrypted binary path) ─────────────────────
+
+async function sendEncryptedBinaryChunk(item, key, targetId, chunkIndex, totalChunks) {
+  if (!items.has(item.id) || !item.rawBuffer) return;
+  if (!await waitForDataWS()) return;
+  await drainWS();
+  const start = chunkIndex * BINARY_CHUNK_SIZE;
+  const chunkBytes = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, chunkBytes));
+
+  const header = { t: 'efc', i: item.id, ci: chunkIndex, tc: totalChunks, sid: clientId };
+  if (targetId) header.tid = targetId;
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const frame = new Uint8Array(4 + headerBytes.length + 12 + ciphertext.length);
+  new DataView(frame.buffer).setUint32(0, headerBytes.length, false);
+  frame.set(headerBytes, 4);
+  frame.set(iv, 4 + headerBytes.length);
+  frame.set(ciphertext, 4 + headerBytes.length + 12);
+
+  if (dataWs && dataWs.readyState === WebSocket.OPEN) dataWs.send(frame.buffer);
+}
+
+async function resendEncryptedBinaryChunks(item, key, targetId, chunkIndexes) {
+  if (!item.rawBuffer) return;
+  const totalChunks = Math.ceil(item.rawBuffer.byteLength / BINARY_CHUNK_SIZE) || 1;
+  for (const i of chunkIndexes) {
+    if (i < 0 || i >= totalChunks) continue;
+    await sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks);
+  }
+}
 
 async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress) {
   if (!item.rawBuffer) return;
@@ -1864,32 +2423,19 @@ async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgres
 
   for (let i = 0; i < totalChunks; i++) {
     if (!items.has(item.id)) return;
-    if (!await waitForDataWS()) return;
-    await drainWS();
-    const start = i * BINARY_CHUNK_SIZE;
-    const chunkBytes = new Uint8Array(buf, start, Math.min(BINARY_CHUNK_SIZE, buf.byteLength - start));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, chunkBytes));
-
-    const header = { t: 'efc', i: item.id, ci: i, tc: totalChunks, sid: clientId };
-    if (targetId) header.tid = targetId;
-    const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-    const frame = new Uint8Array(4 + headerBytes.length + 12 + ciphertext.length);
-    new DataView(frame.buffer).setUint32(0, headerBytes.length, false);
-    frame.set(headerBytes, 4);
-    frame.set(iv, 4 + headerBytes.length);
-    frame.set(ciphertext, 4 + headerBytes.length + 12);
-
-    if (dataWs && dataWs.readyState === WebSocket.OPEN) dataWs.send(frame.buffer);
+    await sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks);
     debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId: targetId || 'broadcast', path: 'encrypted-binary' });
     yield;
   }
+  if (targetId) markOutboundInitialDone(item.id, [targetId]);
+  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
   debugLog('finish-send', { itemId: item.id, targetId: targetId || 'broadcast', path: 'encrypted-binary', totalChunks });
 }
 
 function sendFileChunksBinaryEncrypted(item, key, targetId) {
   if (targetId) {
-    const onProgress = clientCount > 1 ? makeOutboundProgress(item.id, targetId) : () => {};
+    const resendMissing = indexes => resendEncryptedBinaryChunks(item, key, targetId, indexes);
+    const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
     chunkScheduler.enqueue(item.id, -(item.size || 0),
       () => fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress));
     return;
@@ -1902,24 +2448,17 @@ function sendFileChunksBinaryEncrypted(item, key, targetId) {
     return;
   }
 
-  if (!outboundTransfers.has(item.id)) outboundTransfers.set(item.id, new Map());
-  const peerMap = outboundTransfers.get(item.id);
-  for (const pid of peerIds) peerMap.set(pid, { sent: 0, total: 0, startTime: Date.now() });
-  refreshOutboundUI(item.id);
+  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendEncryptedBinaryChunks(item, key, pid, indexes));
 
   const onProgress = (sent, total) => {
     const pm = outboundTransfers.get(item.id);
     for (const pid of peerIds) {
       const p = pm?.get(pid);
-      if (p) { p.sent = sent; p.total = total; }
-      updateOutboundRow(item.id, pid, sent, total);
-    }
-    if (sent >= total) {
-      setTimeout(() => {
-        const pm = outboundTransfers.get(item.id);
-        if (pm) { for (const pid of peerIds) pm.delete(pid); if (!pm.size) outboundTransfers.delete(item.id); }
-        refreshOutboundUI(item.id);
-      }, 1500);
+      if (p) {
+        p.total = total;
+        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
+      }
+      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
     }
   };
 
@@ -1944,17 +2483,17 @@ function handleBinaryMessage(buffer) {
     const sid = header.sid;
     if (!key) {
       const receivedChunks = storeEncryptedBinaryChunk(header, payload);
-      sendChunkAck(header.i, header.tc, sid, receivedChunks);
+      sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       return;
     }
     crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(payload, 0, 12) }, key, payload.slice(12))
       .then(plain => {
         const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, plain, sid);
-        sendChunkAck(header.i, header.tc, sid, receivedChunks);
+        sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       })
       .catch(() => {
         const receivedChunks = storeEncryptedBinaryChunk(header, payload);
-        sendChunkAck(header.i, header.tc, sid, receivedChunks);
+        sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       });
     return;
   }
@@ -1962,39 +2501,41 @@ function handleBinaryMessage(buffer) {
   // Copy chunk data into its own buffer so the outer ArrayBuffer can be GC'd
   const chunkData = buffer.slice(4 + headerLen);
   const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, chunkData, header.sid);
-  sendChunkAck(header.i, header.tc, header.sid, receivedChunks);
+  sendChunkAck(header.i, header.tc, header.sid, receivedChunks, header.ci);
 }
 
-function sendChunkAck(itemId, totalChunks, senderId, receivedChunks) {
+function sendChunkAck(itemId, totalChunks, senderId, receivedChunks, chunkIndex) {
   if (!senderId || !ws || ws.readyState !== WebSocket.OPEN) return;
   debugProgress('progress-ack-send', itemId, receivedChunks, totalChunks, { senderId });
   sendPriorityJson({
     type: 'relay',
     targetId: senderId,
-    payload: { type: 'chunk_ack', itemId, totalChunks, receivedChunks, peerId: clientId },
+    payload: { type: 'chunk_ack', itemId, totalChunks, receivedChunks, chunkIndex, peerId: clientId },
   });
 }
 
-function handleChunkAck(itemId, totalChunks, peerId, receivedChunks) {
+function handleChunkAck(itemId, totalChunks, peerId, receivedChunks, chunkIndex) {
   const pm = outboundTransfers.get(itemId);
   const p = pm?.get(peerId);
   if (!p) return;
   if (!p.total) p.total = totalChunks;
-  if (!Number.isFinite(receivedChunks)) return;
-  p.acked = Math.min(Math.max(receivedChunks, p.acked || 0), p.total);
-  p.sent = p.acked;
+  if (Number.isFinite(chunkIndex)) {
+    p.ackedChunks ||= new Set();
+    p.ackedChunks.add(chunkIndex);
+    p.sent = p.ackedChunks.size;
+  } else if (Number.isFinite(receivedChunks)) {
+    p.sent = Math.min(Math.max(receivedChunks, p.sent || 0), p.total);
+  } else {
+    return;
+  }
+  if (p.sent < p.total) scheduleChunkRetry(itemId, peerId, p);
   debugProgress('progress-ack-received', itemId, p.sent, p.total, { peerId });
   updateOutboundRow(itemId, peerId, p.sent, p.total);
-  if (p.sent >= p.total) {
-    setTimeout(() => {
-      const pm = outboundTransfers.get(itemId);
-      if (pm) { pm.delete(peerId); if (!pm.size) outboundTransfers.delete(itemId); }
-      refreshOutboundUI(itemId);
-    }, 1500);
-  }
+  finishOutboundPeerIfComplete(itemId, peerId, p);
 }
 
 function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, senderId) {
+  if (!binaryTransfers.has(itemId) && items.get(itemId)?.rawBuffer) return totalChunks;
   if (!binaryTransfers.has(itemId)) {
     binaryTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), received: 0, totalChunks, senderId, startTime: Date.now() });
     debugLog('starting', { itemId, path: 'receive-binary', totalChunks });
@@ -2031,6 +2572,10 @@ async function finalizeTransferBinary(itemId, chunks) {
 
 // ── Chunked file receiving (encrypted/base64 path) ───────────────────
 function handleFileChunk({ itemId, chunkIndex, totalChunks, prefix, data }, senderId) {
+  if (!fileTransfers.has(itemId) && items.get(itemId)?.dataUrl) {
+    sendChunkAck(itemId, totalChunks, senderId, totalChunks, chunkIndex);
+    return;
+  }
   if (!fileTransfers.has(itemId)) {
     fileTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), received: 0, totalChunks, prefix: '', senderId, startTime: Date.now() });
     debugLog('starting', { itemId, path: 'receive-base64', totalChunks });
@@ -2038,6 +2583,7 @@ function handleFileChunk({ itemId, chunkIndex, totalChunks, prefix, data }, send
   const t = fileTransfers.get(itemId);
   if (prefix) t.prefix = prefix;
   if (t.chunks[chunkIndex] === null) { t.chunks[chunkIndex] = data; t.received++; }
+  sendChunkAck(itemId, totalChunks, senderId, t.received, chunkIndex);
 
   debugProgress('progress-receive', itemId, t.received, t.totalChunks, { path: 'base64' });
   updateTransferProgress(itemId, t.received / t.totalChunks, t);
@@ -2216,7 +2762,7 @@ function finalizeCardInPlace(item) {
     const imagePreviewUrl = item.thumbnailDataUrl || (isBrowserViewableImage(item.mimeType) ? item.dataUrl : '');
     let bodyHtml;
     if (item.type === 'image' && imagePreviewUrl) {
-      bodyHtml = `<div class="card-image"><img src="${escAttr(imagePreviewUrl)}" alt="${escAttr(item.filename || 'image')}"></div>`;
+      bodyHtml = imageCardHtml(item, imagePreviewUrl);
     } else {
       bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
   <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
@@ -2243,6 +2789,19 @@ function finalizeCardInPlace(item) {
   }
 
   refreshIcons();
+}
+
+function fileMetaHtml(item) {
+  return `<div class="file-info">
+  <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
+  <div class="file-type">${fileTypeName(item.mimeType)}</div>
+  <div class="file-size">${humanSize(item.size)}</div>
+</div>`;
+}
+
+function imageCardHtml(item, imagePreviewUrl) {
+  return `<div class="card-image"><img src="${escAttr(imagePreviewUrl)}" alt="${escAttr(item.filename || 'image')}"></div>
+<div class="card-image-meta">${fileMetaHtml(item)}</div>`;
 }
 
 function buildCard(item) {
@@ -2278,27 +2837,19 @@ function buildCard(item) {
     footerActions = `<button class="btn-icon" title="Copy" onclick="copyText('${item.id}')"><i data-lucide="copy"></i></button>`;
 
   } else if (item.type === 'image' && item.thumbnailDataUrl && !item.dataUrl) {
-    bodyHtml = `<div class="card-image"><img src="${item.thumbnailDataUrl}" alt="${escAttr(item.filename || 'image')}"></div>`;
+    bodyHtml = imageCardHtml(item, item.thumbnailDataUrl);
 
   } else if (item.dataUrl) {
     const imagePreviewUrl = item.thumbnailDataUrl || (isBrowserViewableImage(item.mimeType) ? item.dataUrl : '');
     if (item.type === 'image' && imagePreviewUrl) {
-      bodyHtml = `<div class="card-image"><img src="${imagePreviewUrl}" alt="${escAttr(item.filename || 'image')}"></div>`;
+      bodyHtml = imageCardHtml(item, imagePreviewUrl);
     } else {
-      bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
-    <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
-    <div class="file-type">${fileTypeName(item.mimeType)}</div>
-    <div class="file-size">${humanSize(item.size)}</div>
-  </div></div>`;
+      bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
     }
     footerActions = `<button class="btn-icon" title="Download" onclick="downloadItem('${item.id}')"><i data-lucide="download"></i></button>`;
 
   } else {
-    bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
-  <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
-  <div class="file-type">${fileTypeName(item.mimeType)}</div>
-  <div class="file-size">${humanSize(item.size)}</div>
-</div></div>`;
+    bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
   }
 
   const encryptedIcon = item.encrypted ? '<i data-lucide="lock" title="Encrypted"></i>' : '';
