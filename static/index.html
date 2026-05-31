@@ -4,7 +4,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#1a73e8">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="ClipShare">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <title>ClipShare</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-maskable.svg">
+  <link rel="manifest" href="/static/manifest.webmanifest">
   <script src="/vendor/lucide.min.js"></script>
   <link href="/vendor/materialdesignicons.min.css" rel="stylesheet">
   <script src="/vendor/qrcode.min.js"></script>
@@ -23,23 +31,38 @@
         <input id="token-input" type="text" placeholder="happy-river" maxlength="40" autocomplete="off"
           spellcheck="false">
       </div>
-      <div class="token-field">
-        <label for="passphrase-input">Passphrase</label>
-        <input id="passphrase-input" type="text" placeholder="Passphrase" maxlength="64" autocomplete="off"
+      <div class="token-field" id="start-pin-field">
+        <label for="pin-input">PIN</label>
+        <input id="pin-input" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="12345678" maxlength="8" autocomplete="off"
           spellcheck="false">
+        <p id="pin-error" class="pin-error-msg" style="display:none"></p>
+      </div>
+      <div class="token-field" id="start-pairing-pin" style="display:none">
+        <label>Pairing PIN</label>
+        <div class="pairing-pin-row">
+          <div class="pairing-pin">
+            <div class="pairing-pin-value" id="start-pin-value"></div>
+          </div>
+          <div class="pairing-pin-side">
+            <span class="pairing-spinner" aria-hidden="true"></span>
+            <div class="pairing-pin-time" id="start-pin-time"></div>
+          </div>
+        </div>
       </div>
       <div class="btn-row">
-        <button class="btn-primary" id="btn-join">Join</button>
-        <button class="btn-secondary" id="btn-create"><i data-lucide="refresh-cw"></i> Regenerate</button>
+        <button class="btn-primary" id="btn-join">Join space</button>
+        <button class="btn-secondary" id="btn-create"><i data-lucide="plus"></i> Create space</button>
       </div>
-      <div class="start-share">
-        <div id="start-qr-code" aria-label="QR code for prepared share URL"></div>
-      </div>
-      <div class="token-field">
-        <label for="start-share-url">Share URL</label>
-        <div class="token-modal-value-row">
-          <div class="token-modal-value" id="start-share-url"></div>
-          <button class="btn-icon" id="copy-start-url-btn" title="Copy URL"><i data-lucide="copy"></i></button>
+      <div id="start-share-section" style="display:none">
+        <div class="start-share">
+          <div id="start-qr-code" aria-label="QR code for prepared share URL"></div>
+        </div>
+        <div class="token-field">
+          <label for="start-share-url">Share URL</label>
+          <div class="token-modal-value-row">
+            <div class="token-modal-value" id="start-share-url"></div>
+            <button class="btn-icon" id="copy-start-url-btn" title="Copy URL"><i data-lucide="copy"></i></button>
+          </div>
         </div>
       </div>
     </div>
@@ -52,8 +75,6 @@
       <div class="token-group">
         <div class="token-chip" id="header-token" title="Share token"></div>
         <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
-        <button class="btn-icon encryption-control" id="encryption-control" title="Encryption off"><i
-            data-lucide="unlock"></i></button>
       </div>
       <div class="peer-pills" id="peer-pills" title="Connected users"></div>
       <div class="spacer"></div>
@@ -88,7 +109,7 @@
           <div class="chat-actions">
             <button class="btn-icon" id="chat-archive" title="Archive chat as shared card"><i data-lucide="archive"></i></button>
             <button class="btn-icon" id="chat-clear" title="Clear chat"><i data-lucide="eraser"></i></button>
-            <button class="btn-icon" id="chat-close" title="Close chat"><i data-lucide="panel-right-close"></i></button>
+            <button class="btn-icon" id="chat-close" title="Close chat"><i data-lucide="x"></i></button>
           </div>
         </div>
         <div id="chat-messages"></div>
@@ -129,11 +150,15 @@
       </div>
       <div class="token-modal-row">
         <div class="token-modal-field">
-          <div class="token-modal-label">Passphrase</div>
-          <div class="token-modal-value-row">
-            <div class="token-modal-value passphrase-value" id="token-modal-passphrase"></div>
-            <button class="btn-icon" id="copy-passphrase-btn" title="Copy passphrase"><i
-                data-lucide="copy"></i></button>
+          <div class="token-modal-label">Pairing PIN</div>
+          <div class="pairing-pin-row" id="modal-pairing-pin" style="display:none">
+            <div class="pairing-pin pairing-pin-compact">
+              <div class="pairing-pin-value" id="modal-pin-value"></div>
+            </div>
+            <div class="pairing-pin-side">
+              <span class="pairing-spinner" aria-hidden="true"></span>
+              <span id="modal-pin-time" class="pairing-pin-time"></span>
+            </div>
           </div>
         </div>
       </div>
@@ -151,18 +176,6 @@
       </div>
     </div>
   </div>
-  <div id="passphrase-modal" class="confirm-modal" aria-hidden="true">
-    <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="passphrase-modal-title">
-      <div class="confirm-title" id="passphrase-modal-title">Encryption Passphrase</div>
-      <input id="passphrase-modal-input" class="passphrase-field" type="text" placeholder="Passphrase" maxlength="64"
-        autocomplete="off" spellcheck="false">
-      <div class="confirm-actions">
-        <button class="btn-secondary" id="passphrase-clear"><i data-lucide="unlock"></i> Clear</button>
-        <button class="btn-secondary" id="passphrase-cancel">Cancel</button>
-        <button class="btn-primary" id="passphrase-save"><i data-lucide="lock"></i> Save</button>
-      </div>
-    </div>
-  </div>
   <div id="peers-modal" class="confirm-modal" aria-hidden="true">
     <div class="confirm-card peers-card" role="dialog" aria-modal="true" aria-labelledby="peers-modal-title">
       <div class="token-modal-head">
@@ -174,8 +187,8 @@
   </div>
   <div id="clear-modal" class="confirm-modal" aria-hidden="true">
     <div class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="clear-modal-title">
-      <div class="confirm-title" id="clear-modal-title">Clear All Cards</div>
-      <div class="confirm-text">This will remove all cards for everyone in this space.</div>
+      <div class="confirm-title" id="clear-modal-title">Clear Space</div>
+      <div class="confirm-text">This will remove all cards and chat for everyone in this space.</div>
       <div class="confirm-actions">
         <button class="btn-secondary" id="clear-cancel">Cancel</button>
         <button class="btn-danger" id="clear-confirm">Clear</button>

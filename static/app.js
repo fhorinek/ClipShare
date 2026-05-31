@@ -454,6 +454,11 @@ async function estimateFileMimeType(file) {
 }
 
 const TOKEN_MAX_LENGTH = 40;
+const PASSKEY_LENGTH = 64;
+const PASSKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const PAIRING_PIN_LENGTH = 8;
+const PAIRING_PIN_TTL_MS = 60000;
+const PAIRING_JOIN_TIMEOUT_MS = 3000;
 const TOKEN_ADJECTIVES = [
   'able', 'active', 'blue', 'bold', 'brave', 'bright', 'calm', 'clean',
   'clear', 'clever', 'cool', 'deep', 'dry', 'early', 'easy', 'fair',
@@ -525,9 +530,44 @@ function generateToken() {
 }
 
 function generatePassphrase() {
-  const bytes = new Uint8Array(6);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, byte => String(byte % 10)).join('');
+  const chars = [];
+  const maxUnbiasedByte = Math.floor(256 / PASSKEY_ALPHABET.length) * PASSKEY_ALPHABET.length;
+  while (chars.length < PASSKEY_LENGTH) {
+    const bytes = new Uint8Array(PASSKEY_LENGTH);
+    crypto.getRandomValues(bytes);
+    for (const byte of bytes) {
+      if (byte >= maxUnbiasedByte) continue;
+      chars.push(PASSKEY_ALPHABET[byte % PASSKEY_ALPHABET.length]);
+      if (chars.length === PASSKEY_LENGTH) break;
+    }
+  }
+  return chars.join('');
+}
+
+function generatePairingPin() {
+  const digits = [];
+  const maxUnbiasedByte = Math.floor(256 / 10) * 10;
+  while (digits.length < PAIRING_PIN_LENGTH) {
+    const bytes = new Uint8Array(PAIRING_PIN_LENGTH);
+    crypto.getRandomValues(bytes);
+    for (const byte of bytes) {
+      if (byte >= maxUnbiasedByte) continue;
+      digits.push(String(byte % 10));
+      if (digits.length === PAIRING_PIN_LENGTH) break;
+    }
+  }
+  return digits.join('');
+}
+
+function isGeneratedPasskey(value) {
+  return typeof value === 'string'
+    && value.length === PASSKEY_LENGTH
+    && /^[A-Za-z0-9]+$/.test(value);
+}
+
+function storedOrNewPasskey() {
+  const saved = localStorage.getItem('clipshare_passphrase') || '';
+  return isGeneratedPasskey(saved) ? saved : generatePassphrase();
 }
 
 function tokenFromPath() {
@@ -609,6 +649,13 @@ function isBrowserViewableImage(mime) {
   ].includes(m);
 }
 
+function isBrowserPlayableVideo(mime) {
+  const m = (mime || '').toLowerCase();
+  if (!m.startsWith('video/')) return false;
+  const video = document.createElement('video');
+  return !!video.canPlayType(m);
+}
+
 async function makeJpegThumbnail(blob, maxSize = 900) {
   const url = URL.createObjectURL(blob);
   try {
@@ -636,8 +683,8 @@ async function makeJpegThumbnail(blob, maxSize = 900) {
   }
 }
 
-async function prepareImageThumbnail(item, blob) {
-  if (item?.type !== 'image' || isBrowserViewableImage(item.mimeType)) return;
+async function prepareImageThumbnail(item, blob, { force = false } = {}) {
+  if (item?.type !== 'image' || (!force && isBrowserViewableImage(item.mimeType))) return;
   item.thumbnailDataUrl = await makeJpegThumbnail(blob);
   debugLog('thumbnail', { itemId: item.id, filename: item.filename, mimeType: item.mimeType, converted: !!item.thumbnailDataUrl });
 }
@@ -661,9 +708,10 @@ function updatePeerCount() {
   const imap = buildPeerIdentityMap();
   const selfId = imap.get(clientId);
   let html = `<div class="peer-pill" style="background:${selfId.bg}" title="${escHtml(selfId.fullName)} (You)"><i data-lucide="${selfId.animalIcon}" style="color:${selfId.iconColor}"></i></div>`;
-  for (const [peerId] of connectedPeers) {
+  for (const [peerId, peer] of connectedPeers) {
     const id = imap.get(peerId);
-    html += `<div class="peer-pill" style="background:${id.bg}" title="${escHtml(id.fullName)}"><i data-lucide="${id.animalIcon}" style="color:${id.iconColor}"></i></div>`;
+    const compatibility = peerCompatibilityLabel(peer);
+    html += `<div class="peer-pill${peer.compatibility === 'incompatible' ? ' peer-pill-incompatible' : ''}" style="background:${id.bg}" title="${escHtml([id.fullName, compatibility].filter(Boolean).join(' - '))}"><i data-lucide="${id.animalIcon}" style="color:${id.iconColor}"></i></div>`;
   }
   container.innerHTML = html;
   container.title = `${clientCount} connected user${clientCount === 1 ? '' : 's'}`;
@@ -692,16 +740,6 @@ async function copyShareUrl() {
   }
 }
 
-async function copyPassphrase() {
-  if (!currentPassphrase) return;
-  try {
-    await navigator.clipboard.writeText(currentPassphrase);
-    showToast('Passphrase copied!');
-  } catch {
-    showToast(currentPassphrase);
-  }
-}
-
 function isEditableTarget(el) {
   if (!el) return false;
   if (el.isContentEditable) return true;
@@ -723,19 +761,47 @@ const chatMessages = [];
 let chatPanelOpen = false;
 let unreadChatCount = 0;
 let chatReplyTargetId = null;
-const fileTransfers = new Map();   // base64/encrypted path: itemId -> {chunks,received,totalChunks,prefix}
-const binaryTransfers = new Map(); // binary path: itemId -> {chunks,received,totalChunks}
+const binaryTransfers = new Map(); // itemId -> {chunks,received,totalChunks}
 const editTimers = new Map();
-const CHUNK_SIZE = 65536;        // base64 chars per chunk (encrypted path)
-const BINARY_CHUNK_SIZE = 65536; // bytes per chunk (binary path)
+const BINARY_CHUNK_SIZE = 65536; // bytes per chunk
+const CHUNK_REQUEST_TARGET_BYTES = 1024 * 1024;
+const CHUNK_REQUEST_MAX_CHUNKS = Math.max(1, Math.floor(CHUNK_REQUEST_TARGET_BYTES / BINARY_CHUNK_SIZE));
 const CHUNK_RETRY_DELAY_MS = 1200;
 const CHUNK_RETRY_MAX_ATTEMPTS = 3;
+const MAX_TRANSFER_CHUNKS = Math.ceil((128 * 1024 * 1024) / BINARY_CHUNK_SIZE) + 1;
+const DOWNLOAD_SOURCE_RETRY_DELAY_MS = 2000;
+const METRICS_PING_INTERVAL_MS = 10000;
+const KEY_PROOF_TIMEOUT_MS = 3500;
 let clientCount = 0;
 let draggingInternal = false;
 let tokenQr = null;
 let startQr = null;
 let encryptedMessageSeq = 0;
 let lastForegroundCheckAt = 0;
+let startPairingCreated = false;
+let modalPairingActive = false;
+let pairingPin = '';
+let pairingPinExpiresAt = 0;
+let pairingKeyPair = null;
+let pairingRotateTimer = null;
+let pairingUiTimer = null;
+let pairingHostWs = null;
+let pairingJoinWs = null;
+let pairingJoinKeyPair = null;
+let pairingJoinRequestId = null;
+let pairingJoinTimer = null;
+let pairingJoinToken = '';
+const pairingHosts = new Map();
+let metricsPingTimer = null;
+let peersModalRefreshTimer = null;
+let pendingInitialSyncSources = null;
+const selfClientMetrics = {
+  deviceType: detectDeviceType(),
+  pingMs: null,
+  uploadBps: null,
+  downloadBps: null,
+  updatedAt: Date.now(),
+};
 
 const CHAT_EMOTES = [
   { token: 'smile', icon: 'smile', color: '#fbbc04' },
@@ -807,8 +873,30 @@ function buildPeerIdentityMap() {
   }
   return map;
 }
-function peerPillHtml(identity, extraClass = '') {
-  return `<div class="peer-pill${extraClass ? ' ' + extraClass : ''}" style="background:${identity.bg}"><i data-lucide="${identity.animalIcon}" style="color:${identity.iconColor}"></i></div>`;
+function peerPillHtml(identity, extraClass = '', title = '') {
+  const hint = title || identity.fullName || '';
+  return `<div class="peer-pill${extraClass ? ' ' + extraClass : ''}" style="background:${identity.bg}"${hint ? ` title="${escAttr(hint)}"` : ''}><i data-lucide="${identity.animalIcon}" style="color:${identity.iconColor}"></i></div>`;
+}
+
+function peerCompatibilityLabel(peer) {
+  if (!peer || peer.compatibility === 'compatible') return '';
+  if (peer.compatibility === 'incompatible') return 'Incompatible key';
+  return 'Checking key';
+}
+
+function peerIconStackHtml(peerIds = [], extraClass = '') {
+  const imap = buildPeerIdentityMap();
+  const ids = [...new Set((peerIds || []).filter(Boolean).map(String))];
+  if (!ids.length) {
+    const fallback = fallbackPeerIdentity('');
+    return `<div class="transfer-peer-icons${extraClass ? ' ' + extraClass : ''}">${peerPillHtml(fallback, 'peer-pill-sm', fallback.fullName)}</div>`;
+  }
+  return `<div class="transfer-peer-icons${extraClass ? ' ' + extraClass : ''}">${ids.map(peerId => (
+    (() => {
+      const identity = imap.get(peerId) || fallbackPeerIdentity(peerId);
+      return peerPillHtml(identity, 'peer-pill-sm', identity.fullName);
+    })()
+  )).join('')}</div>`;
 }
 
 function fallbackPeerIdentity(peerId) {
@@ -818,6 +906,12 @@ function fallbackPeerIdentity(peerId) {
     animalIcon: 'user',
     fullName: peerId ? `Guest ${String(peerId).slice(0, 6)}` : 'Unknown',
   };
+}
+
+function transferSourceIdsFromChunks(chunkSources = [], fallbackSourceId = null) {
+  const ids = [...new Set((chunkSources || []).filter(Boolean).map(String))];
+  if (!ids.length && fallbackSourceId) ids.push(String(fallbackSourceId));
+  return ids;
 }
 
 function chatAuthorIdentity(message) {
@@ -883,24 +977,32 @@ function normalizeChatReply(replyTo) {
 
 function chatCardPayload(item) {
   if (!item?.id) return null;
+  const thumbnailDataUrl = item.type === 'image' && isSafeChatImagePreview(item.thumbnailDataUrl) ? item.thumbnailDataUrl : '';
   return {
     id: String(item.id),
     type: String(item.type || 'file').slice(0, 24),
     filename: String(item.filename || item.content || 'Card').slice(0, 160),
     mimeType: String(item.mimeType || '').slice(0, 120),
     size: Number(item.size) || 0,
+    ...(thumbnailDataUrl ? { thumbnailDataUrl } : {}),
   };
 }
 
 function normalizeChatCard(card) {
   if (!card?.id) return null;
+  const thumbnailDataUrl = isSafeChatImagePreview(card.thumbnailDataUrl) ? card.thumbnailDataUrl : '';
   return {
     id: String(card.id),
     type: String(card.type || 'file').slice(0, 24),
     filename: String(card.filename || 'Card').slice(0, 160),
     mimeType: String(card.mimeType || '').slice(0, 120),
     size: Number(card.size) || 0,
+    ...(thumbnailDataUrl ? { thumbnailDataUrl } : {}),
   };
+}
+
+function isSafeChatImagePreview(value) {
+  return typeof value === 'string' && value.startsWith('data:image/') && value.length <= 450000;
 }
 
 function normalizeChatReactions(reactions = {}) {
@@ -1013,12 +1115,46 @@ function renderChatReplyPreview(replyTo) {
   return `<div class="chat-reply-preview"><span>${escHtml(replyTo.authorName)}</span>${renderChatCardMention(replyTo.card, 'chat-card-mention-compact')}<div>${renderChatText(replyTo.text || (replyTo.card ? replyTo.card.filename : ''))}</div></div>`;
 }
 
+function chatCardDownloadState(cardId) {
+  if (!cardId) return null;
+  const id = String(cardId);
+  const item = items.get(id);
+  const transfer = binaryTransfers.get(id);
+  if (transfer?.totalChunks) {
+    const percent = Math.max(0, Math.min(100, Math.round((transfer.received || 0) / transfer.totalChunks * 100)));
+    return { pending: true, percent };
+  }
+  if (expectsIncomingChunks(item) || transfer) return { pending: true, percent: 0 };
+  return { pending: false, percent: 100 };
+}
+
+function updateChatCardDownloadState(cardId) {
+  const state = chatCardDownloadState(cardId);
+  document.querySelectorAll('.chat-card-mention[data-card-id]').forEach(button => {
+    if (button.dataset.cardId !== String(cardId)) return;
+    const pending = !!state?.pending;
+    const percent = pending ? state.percent : 100;
+    button.classList.toggle('chat-card-pending', pending);
+    button.style.setProperty('--chat-card-progress', `${percent}%`);
+    button.setAttribute('aria-busy', pending ? 'true' : 'false');
+    const status = button.querySelector('.chat-card-progress-label');
+    if (status) status.textContent = pending ? `${percent}%` : '';
+  });
+}
+
 function renderChatCardMention(card, extraClass = '') {
   if (!card) return '';
   const typeLabel = card.type === 'image' ? 'Image' : fileTypeName(card.mimeType);
   const sizeLabel = card.size ? humanSize(card.size) : 'Card';
-  const className = `chat-card-mention${extraClass ? ' ' + extraClass : ''}`;
-  return `<button class="${escAttr(className)}" data-action="show-card" data-card-id="${escAttr(card.id)}" title="Show card">${fileTypeIcon(card.mimeType)}<span><strong>${escHtml(card.filename)}</strong><small>${escHtml(typeLabel)} · ${escHtml(sizeLabel)}</small></span></button>`;
+  const hasPreview = card.type === 'image' && isSafeChatImagePreview(card.thumbnailDataUrl);
+  const downloadState = chatCardDownloadState(card.id);
+  const isPending = !!downloadState?.pending;
+  const className = `chat-card-mention${hasPreview ? ' chat-card-image' : ''}${isPending ? ' chat-card-pending' : ''}${extraClass ? ' ' + extraClass : ''}`;
+  const visual = hasPreview
+    ? `<img class="chat-card-preview" src="${escAttr(card.thumbnailDataUrl)}" alt="${escAttr(card.filename)}">`
+    : fileTypeIcon(card.mimeType);
+  const progress = isPending ? downloadState.percent : 100;
+  return `<button class="${escAttr(className)}" data-action="show-card" data-card-id="${escAttr(card.id)}" title="Show card" aria-busy="${isPending ? 'true' : 'false'}" style="--chat-card-progress:${progress}%">${visual}<span><strong>${escHtml(card.filename)}</strong><small>${escHtml(typeLabel)} · ${escHtml(sizeLabel)}</small></span><span class="chat-card-progress-track" aria-hidden="true"><span></span></span><span class="chat-card-progress-label">${isPending ? `${progress}%` : ''}</span></button>`;
 }
 
 function renderChatReactions(message) {
@@ -1173,7 +1309,7 @@ function handleChatMessageClick(event) {
   } else if (button.dataset.action === 'reply') {
     setChatReplyTarget(messageId);
   } else if (button.dataset.action === 'show-card') {
-    focusCard(button.dataset.cardId);
+    focusCard(button.dataset.cardId, { closeChatOnMobile: true });
   }
 }
 
@@ -1194,12 +1330,59 @@ function insertChatEmote(tokenName) {
   input.setSelectionRange(pos, pos);
 }
 
-function focusCard(itemId) {
-  const card = document.getElementById('card-' + itemId);
-  if (!card) {
-    showToast('Card is not available yet');
-    return;
-  }
+function isDesktopChatPanel() {
+  const panel = document.getElementById('chat-panel');
+  return panel && getComputedStyle(panel).position !== 'fixed';
+}
+
+function clampChatPanelWidth(width) {
+  const viewport = window.innerWidth || 0;
+  const min = 320;
+  const max = Math.max(min, Math.min(720, Math.round(viewport * 0.55)));
+  return Math.max(min, Math.min(max, Math.round(width)));
+}
+
+function setChatPanelWidth(width) {
+  const app = document.getElementById('app');
+  app?.style.setProperty('--chat-panel-width', `${clampChatPanelWidth(width)}px`);
+}
+
+function initChatPanelResize() {
+  const panel = document.getElementById('chat-panel');
+  if (!panel) return;
+  let resizing = false;
+
+  panel.addEventListener('pointerdown', event => {
+    if (!isDesktopChatPanel() || event.clientX - panel.getBoundingClientRect().left > 10) return;
+    resizing = true;
+    panel.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  panel.addEventListener('pointermove', event => {
+    if (!resizing) return;
+    const width = window.innerWidth - event.clientX;
+    setChatPanelWidth(width);
+  });
+
+  const finishResize = event => {
+    if (!resizing) return;
+    resizing = false;
+    panel.releasePointerCapture?.(event.pointerId);
+  };
+  panel.addEventListener('pointerup', finishResize);
+  panel.addEventListener('pointercancel', finishResize);
+}
+
+function shouldCloseChatForCardFocus() {
+  const panel = document.getElementById('chat-panel');
+  const panelIsOverlay = panel ? getComputedStyle(panel).position === 'fixed' : false;
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches;
+  const narrowViewport = (window.visualViewport?.width || window.innerWidth || 0) <= 900;
+  return panelIsOverlay || (coarsePointer && narrowViewport);
+}
+
+function scrollAndFlashCard(card) {
   card.scrollIntoView({ behavior: 'smooth', block: 'center' });
   clearTimeout(card._flashTimer);
   card.classList.remove('card-flash');
@@ -1209,6 +1392,22 @@ function focusCard(itemId) {
     card.classList.remove('card-flash');
     card._flashTimer = null;
   }, 1000);
+}
+
+function focusCard(itemId, { closeChatOnMobile = false } = {}) {
+  const card = document.getElementById('card-' + itemId);
+  if (!card) {
+    showToast('Card is not available yet');
+    return;
+  }
+  if (closeChatOnMobile && chatPanelOpen && shouldCloseChatForCardFocus()) {
+    toggleChatPanel(false);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => scrollAndFlashCard(card));
+    });
+    return;
+  }
+  scrollAndFlashCard(card);
 }
 
 function toggleChatPanel(forceOpen = null) {
@@ -1298,12 +1497,61 @@ function sendChatHistory(targetClientId) {
 // ── Transfer scheduling & outbound tracking ──────────────────────────
 const connectedPeers = new Map(); // peerId -> {label: string}
 const peerCardMetadata = new Map(); // peerId -> Map<itemId, metadata>
+const roomManifest = new Map(); // itemId -> {ownerId, revision, meta}
+const manifestRevisions = new Map();
+const peerCompatibilityTimers = new Map();
 let selfPeerInfo = { label: '1', ip: '' };
 let peerCounter = 0;
 const outboundTransfers = new Map(); // itemId -> Map<trackKey, {sent,total,startTime}>
-const debugProgressMarks = new Map();
-// Tracks ongoing broadcast position so new peers can receive missed chunks
-const activeBroadcasts = new Map(); // itemId -> {nextChunk, totalChunks}
+const remoteTransferStatuses = new Map(); // transferKey -> transfer status from other clients
+const transferStatusPublishTimes = new Map();
+const downloadSourceRetryTimers = new Map();
+const downloadSourceRetryAttempts = new Map();
+const pendingDownloadSourceIds = new Map();
+const pendingDownloadTriedSources = new Map();
+const pendingChunkRequestBatches = new Map();
+const downloadLogSources = new Map();
+let sendWakeLock = null;
+let sendWakeLockRequest = null;
+
+function hasPendingChunkSends() {
+  return !!chunkScheduler?.hasPending();
+}
+
+function shouldHoldSendWakeLock() {
+  return detectDeviceType() === 'mobile'
+    && document.visibilityState === 'visible'
+    && (hasPendingChunkSends() || outboundTransfers.size > 0);
+}
+
+async function acquireSendWakeLock() {
+  if (!('wakeLock' in navigator) || sendWakeLock || sendWakeLockRequest || !shouldHoldSendWakeLock()) return;
+  sendWakeLockRequest = navigator.wakeLock.request('screen')
+    .then(lock => {
+      sendWakeLock = lock;
+      sendWakeLock.addEventListener('release', () => {
+        sendWakeLock = null;
+        updateSendWakeLock();
+      }, { once: true });
+    })
+    .catch(() => {})
+    .finally(() => {
+      sendWakeLockRequest = null;
+      if (!shouldHoldSendWakeLock()) releaseSendWakeLock();
+    });
+  await sendWakeLockRequest;
+}
+
+function releaseSendWakeLock() {
+  const lock = sendWakeLock;
+  sendWakeLock = null;
+  if (lock) lock.release().catch(() => {});
+}
+
+function updateSendWakeLock() {
+  if (shouldHoldSendWakeLock()) acquireSendWakeLock();
+  else releaseSendWakeLock();
+}
 
 class ChunkScheduler {
   constructor() {
@@ -1321,14 +1569,20 @@ class ChunkScheduler {
     this.queue.push(entry);
     this.queue.sort((a, b) => a.priority - b.priority);
     this._run();
+    updateSendWakeLock();
     return entry;
   }
   cancelItem(itemId) {
     for (const e of this.queue) if (e.itemId === itemId) e.cancel();
+    updateSendWakeLock();
+  }
+  hasPending() {
+    return this.running || this.queue.some(e => !e.cancelled);
   }
   async _run() {
     if (this.running) return;
     this.running = true;
+    updateSendWakeLock();
     try {
       while (this.queue.length > 0) {
         this.queue = this.queue.filter(e => !e.cancelled);
@@ -1347,6 +1601,7 @@ class ChunkScheduler {
     } finally {
       this.running = false;
       if (this.queue.some(e => !e.cancelled)) this._run();
+      updateSendWakeLock();
     }
   }
 }
@@ -1365,9 +1620,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!url) return;
     try { await navigator.clipboard.writeText(url); showToast('URL copied!'); } catch { showToast(url); }
   });
-  document.getElementById('token-input').addEventListener('input', e => { e.target.value = formatToken(e.target.value); updateStartSharePreview(); });
-  document.getElementById('passphrase-input').addEventListener('input', updateStartSharePreview);
+  document.getElementById('token-input').addEventListener('input', e => {
+    e.target.value = formatToken(e.target.value);
+    if (startPairingCreated && normalizeToken(e.target.value) !== token) stopPairingMode({ start: true });
+    updateStartSharePreview();
+  });
+  document.getElementById('pin-input').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, PAIRING_PIN_LENGTH); clearPinError(); });
   document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
+  document.getElementById('pin-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
   document.getElementById('btn-clear').addEventListener('click', openClearModal);
   document.getElementById('btn-leave').addEventListener('click', openLeaveModal);
   document.getElementById('btn-paste').addEventListener('click', paste);
@@ -1379,6 +1639,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('chat-clear').addEventListener('click', openChatClearModal);
   document.getElementById('chat-send').addEventListener('click', sendChatMessage);
   document.getElementById('chat-card-add').addEventListener('click', () => document.getElementById('chat-file-input').click());
+  initChatPanelResize();
   document.querySelector('.chat-emote-toggle')?.addEventListener('click', e => {
     e.stopPropagation();
     document.querySelector('.chat-emote-picker')?.classList.toggle('open');
@@ -1404,18 +1665,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
   document.getElementById('header-token').addEventListener('click', openTokenModal);
-  document.getElementById('encryption-control').addEventListener('click', () => openPassphraseModal());
   document.getElementById('peer-pills').addEventListener('click', openPeersModal);
   document.getElementById('token-modal-close').addEventListener('click', closeTokenModal);
   document.getElementById('token-modal').addEventListener('click', e => { if (e.target.id === 'token-modal') closeTokenModal(); });
   document.getElementById('copy-token-btn').addEventListener('click', copyToken);
-  document.getElementById('copy-passphrase-btn').addEventListener('click', copyPassphrase);
   document.getElementById('copy-url-btn').addEventListener('click', copyShareUrl);
-  document.getElementById('passphrase-modal').addEventListener('click', e => { if (e.target.id === 'passphrase-modal') closePassphraseModal(); });
-  document.getElementById('passphrase-cancel').addEventListener('click', closePassphraseModal);
-  document.getElementById('passphrase-save').addEventListener('click', savePassphraseFromModal);
-  document.getElementById('passphrase-clear').addEventListener('click', clearPassphraseFromModal);
-  document.getElementById('passphrase-modal-input').addEventListener('keydown', e => { if (e.key === 'Enter') savePassphraseFromModal(); });
   document.getElementById('peers-modal-close').addEventListener('click', closePeersModal);
   document.getElementById('peers-modal').addEventListener('click', e => { if (e.target.id === 'peers-modal') closePeersModal(); });
   document.getElementById('clear-modal').addEventListener('click', e => { if (e.target.id === 'clear-modal') closeClearModal(); });
@@ -1441,8 +1695,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) checkForegroundFreshness();
+    updateSendWakeLock();
   });
-  window.addEventListener('focus', checkForegroundFreshness);
+  window.addEventListener('focus', () => {
+    checkForegroundFreshness();
+    updateSendWakeLock();
+  });
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', updateChatViewportHeight);
     window.visualViewport.addEventListener('scroll', updateChatViewportHeight);
@@ -1459,12 +1717,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const pathToken = tokenFromPath();
   const hashPassphrase = passphraseFromHash();
-  if (hashPassphrase) currentPassphrase = hashPassphrase;
-  if (pathToken) {
+  const savedToken = normalizeToken(localStorage.getItem('clipshare_token'));
+  const savedPassphrase = localStorage.getItem('clipshare_passphrase') || '';
+  if (pathToken && isGeneratedPasskey(hashPassphrase)) {
+    currentPassphrase = hashPassphrase;
+    saveTokenInputsToStorage(pathToken, currentPassphrase);
     setToken(pathToken);
-    if (hashPassphrase) setCurrentPassphrase(hashPassphrase, true);
+  } else if (pathToken && pathToken === savedToken && isGeneratedPasskey(savedPassphrase)) {
+    currentPassphrase = savedPassphrase;
+    localStorage.setItem('clipshare_passphrase', currentPassphrase);
+    setToken(pathToken);
   } else {
     loadTokenInputsFromStorage();
+    if (pathToken) {
+      document.getElementById('token-input').value = formatToken(pathToken);
+      history.replaceState({}, '', '/');
+    }
   }
   renderChatEmotes();
   renderChatMessages();
@@ -1478,6 +1746,337 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Token management ────────────────────────────────────────────────
+function arrayBufferToBytes(buffer) {
+  return Array.from(new Uint8Array(buffer));
+}
+
+function bytesToArrayBuffer(bytes) {
+  return new Uint8Array(bytes || []).buffer;
+}
+
+async function generateRsaKeyPair() {
+  return await crypto.subtle.generateKey(
+    {
+      name: 'RSA-OAEP',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256',
+    },
+    true,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function exportRsaPublicKey(keyPair) {
+  return await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+}
+
+async function importRsaPublicKey(jwk) {
+  return await crypto.subtle.importKey(
+    'jwk',
+    jwk,
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    false,
+    ['encrypt']
+  );
+}
+
+async function rsaEncryptJson(publicKeyJwk, payload) {
+  const publicKey = await importRsaPublicKey(publicKeyJwk);
+  const encoded = new TextEncoder().encode(JSON.stringify(payload));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, encoded);
+  return { ciphertext: arrayBufferToBytes(ciphertext) };
+}
+
+async function rsaDecryptJson(privateKey, encryptedPayload) {
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'RSA-OAEP' },
+    privateKey,
+    bytesToArrayBuffer(encryptedPayload?.ciphertext)
+  );
+  return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+function pairingIsActive() {
+  return startPairingCreated || modalPairingActive;
+}
+
+function setPinInputEnabled(enabled) {
+  const input = document.getElementById('pin-input');
+  if (input) input.disabled = !enabled;
+}
+
+function updatePairingUi() {
+  const active = pairingIsActive() && pairingPin;
+  const remaining = Math.max(0, Math.ceil((pairingPinExpiresAt - Date.now()) / 1000));
+  const startBox = document.getElementById('start-pairing-pin');
+  const modalBox = document.getElementById('modal-pairing-pin');
+  const pinField = document.getElementById('start-pin-field');
+  const showPairing = startPairingCreated && active;
+  if (startBox) startBox.style.display = showPairing ? '' : 'none';
+  if (pinField) pinField.style.display = showPairing ? 'none' : '';
+  const createBtn = document.getElementById('btn-create');
+  if (createBtn) createBtn.innerHTML = startPairingCreated
+    ? '<i data-lucide="refresh-cw"></i> Regenerate'
+    : '<i data-lucide="plus"></i> Create space';
+  if (createBtn) lucide.createIcons({ nodes: [createBtn] });
+  if (modalBox) modalBox.style.display = modalPairingActive && active ? '' : 'none';
+  const pinHtml = pairingPin
+    ? `<span>${pairingPin.slice(0, 4)}</span><span class="pin-sep" aria-hidden="true"> </span><span>${pairingPin.slice(4)}</span>`
+    : '';
+  const label = remaining ? `${remaining}s` : 'Refreshing';
+  const startValue = document.getElementById('start-pin-value');
+  const modalValue = document.getElementById('modal-pin-value');
+  const startTime = document.getElementById('start-pin-time');
+  const modalTime = document.getElementById('modal-pin-time');
+  if (startValue) startValue.innerHTML = pinHtml;
+  if (modalValue) modalValue.innerHTML = pinHtml;
+  if (startTime) startTime.textContent = label;
+  if (modalTime) modalTime.textContent = label;
+}
+
+function stopPairingUiTimer() {
+  if (pairingUiTimer) clearInterval(pairingUiTimer);
+  pairingUiTimer = null;
+}
+
+function startPairingUiTimer() {
+  stopPairingUiTimer();
+  updatePairingUi();
+  pairingUiTimer = setInterval(updatePairingUi, 250);
+}
+
+function pairingSocketUrl(tokenValue) {
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${protocol}://${location.host}/ws/${encodeURIComponent(tokenValue)}?clientId=${clientId}&channel=control`;
+}
+
+function activePairingSocket() {
+  return ws?.readyState === WebSocket.OPEN ? ws : pairingHostWs;
+}
+
+function sendPairingJson(msg) {
+  const socket = activePairingSocket();
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(msg));
+  return true;
+}
+
+function closePairingHostSocket() {
+  if (pairingHostWs) {
+    pairingHostWs.onclose = null;
+    pairingHostWs.close();
+    pairingHostWs = null;
+  }
+}
+
+function ensurePairingHostSocket(tokenValue) {
+  if (ws?.readyState === WebSocket.OPEN) return;
+  if (pairingHostWs && pairingHostWs.readyState <= WebSocket.OPEN) return;
+  pairingHostWs = new WebSocket(pairingSocketUrl(tokenValue));
+  pairingHostWs.onmessage = async event => {
+    try { await handleServerMessage(JSON.parse(event.data)); } catch {}
+  };
+  pairingHostWs.onopen = () => publishPairingMode();
+  pairingHostWs.onclose = () => {
+    if (pairingIsActive() && !ws) setTimeout(() => ensurePairingHostSocket(tokenValue), 1000);
+  };
+}
+
+async function publishPairingMode() {
+  if (!pairingIsActive() || !token || !pairingKeyPair || pairingPinExpiresAt <= Date.now()) return false;
+  const publicKeyJwk = await exportRsaPublicKey(pairingKeyPair);
+  return sendPairingJson({
+    type: 'pairing_mode',
+    publicKeyJwk,
+    expiresAt: pairingPinExpiresAt,
+  });
+}
+
+async function rotatePairingPin() {
+  if (!pairingIsActive() || !token || !currentPassphrase) return;
+  pairingPin = generatePairingPin();
+  pairingPinExpiresAt = Date.now() + PAIRING_PIN_TTL_MS;
+  pairingKeyPair = await generateRsaKeyPair();
+  document.querySelectorAll('.pairing-spinner').forEach(el => {
+    el.style.animation = 'none';
+    el.offsetWidth;
+    el.style.animation = `pin-countdown ${PAIRING_PIN_TTL_MS / 1000}s linear 1 forwards`;
+  });
+  startPairingUiTimer();
+  ensurePairingHostSocket(token);
+  await publishPairingMode();
+  if (pairingRotateTimer) clearTimeout(pairingRotateTimer);
+  pairingRotateTimer = setTimeout(rotatePairingPin, PAIRING_PIN_TTL_MS);
+}
+
+function stopPairingMode({ start = false, modal = false, all = false } = {}) {
+  if (all || start) startPairingCreated = false;
+  if (all || modal) modalPairingActive = false;
+  if (pairingIsActive()) {
+    updatePairingUi();
+    return;
+  }
+  if (pairingRotateTimer) clearTimeout(pairingRotateTimer);
+  pairingRotateTimer = null;
+  stopPairingUiTimer();
+  pairingPin = '';
+  pairingPinExpiresAt = 0;
+  pairingKeyPair = null;
+  sendPairingJson({ type: 'pairing_stop' });
+  closePairingHostSocket();
+  updatePairingUi();
+}
+
+async function startPairingMode({ start = false, modal = false } = {}) {
+  if (!token || !currentPassphrase) return;
+  if (start) startPairingCreated = true;
+  if (modal) modalPairingActive = true;
+  if (!pairingPin || pairingPinExpiresAt <= Date.now()) await rotatePairingPin();
+  else {
+    startPairingUiTimer();
+    ensurePairingHostSocket(token);
+    await publishPairingMode();
+  }
+}
+
+function updatePairingHosts(hosts = []) {
+  pairingHosts.clear();
+  for (const host of hosts || []) {
+    if (!host?.clientId || host.clientId === clientId || !host.publicKeyJwk) continue;
+    if (Number(host.expiresAt) <= Date.now()) continue;
+    pairingHosts.set(host.clientId, host);
+  }
+}
+
+function closePairingJoinSocket() {
+  if (pairingJoinWs) {
+    pairingJoinWs.onclose = null;
+    pairingJoinWs.close();
+    pairingJoinWs = null;
+  }
+}
+
+function clearPairingJoinTimer() {
+  if (pairingJoinTimer) clearTimeout(pairingJoinTimer);
+  pairingJoinTimer = null;
+}
+
+function resetPairingJoin() {
+  clearPairingJoinTimer();
+  pairingJoinKeyPair = null;
+  pairingJoinRequestId = null;
+  pairingJoinToken = '';
+  closePairingJoinSocket();
+}
+
+function showPinError(msg) {
+  const el = document.getElementById('pin-error');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = '';
+}
+
+function clearPinError() {
+  const el = document.getElementById('pin-error');
+  if (el) el.style.display = 'none';
+}
+
+function pairingJoinFailed(message = 'PIN does not match any peer') {
+  showPinError(message);
+  resetPairingJoin();
+  setPinInputEnabled(true);
+}
+
+async function requestPairingWithHosts() {
+  const pin = (document.getElementById('pin-input')?.value || '').replace(/\D/g, '');
+  if (!pairingJoinWs || pairingJoinWs.readyState !== WebSocket.OPEN || !pairingJoinKeyPair || !pin || pin.length !== PAIRING_PIN_LENGTH) return;
+  const hosts = [...pairingHosts.values()].filter(host => Number(host.expiresAt) > Date.now());
+  if (!hosts.length) {
+    pairingJoinFailed('No peer found with an active pairing PIN on this token');
+    return;
+  }
+  const requesterPublicKeyJwk = await exportRsaPublicKey(pairingJoinKeyPair);
+  pairingJoinRequestId = randomUUID();
+  for (const host of hosts) {
+    const encryptedPin = await rsaEncryptJson(host.publicKeyJwk, {
+      kind: 'clipshare-pairing-pin',
+      requestId: pairingJoinRequestId,
+      pin,
+    });
+    pairingJoinWs.send(JSON.stringify({
+      type: 'pairing_request',
+      requestId: pairingJoinRequestId,
+      hostIds: [host.clientId],
+      requesterPublicKeyJwk,
+      encryptedPin,
+    }));
+  }
+  clearPairingJoinTimer();
+  pairingJoinTimer = setTimeout(() => pairingJoinFailed('PIN does not match any peer'), PAIRING_JOIN_TIMEOUT_MS);
+}
+
+async function handlePairingJoinMessage(msg) {
+  if (msg.type === 'welcome' || msg.type === 'pairing_hosts') {
+    updatePairingHosts(msg.pairingHosts || msg.hosts || []);
+    await requestPairingWithHosts();
+    return;
+  }
+  if (msg.type !== 'pairing_response' || msg.requestId !== pairingJoinRequestId || !pairingJoinKeyPair) return;
+  try {
+    const payload = await rsaDecryptJson(pairingJoinKeyPair.privateKey, msg.encryptedPassphrase);
+    if (payload?.kind !== 'clipshare-pairing-passphrase' || !isGeneratedPasskey(payload.passphrase)) throw new Error('bad passphrase');
+    const pairedToken = pairingJoinToken;
+    currentPassphrase = payload.passphrase;
+    saveTokenInputsToStorage(pairedToken, currentPassphrase);
+    resetPairingJoin();
+    clearPinError();
+    setPinInputEnabled(true);
+    setToken(pairedToken);
+  } catch {
+    pairingJoinFailed('Invalid pairing response');
+  }
+}
+
+async function joinWithPairingPin(tokenValue, pin) {
+  pairingJoinToken = tokenValue;
+  pairingJoinKeyPair = await generateRsaKeyPair();
+  setPinInputEnabled(false);
+  closePairingJoinSocket();
+  pairingJoinWs = new WebSocket(pairingSocketUrl(tokenValue));
+  pairingJoinWs.onmessage = async event => {
+    try { await handlePairingJoinMessage(JSON.parse(event.data)); } catch {}
+  };
+  pairingJoinWs.onopen = () => {};
+  pairingJoinWs.onerror = () => pairingJoinFailed('Pairing failed');
+  pairingJoinWs.onclose = () => {
+    if (pairingJoinRequestId) pairingJoinFailed('Pairing disconnected');
+  };
+  clearPairingJoinTimer();
+  pairingJoinTimer = setTimeout(() => pairingJoinFailed('PIN does not match any peer'), PAIRING_JOIN_TIMEOUT_MS);
+}
+
+async function answerPairingRequest(msg) {
+  if (!pairingIsActive() || !pairingKeyPair || !currentPassphrase || pairingPinExpiresAt <= Date.now()) return;
+  try {
+    const request = await rsaDecryptJson(pairingKeyPair.privateKey, msg.encryptedPin);
+    if (request?.kind !== 'clipshare-pairing-pin' || request.pin !== pairingPin || request.requestId !== msg.requestId) return;
+    const encryptedPassphrase = await rsaEncryptJson(msg.requesterPublicKeyJwk, {
+      kind: 'clipshare-pairing-passphrase',
+      requestId: msg.requestId,
+      passphrase: currentPassphrase,
+    });
+    sendPairingJson({
+      type: 'pairing_response',
+      targetId: msg.senderId,
+      requestId: msg.requestId,
+      encryptedPassphrase,
+    });
+    showToast('Device paired successfully');
+    await rotatePairingPin();
+  } catch {}
+}
+
 function saveTokenInputsToStorage(tokenValue, passphraseValue) {
   localStorage.setItem('clipshare_token', normalizeToken(tokenValue));
   localStorage.setItem('clipshare_passphrase', passphraseValue || '');
@@ -1485,10 +2084,18 @@ function saveTokenInputsToStorage(tokenValue, passphraseValue) {
 
 function updateStartSharePreview() {
   const preparedToken = normalizeToken(document.getElementById('token-input').value);
-  const preparedPassphrase = document.getElementById('passphrase-input').value;
+  const preparedPassphrase = isGeneratedPasskey(currentPassphrase) ? currentPassphrase : '';
   const urlEl = document.getElementById('start-share-url');
   const qrEl = document.getElementById('start-qr-code');
-  if (!preparedToken || !urlEl || !qrEl) return;
+  const section = document.getElementById('start-share-section');
+  if (!urlEl || !qrEl) return;
+  if (!preparedToken || !preparedPassphrase || !startPairingCreated) {
+    urlEl.textContent = '';
+    qrEl.innerHTML = '';
+    if (section) section.style.display = 'none';
+    return;
+  }
+  if (section) section.style.display = '';
 
   const url = tokenShareUrl(preparedToken, preparedPassphrase);
   urlEl.textContent = url;
@@ -1508,39 +2115,55 @@ function updateStartSharePreview() {
 }
 
 function loadTokenInputsFromStorage() {
-  const savedToken = normalizeToken(localStorage.getItem('clipshare_token'));
-  const savedPassphrase = localStorage.getItem('clipshare_passphrase') || '';
-  if (savedToken) {
-    document.getElementById('token-input').value = formatToken(savedToken);
-    document.getElementById('passphrase-input').value = savedPassphrase;
-    currentPassphrase = savedPassphrase;
-  } else {
-    regenerateTokenInput(false);
-  }
+  document.getElementById('token-input').value = '';
+  document.getElementById('pin-input').value = '';
+  currentPassphrase = '';
   updateStartSharePreview();
+  updatePairingUi();
 }
 
-function regenerateTokenInput(showMessage = true) {
+async function regenerateTokenInput(showMessage = true) {
   const newToken = generateToken();
   const newPassphrase = generatePassphrase();
+  stopPairingMode({ all: true });
+  token = normalizeToken(newToken);
   document.getElementById('token-input').value = formatToken(newToken);
-  document.getElementById('passphrase-input').value = newPassphrase;
+  document.getElementById('pin-input').value = '';
   currentPassphrase = newPassphrase;
   saveTokenInputsToStorage(newToken, newPassphrase);
+  await startPairingMode({ start: true });
   updateStartSharePreview();
-  if (showMessage) showToast('New token and passphrase generated');
+  if (showMessage) showToast('Space created');
 }
 
-function joinFromInput() {
+async function joinFromInput() {
   const t = normalizeToken(document.getElementById('token-input').value);
-  const passphrase = document.getElementById('passphrase-input').value;
-  if (!t) return;
-  if (passphrase) {
-    currentPassphrase = passphrase;
-  } else {
-    currentPassphrase = '';
+  const pin = (document.getElementById('pin-input')?.value || '').replace(/\D/g, '');
+  if (!t) {
+    showToast('Enter a token first');
+    return;
   }
-  saveTokenInputsToStorage(t, passphrase);
+  if (isGeneratedPasskey(currentPassphrase)) {
+    saveTokenInputsToStorage(t, currentPassphrase);
+    enterAppWithToken(t);
+    return;
+  }
+  const hashPassphrase = passphraseFromHash();
+  if (isGeneratedPasskey(hashPassphrase)) {
+    currentPassphrase = hashPassphrase;
+    saveTokenInputsToStorage(t, currentPassphrase);
+    enterAppWithToken(t);
+    return;
+  }
+  if (pin.length === PAIRING_PIN_LENGTH) {
+    await joinWithPairingPin(t, pin);
+    return;
+  }
+  showToast('Enter an 8 digit PIN or use a full share URL');
+}
+
+function enterAppWithToken(t) {
+  stopPairingMode({ all: true });
   setToken(t);
 }
 
@@ -1549,6 +2172,7 @@ function setToken(t) {
   if (!token) return;
   localStorage.setItem('clipshare_token', token);
   history.replaceState({}, '', `/${encodeURIComponent(token)}`);
+  document.body.classList.add('app-active');
   document.getElementById('token-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   document.getElementById('header-token').textContent = token;
@@ -1559,10 +2183,14 @@ function setToken(t) {
 }
 
 function leaveSpace() {
+  stopPairingMode({ all: true });
+  resetPairingJoin();
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
   if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
   if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
   if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
+  stopMetricsPing();
+  releaseSendWakeLock();
   const chatKey = chatStorageKey();
   token = null;
   items.clear();
@@ -1574,24 +2202,35 @@ function leaveSpace() {
   toggleChatPanel(false);
   cardEncryptionKeys.clear();
   peerCardMetadata.clear();
-  fileTransfers.clear();
   binaryTransfers.clear();
-  activeBroadcasts.clear();
+  clearAllOutboundRetries();
+  outboundTransfers.clear();
+  remoteTransferStatuses.clear();
+  transferStatusPublishTimes.clear();
+  for (const timer of downloadSourceRetryTimers.values()) clearTimeout(timer);
+  downloadSourceRetryTimers.clear();
+  downloadSourceRetryAttempts.clear();
+  pendingDownloadSourceIds.clear();
+  pendingDownloadTriedSources.clear();
+  pendingChunkRequestBatches.clear();
+  downloadLogSources.clear();
+  pendingInitialSyncSources = null;
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   clientCount = 0;
   updatePeerCount();
   document.getElementById('cards').innerHTML = '';
+  document.body.classList.remove('app-active');
   document.getElementById('app').style.display = 'none';
   document.getElementById('token-screen').style.display = 'flex';
-  regenerateTokenInput(false);
+  loadTokenInputsFromStorage();
   history.replaceState({}, '', '/');
   setDot('disconnected');
   updateEmpty();
 }
 
 function openClearModal() {
-  if (!items.size) return;
+  if (!items.size && !chatMessages.length) return;
   const modal = document.getElementById('clear-modal');
   modal.classList.add('open');
   modal.setAttribute('aria-hidden', 'false');
@@ -1655,45 +2294,211 @@ function cardMetadataFromItem(item) {
   };
 }
 
-function cardMetadataFromEncryptedMeta(meta = {}) {
-  if (meta.payloadType === 'item_deleted') return null;
-  if (!meta.itemId) return null;
-  return {
-    id: meta.itemId,
-    type: meta.itemType || 'encrypted',
-    addedAt: meta.addedAt,
-    encrypted: true,
-  };
+function nextManifestRevision(itemId) {
+  const revision = Math.max(Date.now(), (manifestRevisions.get(itemId) || 0) + 1);
+  manifestRevisions.set(itemId, revision);
+  return revision;
+}
+
+async function encryptedManifestMeta(item) {
+  if (!encryptionKey) return null;
+  const meta = cardMetadataFromItem(item);
+  if (!meta) return null;
+  return await encryptMessage(JSON.stringify(meta), encryptionKey);
 }
 
 function debugLog(event, details = {}) {
-  console.log(`[ClipShare:${event}]`, {
+  console.log(event, {
     clientId: clientId.slice(0, 8),
     token,
     ...details,
   });
 }
 
-function debugProgress(event, itemId, done, total, details = {}) {
-  const pct = total ? Math.floor((done / total) * 100) : 0;
-  const bucket = pct >= 100 ? 100 : Math.floor(pct / 10) * 10;
-  const key = `${event}:${itemId}:${details.peerId || details.targetId || details.path || 'local'}`;
-  if (debugProgressMarks.get(key) === bucket) return;
-  debugProgressMarks.set(key, bucket);
-  debugLog(event, { itemId, done, total, percent: pct, ...details });
+function downloadLogFileLabel(itemId) {
+  return transferItemTitle(itemId) || String(itemId || 'file');
 }
 
-function publishClientCardMetadata(item) {
+function downloadLogSourceLabel(sourceId) {
+  return buildPeerIdentityMap().get(sourceId)?.fullName || (sourceId ? `Peer ${String(sourceId).slice(0, 8)}` : 'Unknown source');
+}
+
+function uploadLogTargetLabel(targetId) {
+  return targetId ? downloadLogSourceLabel(targetId) : 'Broadcast';
+}
+
+function logDownloadSourceStart(itemId, sourceId, totalChunks) {
+  if (!itemId || !sourceId) return;
+  if (!downloadLogSources.has(itemId)) downloadLogSources.set(itemId, new Set());
+  const sources = downloadLogSources.get(itemId);
+  if (sources.has(sourceId)) return;
+  sources.add(sourceId);
+  console.log(`DN ${downloadLogFileLabel(itemId)} chunks ${downloadLogSourceLabel(sourceId)} start`, {
+    chunks: totalChunks || 0,
+  });
+}
+
+function logDownloadChunk(itemId, chunkIndex, totalChunks, sourceId) {
+  if (!itemId || !sourceId || !Number.isFinite(chunkIndex)) return;
+  console.log(`DN ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${downloadLogSourceLabel(sourceId)}`);
+}
+
+function logDownloadDone(itemId, sourceIds = []) {
+  const names = [...new Set(sourceIds.filter(Boolean).map(downloadLogSourceLabel))];
+  console.log(`DN ${downloadLogFileLabel(itemId)} chunks ${names.join(' + ') || 'Unknown source'} done`);
+  downloadLogSources.delete(itemId);
+}
+
+function logUploadStart(itemId, targetId, totalChunks) {
+  console.log(`UP ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} start`, {
+    chunks: totalChunks || 0,
+  });
+}
+
+function logUploadChunk(itemId, chunkIndex, totalChunks, targetId) {
+  if (!itemId || !Number.isFinite(chunkIndex)) return;
+  console.log(`UP ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${uploadLogTargetLabel(targetId)}`);
+}
+
+function logUploadDone(itemId, targetId) {
+  console.log(`UP ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} done`);
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32Bytes(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function isValidChunkIndex(index, totalChunks) {
+  return Number.isInteger(index) && index >= 0 && index < totalChunks;
+}
+
+function isValidChunkSet(chunkIndex, totalChunks) {
+  return Number.isInteger(totalChunks)
+    && totalChunks > 0
+    && totalChunks <= MAX_TRANSFER_CHUNKS
+    && isValidChunkIndex(chunkIndex, totalChunks);
+}
+
+function normalizeChunkIndexes(indexes, totalChunks) {
+  if (!Array.isArray(indexes) || !Number.isFinite(totalChunks)) return null;
+  const unique = [...new Set(indexes.map(Number).filter(index => isValidChunkIndex(index, totalChunks)))];
+  unique.sort((a, b) => a - b);
+  return unique;
+}
+
+function detectDeviceType() {
+  const ua = navigator.userAgent || '';
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches;
+  const narrowViewport = Math.min(window.innerWidth || 0, window.innerHeight || 0) < 820;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (coarsePointer && narrowViewport) ? 'mobile' : 'desktop';
+}
+
+function normalizeClientMetrics(metrics = {}) {
+  return {
+    deviceType: metrics.deviceType === 'mobile' ? 'mobile' : 'desktop',
+    pingMs: Number.isFinite(Number(metrics.pingMs)) ? Number(metrics.pingMs) : null,
+    uploadBps: Number.isFinite(Number(metrics.uploadBps)) ? Number(metrics.uploadBps) : null,
+    downloadBps: Number.isFinite(Number(metrics.downloadBps)) ? Number(metrics.downloadBps) : null,
+    updatedAt: Number(metrics.updatedAt) || Date.now(),
+  };
+}
+
+function publishClientMetrics() {
+  selfClientMetrics.deviceType = detectDeviceType();
+  selfClientMetrics.updatedAt = Date.now();
+  return false;
+}
+
+function recordTransferMetric(kind, bytes, startTime) {
+  const elapsedSeconds = Math.max((Date.now() - startTime) / 1000, 0.001);
+  const bps = Math.round((Number(bytes) || 0) / elapsedSeconds);
+  if (!Number.isFinite(bps) || bps <= 0) return;
+  if (kind === 'upload') selfClientMetrics.uploadBps = bps;
+  if (kind === 'download') selfClientMetrics.downloadBps = bps;
+  publishClientMetrics();
+}
+
+function startMetricsPing() {
+  stopMetricsPing();
+  sendMetricsPing();
+  metricsPingTimer = setInterval(sendMetricsPing, METRICS_PING_INTERVAL_MS);
+}
+
+function stopMetricsPing() {
+  if (metricsPingTimer) {
+    clearInterval(metricsPingTimer);
+    metricsPingTimer = null;
+  }
+}
+
+function sendMetricsPing() {
+  return false;
+}
+
+function formatSpeed(bytesPerSecond) {
+  const bps = Number(bytesPerSecond);
+  if (!Number.isFinite(bps) || bps <= 0) return '...';
+  if (bps < 1024) return `${Math.round(bps)} B/s`;
+  if (bps < 1048576) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / 1048576).toFixed(1)} MB/s`;
+}
+
+function formatPing(ms) {
+  const value = Number(ms);
+  return Number.isFinite(value) && value >= 0 ? `${Math.round(value)} ms` : '...';
+}
+
+function metricsDetail(metrics) {
+  const m = normalizeClientMetrics(metrics);
+  return `${m.deviceType === 'mobile' ? 'Mobile' : 'Desktop'} | Ping ${formatPing(m.pingMs)} | Up ${formatSpeed(m.uploadBps)} | Down ${formatSpeed(m.downloadBps)}`;
+}
+
+async function publishClientCardMetadata(item) {
   const meta = cardMetadataFromItem(item);
   if (!meta || !ws || ws.readyState !== WebSocket.OPEN) return;
   debugLog('announce', { itemId: item.id, type: item.type, filename: item.filename, size: item.size, encrypted: !!item.encrypted });
-  sendPriorityJson({ type: 'metadata_update', action: 'upsert', item: meta, encrypted: !!meta.encrypted });
+  const encryptedMeta = await encryptedManifestMeta(item);
+  if (!encryptedMeta) return;
+  const revision = nextManifestRevision(item.id);
+  sendPriorityJson({
+    type: 'manifest_upsert',
+    itemId: item.id,
+    revision,
+    updatedAt: Date.now(),
+    encryptedMeta,
+  });
 }
 
 function publishClientCardRemoval(itemId, reason = 'delete') {
   if (!itemId || !ws || ws.readyState !== WebSocket.OPEN) return;
   debugLog('announce-remove', { itemId, reason });
-  sendPriorityJson({ type: 'metadata_update', action: 'delete', itemId });
+  sendPriorityJson({
+    type: 'manifest_delete',
+    itemId,
+    revision: nextManifestRevision(itemId),
+    updatedAt: Date.now(),
+  });
+}
+
+function publishLocalManifest() {
+  for (const item of items.values()) {
+    if (item.type === 'encrypted') continue;
+    publishClientCardMetadata(item);
+  }
 }
 
 function rememberPeerCardMetadata(peerId, metadata) {
@@ -1708,6 +2513,51 @@ function forgetPeerCardMetadata(peerId, itemId) {
   if (!cards) return;
   cards.delete(itemId);
   if (!cards.size) peerCardMetadata.delete(peerId);
+}
+
+function rememberManifestMeta(ownerId, meta, revision = 0, holders = null) {
+  if (!ownerId || !meta?.id) return;
+  const existing = roomManifest.get(meta.id);
+  if (existing && (existing.revision || 0) > revision) return;
+  const holderIds = [...new Set((holders?.length ? holders : [ownerId]).filter(Boolean))];
+  roomManifest.set(meta.id, { ownerId, holders: holderIds, revision, meta });
+  manifestRevisions.set(meta.id, Math.max(manifestRevisions.get(meta.id) || 0, revision || 0));
+  for (const peerId of [...peerCardMetadata.keys()]) forgetPeerCardMetadata(peerId, meta.id);
+  for (const holderId of holderIds) {
+    if (holderId !== clientId) rememberPeerCardMetadata(holderId, meta);
+  }
+}
+
+function removeManifestMeta(itemId, revision = 0) {
+  if (!itemId) return;
+  const existing = roomManifest.get(itemId);
+  if (existing && (existing.revision || 0) > revision) return;
+  roomManifest.delete(itemId);
+  manifestRevisions.set(itemId, Math.max(manifestRevisions.get(itemId) || 0, revision || 0));
+  for (const peerId of peerCardMetadata.keys()) forgetPeerCardMetadata(peerId, itemId);
+}
+
+async function applyManifestRecord(record) {
+  if (!record?.itemId) return;
+  const revision = Number(record.revision) || 0;
+  if (record.deleted) {
+    removeManifestMeta(record.itemId, revision);
+    return;
+  }
+  if (!record.encryptedMeta || !encryptionKey) return;
+  try {
+    const meta = JSON.parse(await decryptMessage(record.encryptedMeta, encryptionKey));
+    if (meta?.id !== record.itemId) return;
+    rememberManifestMeta(record.ownerId, meta, revision, record.holders);
+  } catch {
+    // A manifest from a different passkey stays invisible.
+  }
+}
+
+async function applyManifestSnapshot(records = []) {
+  for (const record of records || []) await applyManifestRecord(record);
+  if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+  armRecoveryTimersForIncompleteReceives();
 }
 
 function applyPeerMetadataUpdate(msg) {
@@ -1728,40 +2578,345 @@ function seedPeerMetadataFromSources(sources = []) {
     const cards = new Map();
     (source.items || []).forEach(item => {
       const meta = cardMetadataFromItem(item);
+      if (!meta?.filename && !meta?.mimeType && meta?.type === 'unknown') return;
       if (meta) cards.set(meta.id, meta);
     });
     if (cards.size) peerCardMetadata.set(source.clientId, cards);
   }
 }
 
+function hasConnectedCompleteSource(itemId) {
+  if (!itemId) return false;
+  for (const [peerId, cards] of peerCardMetadata) {
+    if (connectedPeers.get(peerId)?.compatibility === 'compatible' && cards?.has(itemId)) return true;
+  }
+  return false;
+}
+
+function isIncompleteIncomingCard(itemId) {
+  const item = items.get(itemId);
+  return !!itemId && (
+    binaryTransfers.has(itemId) ||
+    expectsIncomingChunks(item)
+  );
+}
+
+function cancelInterruptedIncomingCard(itemId) {
+  if (!isIncompleteIncomingCard(itemId)) return false;
+  items.delete(itemId);
+  cardEncryptionKeys.delete(itemId);
+  binaryTransfers.delete(itemId);
+  chunkScheduler.cancelItem(itemId);
+  clearOutboundRetriesForItem(itemId);
+  outboundTransfers.delete(itemId);
+  clearAutomaticDownloadRetry(itemId);
+  downloadSourceRetryAttempts.delete(itemId);
+  pendingDownloadSourceIds.delete(itemId);
+  pendingDownloadTriedSources.delete(itemId);
+  pendingChunkRequestBatches.delete(itemId);
+  downloadLogSources.delete(itemId);
+  clearTransferStatusesForItem(itemId);
+  removeCardAnimated(itemId, updateEmpty);
+  updateSendWakeLock();
+  return true;
+}
+
+function removeOrphanedIncomingCards() {
+  const candidateIds = new Set([
+    ...binaryTransfers.keys(),
+    ...[...items.values()].filter(item => expectsIncomingChunks(item)).map(item => item.id),
+  ]);
+  let removed = 0;
+  for (const itemId of candidateIds) {
+    if (!hasConnectedCompleteSource(itemId) && cancelInterruptedIncomingCard(itemId)) removed++;
+  }
+  if (removed) {
+    showToast(removed === 1 ? 'Transfer interrupted.' : 'Transfers interrupted.');
+    schedulePeersModalRefresh();
+  }
+}
+
 function peerCardTitle(meta) {
   if (meta.filename) return meta.filename;
-  if (meta.type === 'text') return 'Text card';
-  if (meta.type === 'image') return 'Image';
-  if (meta.encrypted) return 'Encrypted card';
-  return `${String(meta.type || 'Card').charAt(0).toUpperCase()}${String(meta.type || 'card').slice(1)}`;
+  if (meta.mimeType) return fileTypeName(meta.mimeType);
+  if (meta.type === 'text') return 'Text note';
+  if (meta.type === 'image') return 'Shared image';
+  if (meta.type === 'file') return 'Shared file';
+  return 'Shared card';
 }
 
 function peerCardDetail(meta) {
+  if (!meta.size) return '';
   const parts = [];
-  if (meta.encrypted) parts.push('Encrypted');
-  if (meta.size) parts.push(humanSize(meta.size));
+  parts.push(humanSize(meta.size));
   if (meta.addedAt) parts.push(timeAgo(meta.addedAt));
-  return parts.join(' | ') || 'Metadata';
+  return parts.join(' | ');
+}
+
+function transferItemTitle(itemId) {
+  const item = items.get(itemId);
+  if (item) return peerCardTitle(cardMetadataFromItem(item) || item);
+  for (const cards of peerCardMetadata.values()) {
+    const meta = cards?.get(itemId);
+    if (meta) return peerCardTitle(meta);
+  }
+  return 'File';
+}
+
+function transferStatusKey(status) {
+  return `${status.itemId || ''}:${status.sourceId || ''}:${status.targetId || ''}`;
+}
+
+function clearRemoteTransferStatusesForPeer(peerId) {
+  for (const [key, status] of remoteTransferStatuses) {
+    if (status.sourceId === peerId || status.targetId === peerId) remoteTransferStatuses.delete(key);
+  }
+}
+
+function clearTransferStatusesForItem(itemId) {
+  for (const key of remoteTransferStatuses.keys()) {
+    if (key.startsWith(`${itemId}:`)) remoteTransferStatuses.delete(key);
+  }
+  for (const key of transferStatusPublishTimes.keys()) {
+    if (key.startsWith(`${itemId}:`)) transferStatusPublishTimes.delete(key);
+  }
+}
+
+function publishTransferStatus({ itemId, sourceId, targetId, current, done, total, chunkRuns = null, status = 'active', force = false }) {
+  if (!itemId || !sourceId || !targetId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const key = `${itemId}:${sourceId}:${targetId}`;
+  const now = Date.now();
+  if (!force && now - (transferStatusPublishTimes.get(key) || 0) < 350) return;
+  transferStatusPublishTimes.set(key, now);
+  wsSend({
+    type: 'relay',
+    payload: {
+      type: 'transfer_status',
+      itemId,
+      sourceId,
+      targetId,
+      title: transferItemTitle(itemId),
+      currentChunk: Math.max(0, Number(current) || 0),
+      receivedChunks: Math.max(0, Number(done) || 0),
+      totalChunks: Math.max(0, Number(total) || 0),
+      chunkRuns: normalizeTransferChunkRuns(chunkRuns),
+      status,
+      updatedAt: now,
+    },
+  }, null, true);
+}
+
+function applyRemoteTransferStatus(status) {
+  if (!status?.itemId || !status.sourceId || !status.targetId) return;
+  if (status.sourceId === clientId || status.targetId === clientId) return;
+  const normalized = {
+    itemId: String(status.itemId),
+    sourceId: String(status.sourceId),
+    targetId: String(status.targetId),
+    title: String(status.title || transferItemTitle(status.itemId)).slice(0, 160),
+    currentChunk: Math.max(0, Number(status.currentChunk) || 0),
+    receivedChunks: Math.max(0, Number(status.receivedChunks) || 0),
+    totalChunks: Math.max(0, Number(status.totalChunks) || 0),
+    chunkRuns: normalizeTransferChunkRuns(status.chunkRuns),
+    status: status.status === 'done' ? 'done' : 'active',
+    updatedAt: Number(status.updatedAt) || Date.now(),
+  };
+  const key = transferStatusKey(normalized);
+  const previous = remoteTransferStatuses.get(key);
+  if (!normalized.chunkRuns.length && previous?.chunkRuns?.length) normalized.chunkRuns = previous.chunkRuns;
+  if (normalized.status === 'done') {
+    remoteTransferStatuses.set(key, normalized);
+    setTimeout(() => {
+      const current = remoteTransferStatuses.get(key);
+      if (current?.updatedAt === normalized.updatedAt) {
+        remoteTransferStatuses.delete(key);
+        schedulePeersModalRefresh();
+      }
+    }, 1500);
+  } else {
+    remoteTransferStatuses.set(key, normalized);
+  }
+  schedulePeersModalRefresh();
+}
+
+function normalizeTransferChunkRuns(runs) {
+  if (!Array.isArray(runs)) return [];
+  return runs
+    .map(run => ({
+      sourceId: run?.sourceId ? String(run.sourceId) : '',
+      count: Math.max(0, Math.floor(Number(run?.count) || 0)),
+    }))
+    .filter(run => run.count > 0);
+}
+
+function transferChunkRunsFromSources(sourceIds, totalChunks) {
+  const total = Math.max(0, Math.floor(Number(totalChunks) || 0));
+  if (!total) return [];
+  const runs = [];
+  let currentSourceId = '';
+  let count = 0;
+  for (let i = 0; i < total; i++) {
+    const nextSourceId = sourceIds?.[i] ? String(sourceIds[i]) : '';
+    if (i === 0 || nextSourceId === currentSourceId) {
+      currentSourceId = nextSourceId;
+      count++;
+      continue;
+    }
+    runs.push({ sourceId: currentSourceId, count });
+    currentSourceId = nextSourceId;
+    count = 1;
+  }
+  if (count) runs.push({ sourceId: currentSourceId, count });
+  return runs;
+}
+
+function transferChunkRunsFromAcked(progress, sourceId) {
+  const total = Math.max(0, Math.floor(Number(progress?.total) || 0));
+  if (!total) return [];
+  const sources = new Array(total).fill('');
+  for (const index of progress?.ackedChunks || []) {
+    if (Number.isInteger(index) && index >= 0 && index < total) sources[index] = sourceId || '';
+  }
+  return transferChunkRunsFromSources(sources, total);
+}
+
+function transferStatusRowsForPeer(peerId) {
+  const rows = [];
+  const imap = buildPeerIdentityMap();
+  for (const [itemId, transfer] of binaryTransfers) {
+    if (peerId !== clientId) continue;
+    rows.push({
+      itemId,
+      direction: 'Receiving',
+      sourceId: transfer.senderId || '',
+      sourceIds: transferSourceIdsFromChunks(transfer.chunkSources, transfer.senderId),
+      source: imap.get(transfer.senderId)?.fullName || 'Peer',
+      title: transferItemTitle(itemId),
+      current: transfer.currentChunk || transfer.received || 0,
+      done: transfer.received || 0,
+      total: transfer.totalChunks || 0,
+      chunkRuns: transferChunkRunsFromSources(transfer.chunkSources, transfer.totalChunks),
+    });
+  }
+  for (const [itemId, peerMap] of outboundTransfers) {
+    const progress = peerMap.get(peerId);
+    if (!progress) continue;
+    rows.push({
+      itemId,
+      direction: 'Receiving',
+      sourceId: clientId,
+      sourceIds: [clientId],
+      source: 'You',
+      title: transferItemTitle(itemId),
+      current: progress.currentChunk || progress.sent || 0,
+      done: progress.sent || 0,
+      total: progress.total || 0,
+      chunkRuns: transferChunkRunsFromAcked(progress, clientId),
+    });
+  }
+  for (const status of remoteTransferStatuses.values()) {
+    if (status.targetId !== peerId) continue;
+    rows.push({
+      itemId: status.itemId,
+      direction: 'Receiving',
+      sourceId: status.sourceId,
+      sourceIds: [status.sourceId],
+      source: imap.get(status.sourceId)?.fullName || 'Peer',
+      title: status.title || transferItemTitle(status.itemId),
+      current: status.currentChunk || status.receivedChunks || 0,
+      done: status.receivedChunks || 0,
+      total: status.totalChunks || 0,
+      chunkRuns: status.chunkRuns || [],
+    });
+  }
+  return mergeTransferStatusRows(rows);
+}
+
+function mergeTransferStatusRows(rows) {
+  const merged = new Map();
+  for (const row of rows) {
+    const key = row.itemId || `${row.title}:${row.total}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, { ...row, sourceNames: new Set([row.source].filter(Boolean)), sourceIds: new Set(row.sourceIds || [row.sourceId].filter(Boolean)) });
+      continue;
+    }
+    if (row.source) existing.sourceNames.add(row.source);
+    for (const sourceId of row.sourceIds || [row.sourceId].filter(Boolean)) existing.sourceIds.add(sourceId);
+    existing.current = Math.max(existing.current || 0, row.current || 0);
+    existing.done = Math.max(existing.done || 0, row.done || 0);
+    existing.total = Math.max(existing.total || 0, row.total || 0);
+    if ((row.chunkRuns?.length || 0) > (existing.chunkRuns?.length || 0)) existing.chunkRuns = row.chunkRuns;
+  }
+  return [...merged.values()].map(row => ({
+    ...row,
+    sourceIds: [...row.sourceIds],
+    source: [...row.sourceNames].join(' + ') || row.source || 'Peer',
+  }));
+}
+
+function renderTransferStatus(rows) {
+  if (!rows.length) return '';
+  return `<div class="peer-transfer-list">${rows.map(row => {
+    const pct = row.total ? Math.round((row.done / row.total) * 100) : 0;
+    const chunk = row.total ? `${Math.min(row.current, row.total)}/${row.total}` : '...';
+    const chunkBar = renderTransferChunkBar(row);
+    return `<div class="peer-transfer-row">
+      <div class="peer-transfer-meta">
+        <span class="peer-transfer-title" title="${escAttr(row.title)}">${escHtml(row.direction)}: ${escHtml(row.title)}</span>
+        <span class="peer-transfer-source"><span>Source</span>${peerIconStackHtml(row.sourceIds, 'peer-transfer-source-icons')}<span>| Chunk ${escHtml(chunk)} | ${pct}%</span></span>
+      </div>
+      ${chunkBar}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function renderTransferChunkBar(row) {
+  const total = Math.max(0, Math.floor(Number(row.total) || 0));
+  const runs = normalizeTransferChunkRuns(row.chunkRuns);
+  if (!total || !runs.length) {
+    const pct = total ? Math.round((row.done / total) * 100) : 0;
+    return `<div class="peer-transfer-progress"><div class="peer-transfer-fill" style="width:${pct}%"></div></div>`;
+  }
+  const imap = buildPeerIdentityMap();
+  const chunks = [];
+  const densityClass = total > 120 ? ' peer-transfer-chunks-dense' : '';
+  for (const run of runs) {
+    const identity = run.sourceId ? imap.get(run.sourceId) : null;
+    const color = identity?.iconColor || 'transparent';
+    const filledClass = run.sourceId ? ' peer-transfer-chunk-done' : '';
+    for (let i = 0; i < run.count; i++) {
+      chunks.push(`<span class="peer-transfer-chunk${filledClass}" style="--peer-transfer-chunk:${escAttr(color)}"></span>`);
+    }
+  }
+  return `<div class="peer-transfer-progress peer-transfer-chunks${densityClass}" style="--peer-transfer-total:${total}">${chunks.join('')}</div>`;
+}
+
+function schedulePeersModalRefresh() {
+  const modal = document.getElementById('peers-modal');
+  if (!modal?.classList.contains('open') || peersModalRefreshTimer) return;
+  peersModalRefreshTimer = setTimeout(() => {
+    peersModalRefreshTimer = null;
+    if (modal.classList.contains('open')) openPeersModal();
+  }, 250);
 }
 
 function renderPeerCardMetadata(cards) {
   const metas = [...(cards || new Map()).values()].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
   if (!metas.length) return '<div class="peer-card-empty">No cards</div>';
-  return `<div class="peer-card-list">${metas.map(meta => `
+  return `<div class="peer-card-list">${metas.map(meta => {
+    const title = peerCardTitle(meta);
+    const detail = peerCardDetail(meta);
+    return `
     <div class="peer-card-meta">
-      <span class="peer-card-name" title="${escAttr(peerCardTitle(meta))}">${escHtml(peerCardTitle(meta))}</span>
-      <span>${escHtml(peerCardDetail(meta))}</span>
-    </div>`).join('')}</div>`;
+      <span class="peer-card-name" title="${escAttr(title)}">${escHtml(title)}</span>
+      ${detail ? `<span class="peer-card-detail">${escHtml(detail)}</span>` : ''}
+    </div>`;
+  }).join('')}</div>`;
 }
 
 function peerDetail(id, peer) {
-  return [peer?.ip, id.slice(0, 8)].filter(Boolean).join(' | ');
+  return [peerCompatibilityLabel(peer), peer?.ip, id.slice(0, 8), metricsDetail(peer?.metrics)].filter(Boolean).join(' | ');
 }
 
 function openPeersModal() {
@@ -1770,18 +2925,19 @@ function openPeersModal() {
   const imap = buildPeerIdentityMap();
   const selfId = imap.get(clientId);
   const rows = [
-    { identity: selfId, label: `${selfId.fullName} (You)`, detail: peerDetail(clientId, selfPeerInfo), cards: new Map([...items.values()].map(item => [item.id, cardMetadataFromItem(item)]).filter(([, meta]) => meta)) },
+    { id: clientId, identity: selfId, label: `${selfId.fullName} (You)`, detail: peerDetail(clientId, { ...selfPeerInfo, metrics: selfClientMetrics }), cards: new Map([...items.values()].map(item => [item.id, cardMetadataFromItem(item)]).filter(([, meta]) => meta)) },
     ...[...connectedPeers.entries()].map(([id, peer]) => {
       const pid = imap.get(id);
-      return { identity: pid, label: pid.fullName, detail: peerDetail(id, peer), cards: peerCardMetadata.get(id) || new Map() };
+      const compatible = peer.compatibility === 'compatible';
+      return { id, identity: pid, label: pid.fullName, detail: peerDetail(id, peer), cards: compatible ? (peerCardMetadata.get(id) || new Map()) : new Map(), compatibility: peer.compatibility };
     })
   ];
 
   for (const row of rows) {
     const el = document.createElement('div');
-    el.className = 'peer-row peer-user-row';
+    el.className = `peer-row peer-user-row${row.compatibility === 'incompatible' ? ' peer-incompatible' : ''}`;
     const itemCount = row.cards?.size || 0;
-    el.innerHTML = `<div class="peer-row-main">${peerPillHtml(row.identity, 'peer-pill-sm')}<span>${escHtml(row.label)}</span><span class="spacer"></span><span class="token-modal-label">${itemCount} card${itemCount === 1 ? '' : 's'} | ${escHtml(row.detail)}</span></div>${renderPeerCardMetadata(row.cards)}`;
+    el.innerHTML = `<div class="peer-row-main">${peerPillHtml(row.identity, 'peer-pill-sm')}<span class="peer-row-name">${escHtml(row.label)}</span><span class="spacer"></span><span class="token-modal-label peer-row-detail">${itemCount} card${itemCount === 1 ? '' : 's'} | ${escHtml(row.detail)}</span></div>${renderTransferStatus(transferStatusRowsForPeer(row.id))}${renderPeerCardMetadata(row.cards)}`;
     list.appendChild(el);
   }
 
@@ -1806,6 +2962,13 @@ function autoSelectSyncSource(sources) {
       return bCount - aCount;
     })[0];
   if (source) requestSyncFrom(source.clientId);
+}
+
+function runPendingInitialSyncIfReady() {
+  if (!pendingInitialSyncSources?.length || !dataWs || dataWs.readyState !== WebSocket.OPEN) return;
+  const sources = pendingInitialSyncSources;
+  pendingInitialSyncSources = null;
+  autoSelectSyncSource(sources);
 }
 
 function syncMissingFromSources(sources = []) {
@@ -1836,23 +2999,173 @@ function checkForegroundFreshness() {
   if (now - lastForegroundCheckAt < 2000) return;
   lastForegroundCheckAt = now;
   debugLog('foreground-check-start', { localItems: items.size, peers: connectedPeers.size });
-  sendPriorityJson({ type: 'metadata_snapshot_request' });
 }
 
-function requestSyncFrom(sourceClientId) {
+function requestSyncFrom(sourceClientId, itemId = null, missingChunks = null, { silent = false } = {}) {
   if (!sourceClientId) return;
-  debugLog('retrieve-request', { sourceClientId });
+  const requestedChunks = missingChunks?.length ? missingChunks.slice(0, CHUNK_REQUEST_MAX_CHUNKS) : null;
+  if (itemId && requestedChunks?.length) {
+    pendingChunkRequestBatches.set(itemId, {
+      sourceClientId,
+      chunks: new Set(requestedChunks),
+    });
+  }
+  debugLog('retrieve-request', {
+    sourceClientId,
+    itemId,
+    missingChunks: requestedChunks?.length,
+    remainingMissingChunks: missingChunks?.length ? Math.max(0, missingChunks.length - requestedChunks.length) : 0,
+  });
   wsSend({
     type: 'relay',
     targetId: sourceClientId,
-    payload: { type: 'sync_request', requesterId: clientId },
-  }, null);
-  showToast('Requesting files...');
+    payload: {
+      type: 'sync_request',
+      requesterId: clientId,
+      itemId: itemId || undefined,
+      missingChunks: requestedChunks?.length ? requestedChunks : undefined,
+    },
+  }, null, true);
+  if (!silent) showToast(itemId ? 'Retrying download...' : 'Requesting files...');
+}
+
+function continueChunkRequestBatch(itemId, chunkIndex, senderId = null) {
+  const batch = pendingChunkRequestBatches.get(itemId);
+  if (!batch || (senderId && batch.sourceClientId && batch.sourceClientId !== senderId)) return;
+  batch.chunks.delete(Number(chunkIndex));
+  if (batch.chunks.size) return;
+  pendingChunkRequestBatches.delete(itemId);
+  const transfer = binaryTransfers.get(itemId);
+  const encryptedChunks = items.get(encryptedPlaceholderIdForItem(itemId))?.encryptedBinaryChunks;
+  const transferDone = transfer && transfer.received >= transfer.totalChunks;
+  if (transferDone) return;
+  const missingChunks = transfer
+    ? missingTransferChunks(transfer)
+    : missingStoredEncryptedChunks(encryptedChunks);
+  if (missingChunks?.length) {
+    requestSyncFrom(senderId || batch.sourceClientId, itemId, missingChunks, { silent: true });
+  }
+}
+
+function missingTransferChunks(transfer) {
+  if (!transfer?.chunks?.length) return null;
+  const missing = [];
+  for (let i = 0; i < transfer.chunks.length; i++) {
+    if (transfer.chunks[i] === null) missing.push(i);
+  }
+  return missing;
+}
+
+function missingStoredEncryptedChunks(chunks) {
+  if (!chunks?.length) return null;
+  const missing = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (chunks[i] === null) missing.push(i);
+  }
+  return missing;
+}
+
+function findDownloadRetryCandidates(itemId, currentSenderId = null) {
+  return [...peerCardMetadata.entries()]
+    .filter(([peerId, cards]) => (
+      peerId &&
+      peerId !== clientId &&
+      peerId !== currentSenderId &&
+      connectedPeers.has(peerId) &&
+      cards?.has(itemId)
+    ))
+    .map(([peerId]) => peerId);
+}
+
+function retryDownloadFromDifferentClient(itemId, { silent = false } = {}) {
+  const currentTransfer = binaryTransfers.get(itemId);
+  const currentSenderId = currentTransfer?.senderId || pendingDownloadSourceIds.get(itemId) || null;
+  const missingChunks = missingTransferChunks(currentTransfer);
+  const triedSources = !currentTransfer ? (pendingDownloadTriedSources.get(itemId) || new Set()) : null;
+  const candidates = findDownloadRetryCandidates(itemId, currentSenderId)
+    .filter(peerId => !triedSources?.has(peerId));
+  if (!candidates.length) {
+    if (silent) return;
+    showToast('No other client has this file right now.');
+    return;
+  }
+
+  const sourceClientId = candidates[0];
+  if (currentTransfer) {
+    currentTransfer.senderId = sourceClientId;
+    currentTransfer.retrySourceId = sourceClientId;
+    updateTransferProgress(itemId, currentTransfer.received / currentTransfer.totalChunks, currentTransfer);
+  } else {
+    pendingDownloadSourceIds.set(itemId, sourceClientId);
+    if (!pendingDownloadTriedSources.has(itemId)) pendingDownloadTriedSources.set(itemId, new Set());
+    pendingDownloadTriedSources.get(itemId).add(sourceClientId);
+  }
+  requestSyncFrom(sourceClientId, itemId, missingChunks, { silent });
+}
+
+function clearAutomaticDownloadRetry(itemId) {
+  const timer = downloadSourceRetryTimers.get(itemId);
+  if (timer) clearTimeout(timer);
+  downloadSourceRetryTimers.delete(itemId);
+}
+
+function scheduleAutomaticDownloadRetry(itemId, transfer) {
+  clearAutomaticDownloadRetry(itemId);
+  if (!itemId || !transfer || transfer.totalChunks && transfer.received >= transfer.totalChunks) return;
+  const timer = setTimeout(() => {
+    downloadSourceRetryTimers.delete(itemId);
+    const currentTransfer = binaryTransfers.get(itemId);
+    const currentItem = items.get(itemId);
+    if ((!currentTransfer && !expectsIncomingChunks(currentItem)) || currentTransfer?.totalChunks && currentTransfer.received >= currentTransfer.totalChunks) return;
+    const previousSenderId = currentTransfer?.senderId || transfer.senderId || null;
+    retryDownloadFromDifferentClient(itemId, { silent: true });
+    const nextTransfer = binaryTransfers.get(itemId);
+    if (nextTransfer?.senderId && nextTransfer.senderId !== previousSenderId) {
+      downloadSourceRetryAttempts.set(itemId, (downloadSourceRetryAttempts.get(itemId) || 0) + 1);
+      debugLog('retry-download-source', { itemId, from: previousSenderId, to: nextTransfer.senderId, attempts: downloadSourceRetryAttempts.get(itemId) });
+    }
+    const remainingTransfer = binaryTransfers.get(itemId);
+    if (remainingTransfer || expectsIncomingChunks(items.get(itemId))) {
+      scheduleAutomaticDownloadRetry(itemId, remainingTransfer || {
+        senderId: nextTransfer?.senderId || previousSenderId || null,
+        received: 0,
+        totalChunks: 0,
+      });
+    }
+  }, DOWNLOAD_SOURCE_RETRY_DELAY_MS);
+  downloadSourceRetryTimers.set(itemId, timer);
+}
+
+function armRecoveryTimersForIncompleteReceives() {
+  for (const [itemId, transfer] of binaryTransfers) scheduleAutomaticDownloadRetry(itemId, transfer);
+  for (const item of items.values()) {
+    if (!expectsIncomingChunks(item) || downloadSourceRetryTimers.has(item.id)) continue;
+    scheduleAutomaticDownloadRetry(item.id, {
+      senderId: null,
+      received: 0,
+      totalChunks: 0,
+    });
+  }
+}
+
+function expectsIncomingChunks(item) {
+  return item && item.type !== 'text' && item.type !== 'encrypted' && !item.rawBuffer && !item.dataUrl;
+}
+
+function showPendingReceiveProgress(itemId, senderId) {
+  if (itemId && senderId && !pendingDownloadSourceIds.has(itemId)) pendingDownloadSourceIds.set(itemId, senderId);
+  if (!itemId || document.getElementById('card-' + itemId)?.querySelector('.inbound-progress')) return;
+  updateTransferProgress(itemId, 0, {
+    senderId,
+    received: 0,
+    totalChunks: 0,
+    currentChunk: 0,
+    startTime: Date.now(),
+  });
 }
 
 function closeAllModals() {
   closeTokenModal();
-  closePassphraseModal();
   closePeersModal();
   closeClearModal();
   closeChatArchiveModal();
@@ -1862,28 +3175,42 @@ function closeAllModals() {
 }
 
 function clearAllItems() {
-  if (!items.size) return;
-  for (const id of [...items.keys()]) {
-    wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, cardEncryptionKeys.get(id));
+  const hadItems = items.size > 0;
+  const hadChat = chatMessages.length > 0;
+  if (hadItems) {
+    for (const id of [...items.keys()]) {
+      wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, cardEncryptionKeys.get(id));
+    }
   }
   items.clear();
   cardEncryptionKeys.clear();
-  fileTransfers.clear();
   binaryTransfers.clear();
-  activeBroadcasts.clear();
+  clearAllOutboundRetries();
+  outboundTransfers.clear();
+  remoteTransferStatuses.clear();
+  transferStatusPublishTimes.clear();
+  pendingChunkRequestBatches.clear();
+  releaseSendWakeLock();
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   document.getElementById('cards').innerHTML = '';
   updateEmpty();
-  showToast('All cards cleared');
+  if (hadChat) clearChat({ broadcast: true });
+  showToast(hadChat ? 'Space cleared' : 'All cards cleared');
 }
 
 function openTokenModal() {
   if (!token) return;
-  const url = tokenShareUrl(token);
   document.getElementById('token-modal-token').textContent = formatToken(token);
-  document.getElementById('token-modal-passphrase').textContent = currentPassphrase || 'None';
-  document.getElementById('token-modal-url').textContent = url;
+  updateTokenModalSharePreview();
+  const modal = document.getElementById('token-modal');
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  startPairingMode({ modal: true });
+  refreshIcons();
+}
+
+function renderTokenModalQr(url) {
   const qrEl = document.getElementById('token-modal-qr-code');
   qrEl.innerHTML = '';
   if (window.QRCode) {
@@ -1898,64 +3225,20 @@ function openTokenModal() {
   } else {
     qrEl.textContent = 'QR unavailable';
   }
-  const modal = document.getElementById('token-modal');
-  modal.classList.add('open');
-  modal.setAttribute('aria-hidden', 'false');
-  refreshIcons();
+}
+
+function updateTokenModalSharePreview() {
+  if (!token) return;
+  const url = tokenShareUrl(token);
+  document.getElementById('token-modal-url').textContent = url;
+  renderTokenModalQr(url);
 }
 
 function closeTokenModal() {
   const modal = document.getElementById('token-modal');
   modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
-}
-
-let passphraseModalCardId = null;
-
-function openPassphraseModal(cardId = null) {
-  const cardMode = typeof cardId === 'string';
-  passphraseModalCardId = cardMode ? cardId : null;
-  const modal = document.getElementById('passphrase-modal');
-  const input = document.getElementById('passphrase-modal-input');
-  const title = document.getElementById('passphrase-modal-title');
-  const clearBtn = document.getElementById('passphrase-clear');
-  const saveBtn = document.getElementById('passphrase-save');
-  input.value = cardMode ? '' : currentPassphrase || '';
-  title.textContent = cardMode ? 'Open Encrypted Card' : 'Encryption Passphrase';
-  clearBtn.style.display = cardMode ? 'none' : '';
-  saveBtn.innerHTML = cardMode ? '<i data-lucide="key-round"></i> Open' : '<i data-lucide="lock"></i> Save';
-  modal.classList.add('open');
-  modal.setAttribute('aria-hidden', 'false');
-  refreshIcons();
-  requestAnimationFrame(() => input.focus());
-}
-
-function closePassphraseModal() {
-  const modal = document.getElementById('passphrase-modal');
-  modal.classList.remove('open');
-  modal.setAttribute('aria-hidden', 'true');
-  passphraseModalCardId = null;
-}
-
-async function savePassphraseFromModal() {
-  const passphrase = document.getElementById('passphrase-modal-input').value;
-  if (!passphrase) return;
-  if (passphraseModalCardId) {
-    await openEncryptedCardWithPassphrase(passphraseModalCardId, passphrase);
-    return;
-  }
-  await setCurrentPassphrase(passphrase, true);
-  closePassphraseModal();
-}
-
-function clearPassphraseFromModal() {
-  currentPassphrase = '';
-  encryptionKey = null;
-  encryptionEnabled = false;
-  localStorage.removeItem('clipshare_passphrase');
-  updateEncryptionControl();
-  closePassphraseModal();
-  showToast('Encryption disabled');
+  stopPairingMode({ modal: true });
 }
 
 // ── WebSocket ────────────────────────────────────────────────────────
@@ -1981,27 +3264,7 @@ async function deriveKey(passphrase, salt) {
 }
 
 function updateEncryptionControl() {
-  const btn = document.getElementById('encryption-control');
-  if (!btn) return;
-  const active = !!encryptionKey;
-  btn.classList.toggle('active', active);
-  btn.title = active ? 'Encryption on. Click to change passphrase.' : 'Encryption off. Click to set passphrase.';
-  btn.innerHTML = `<i data-lucide="${active ? 'lock' : 'unlock'}"></i>`;
   refreshIcons();
-}
-
-async function setCurrentPassphrase(passphrase, tryUnlock = false) {
-  if (!token) return;
-  currentPassphrase = passphrase;
-  encryptionKey = await deriveKey(passphrase, token);
-  encryptionEnabled = true;
-  localStorage.setItem('clipshare_passphrase', passphrase);
-  updateEncryptionControl();
-
-  if (tryUnlock) {
-    const unlocked = await tryDecryptEncryptedCards(passphrase, encryptionKey);
-    showToast(unlocked ? `Unlocked ${unlocked} encrypted card${unlocked === 1 ? '' : 's'}` : 'Passphrase saved');
-  }
 }
 
 async function encryptMessage(message, key) {
@@ -2033,11 +3296,7 @@ async function decryptMessage(encryptedData, key) {
 async function applyEncryptedMessage(encryptedData, key, senderId = null) {
   const decrypted = await decryptMessage(encryptedData, key);
   const innerMsg = JSON.parse(decrypted);
-  if (innerMsg.type === 'relay') {
-    handlePayload(innerMsg.payload, true, key, senderId);
-  } else {
-    await handleServerMessage(innerMsg);
-  }
+  if (innerMsg.type === 'relay') handlePayload(innerMsg.payload, true, key, senderId);
 }
 
 async function applyEncryptedMessages(encryptedMessages, key) {
@@ -2046,9 +3305,6 @@ async function applyEncryptedMessages(encryptedMessages, key) {
     const bKind = b.meta?.payloadType;
     if (aKind === 'item_added' && bKind !== 'item_added') return -1;
     if (bKind === 'item_added' && aKind !== 'item_added') return 1;
-    if (aKind === 'file_chunk' && bKind === 'file_chunk') {
-      return (a.meta?.chunkIndex ?? 0) - (b.meta?.chunkIndex ?? 0);
-    }
     return a.seq - b.seq;
   });
 
@@ -2101,39 +3357,25 @@ function encryptedMetaForMessage(msg) {
     return {
       messageType: 'relay',
       payloadType: 'item_added',
-      itemId: payload.item.id,
-      itemType: payload.item.type,
-      addedAt: payload.item.addedAt
-    };
-  }
-  if (payload.type === 'file_chunk') {
-    return {
-      messageType: 'relay',
-      payloadType: 'file_chunk',
-      itemId: payload.itemId,
-      chunkIndex: payload.chunkIndex,
-      totalChunks: payload.totalChunks
+      itemId: payload.item.id
     };
   }
   if (payload.type === 'chat_line') {
     return {
       messageType: 'relay',
-      payloadType: 'chat_line',
-      addedAt: payload.message?.addedAt
+      payloadType: 'chat_line'
     };
   }
   if (payload.type === 'chat_cleared') {
     return {
       messageType: 'relay',
-      payloadType: 'chat_cleared',
-      addedAt: payload.clearedAt
+      payloadType: 'chat_cleared'
     };
   }
   if (payload.type === 'sync_state' && payload.chatMessages?.length) {
     return {
       messageType: 'relay',
-      payloadType: 'sync_state',
-      addedAt: Date.now()
+      payloadType: 'sync_state'
     };
   }
   return {
@@ -2153,8 +3395,8 @@ function encryptedPlaceholderIdForItem(itemId) {
 
 function encryptedChunkStatus(item) {
   return item.totalEncryptedChunks
-    ? `Encrypted chunks ${item.receivedEncryptedChunks || 0}/${item.totalEncryptedChunks}`
-    : 'Password required';
+    ? `Receiving ${item.receivedEncryptedChunks || 0}/${item.totalEncryptedChunks}`
+    : 'Receiving';
 }
 
 function updateEncryptedPlaceholderCard(item) {
@@ -2185,7 +3427,7 @@ function ensureEncryptedBinaryPlaceholder(itemId, totalChunks) {
     item = {
       id: groupId,
       type: 'encrypted',
-      encryptedMeta: { payloadType: 'file_chunk', itemId, totalChunks },
+      encryptedMeta: { payloadType: 'encrypted_binary_chunk', itemId, totalChunks },
       encryptedMessages: [],
       encryptedChunkIndexes: [],
       encryptedBinaryChunks: new Array(totalChunks).fill(null),
@@ -2195,7 +3437,6 @@ function ensureEncryptedBinaryPlaceholder(itemId, totalChunks) {
       addedAt: Date.now()
     };
     items.set(item.id, item);
-    prependCard(item);
     updateEmpty();
   } else {
     item.encryptedBinaryChunks ||= new Array(totalChunks).fill(null);
@@ -2205,6 +3446,7 @@ function ensureEncryptedBinaryPlaceholder(itemId, totalChunks) {
 }
 
 function storeEncryptedBinaryChunk(header, payload) {
+  if (!isValidChunkSet(header?.ci, header?.tc)) return 0;
   const item = ensureEncryptedBinaryPlaceholder(header.i, header.tc);
   item.encryptedBinaryChunks ||= new Array(header.tc).fill(null);
   if (item.encryptedBinaryChunks[header.ci] === null) {
@@ -2247,14 +3489,6 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
       if (timeEl) timeEl.dataset.addedAt = meta.addedAt;
       refreshCardTimes();
     }
-    if (meta.payloadType === 'file_chunk') {
-      existing.totalEncryptedChunks = meta.totalChunks || existing.totalEncryptedChunks;
-      existing.encryptedChunkIndexes ||= [];
-      if (!existing.encryptedChunkIndexes.includes(meta.chunkIndex)) {
-        existing.encryptedChunkIndexes.push(meta.chunkIndex);
-      }
-      existing.receivedEncryptedChunks = existing.encryptedChunkIndexes.length;
-    }
     updateEncryptedPlaceholderCard(existing);
     return;
   }
@@ -2264,33 +3498,13 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
     type: 'encrypted',
     encryptedMeta: meta,
     encryptedMessages: [message],
-    encryptedChunkIndexes: meta.payloadType === 'file_chunk' ? [meta.chunkIndex] : [],
-    receivedEncryptedChunks: meta.payloadType === 'file_chunk' ? 1 : 0,
-    totalEncryptedChunks: meta.payloadType === 'file_chunk' ? meta.totalChunks : undefined,
+    encryptedChunkIndexes: [],
+    receivedEncryptedChunks: 0,
     encrypted: true,
     addedAt: meta.addedAt || Date.now()
   };
   items.set(item.id, item);
-  prependCard(item);
   updateEmpty();
-}
-
-async function enterPasswordForEncryptedCard(id) {
-  openPassphraseModal(id);
-}
-
-async function openEncryptedCardWithPassphrase(id, passphrase) {
-  const item = items.get(id);
-  if (!item || item.type !== 'encrypted') return;
-
-  try {
-    const key = await deriveKey(passphrase, token);
-    await unlockEncryptedCard(item, key);
-    closePassphraseModal();
-    showToast('Encrypted card unlocked');
-  } catch {
-    showToast('Could not decrypt with that password.');
-  }
 }
 
 function connectDataWS() {
@@ -2303,14 +3517,12 @@ function connectDataWS() {
   dataWs.onopen = () => {
     dataWsRetryDelay = 1000;
     debugLog('data-socket-open');
+    runPendingInitialSyncIfReady();
+    retryPendingChunksAfterDataReconnect();
   };
   dataWs.onmessage = async e => {
     try {
-      if (e.data instanceof ArrayBuffer) {
-        handleBinaryMessage(e.data);
-      } else {
-        await handleServerMessage(JSON.parse(e.data));
-      }
+      if (e.data instanceof ArrayBuffer) handleBinaryMessage(e.data);
     } catch { }
   };
   dataWs.onclose = () => {
@@ -2332,6 +3544,7 @@ async function connectWS() {
   if (passphrase) {
     currentPassphrase = passphrase;
     encryptionKey = await deriveKey(currentPassphrase, token);
+    encryptionEnabled = true;
   }
   updateEncryptionControl();
   ws = new WebSocket(url);
@@ -2339,6 +3552,11 @@ async function connectWS() {
   ws.onopen = () => {
     wsRetryDelay = 1000;
     setDot('connected');
+    publishKeyProof();
+    publishPairingMode();
+    publishClientMetrics();
+    startMetricsPing();
+    publishLocalManifest();
     connectDataWS();
   };
   ws.onmessage = async e => {
@@ -2349,6 +3567,7 @@ async function connectWS() {
   };
   ws.onclose = () => {
     setDot('disconnected');
+    stopMetricsPing();
     if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
     if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
     wsRetryTimer = setTimeout(connectWS, wsRetryDelay);
@@ -2369,26 +3588,63 @@ function sendPriorityJson(msg) {
   return true;
 }
 
-function sendDataJson(msg) {
-  if (!dataWs || dataWs.readyState !== WebSocket.OPEN) return false;
-  dataWs.send(JSON.stringify(msg));
-  return true;
+function setPeerCompatibility(peerId, status) {
+  if (!peerId || peerId === clientId) return;
+  const peer = connectedPeers.get(peerId);
+  if (!peer) return;
+  peer.compatibility = status;
+  const timer = peerCompatibilityTimers.get(peerId);
+  if (timer) {
+    clearTimeout(timer);
+    peerCompatibilityTimers.delete(peerId);
+  }
+  if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+  updatePeerCount();
 }
 
-async function wsSend(msg, keyOverride = null, priority = false, useDataSocket = false) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const key = arguments.length > 1 ? keyOverride : encryptionKey;
-  const sendJson = useDataSocket ? sendDataJson : sendPriorityJson;
-  if (key) {
-    const jsonStr = JSON.stringify(msg);
-    const encrypted = await encryptMessage(jsonStr, key);
-    const envelope = { type: 'encrypted', data: encrypted, meta: encryptedMetaForMessage(msg) };
-    if (priority || useDataSocket) sendJson(envelope);
-    else ws.send(JSON.stringify(envelope));
-  } else {
-    if (priority || useDataSocket) sendJson(msg);
-    else ws.send(JSON.stringify(msg));
-  }
+function armPeerCompatibilityTimeout(peerId) {
+  if (!peerId || peerId === clientId) return;
+  const existing = peerCompatibilityTimers.get(peerId);
+  if (existing) clearTimeout(existing);
+  peerCompatibilityTimers.set(peerId, setTimeout(() => {
+    if (connectedPeers.get(peerId)?.compatibility === 'pending') setPeerCompatibility(peerId, 'incompatible');
+  }, KEY_PROOF_TIMEOUT_MS));
+}
+
+async function publishKeyProof() {
+  if (!encryptionKey) return false;
+  const proof = await encryptMessage(JSON.stringify({
+    kind: 'clipshare-key-proof',
+    clientId,
+    issuedAt: Date.now(),
+  }), encryptionKey);
+  return sendPriorityJson({ type: 'key_proof', proof });
+}
+
+async function applyKeyProof(msg) {
+  const senderId = msg?.senderId;
+  if (!senderId || senderId === clientId || !connectedPeers.has(senderId) || !encryptionKey) return;
+  try {
+    const proof = JSON.parse(await decryptMessage(msg.proof, encryptionKey));
+    if (proof?.kind === 'clipshare-key-proof' && proof.clientId === senderId) {
+      setPeerCompatibility(senderId, 'compatible');
+      return;
+    }
+  } catch { }
+  setPeerCompatibility(senderId, 'incompatible');
+}
+
+async function wsSend(msg, keyOverride = null, priority = false) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  const key = keyOverride || encryptionKey;
+  if (!key) return false;
+  const jsonStr = JSON.stringify(msg);
+  const encrypted = await encryptMessage(jsonStr, key);
+  const envelope = { type: 'encrypted', data: encrypted, meta: encryptedMetaForMessage(msg) };
+  if (msg.targetId) envelope.targetId = msg.targetId;
+  if (priority) return sendPriorityJson(envelope);
+  ws.send(JSON.stringify(envelope));
+  return true;
 }
 
 // ── Message handling ─────────────────────────────────────────────────
@@ -2399,26 +3655,49 @@ async function handleServerMessage(msg) {
     peerCardMetadata.clear();
     peerCounter = 0;
     selfPeerInfo = { label: String(msg.selfPeerNumber || 1), ip: msg.clientIp || '' };
+    Object.assign(selfClientMetrics, normalizeClientMetrics({ ...selfClientMetrics, ...(msg.metrics || {}) }));
     (msg.peerInfos || []).forEach(peer => {
       const peerId = peer.clientId;
       if (peerId === clientId) return;
       peerCounter = Math.max(peerCounter, Number(peer.peerNumber) || peerCounter + 1);
-      connectedPeers.set(peerId, { label: String(peer.peerNumber || peerCounter), ip: peer.ip || '' });
+      connectedPeers.set(peerId, {
+        label: String(peer.peerNumber || peerCounter),
+        ip: peer.ip || '',
+        metrics: normalizeClientMetrics(peer.metrics || {}),
+        compatibility: 'pending',
+      });
+      armPeerCompatibilityTimeout(peerId);
     });
-    seedPeerMetadataFromSources(msg.sources || []);
+    updatePairingHosts(msg.pairingHosts || []);
+    await applyManifestSnapshot(msg.manifest || []);
     updatePeerCount();
-    encryptionEnabled = !!msg.encrypted;
-    if ((msg.sources || []).length && !items.size) autoSelectSyncSource(msg.sources);
+    encryptionEnabled = !!encryptionKey;
+    if ((msg.sources || []).length && !items.size) {
+      pendingInitialSyncSources = msg.sources || [];
+      runPendingInitialSyncIfReady();
+    }
   } else if (msg.type === 'peer_joined') {
     clientCount++;
     peerCounter = Math.max(peerCounter + 1, Number(msg.peerNumber) || 0);
-    connectedPeers.set(msg.clientId, { label: String(msg.peerNumber || peerCounter), ip: msg.ip || '' });
+    connectedPeers.set(msg.clientId, {
+      label: String(msg.peerNumber || peerCounter),
+      ip: msg.ip || '',
+      metrics: normalizeClientMetrics(msg.metrics || {}),
+      compatibility: 'pending',
+    });
+    armPeerCompatibilityTimeout(msg.clientId);
     updatePeerCount();
+    publishKeyProof();
     sendSyncState(msg.clientId);
+    armRecoveryTimersForIncompleteReceives();
   } else if (msg.type === 'peer_left') {
     clientCount = Math.max(1, clientCount - 1);
     connectedPeers.delete(msg.clientId);
+    const timer = peerCompatibilityTimers.get(msg.clientId);
+    if (timer) clearTimeout(timer);
+    peerCompatibilityTimers.delete(msg.clientId);
     peerCardMetadata.delete(msg.clientId);
+    clearRemoteTransferStatusesForPeer(msg.clientId);
     for (const [itemId, peerMap] of outboundTransfers) {
       if (peerMap.has(msg.clientId)) {
         peerMap.delete(msg.clientId);
@@ -2426,7 +3705,23 @@ async function handleServerMessage(msg) {
         refreshOutboundUI(itemId);
       }
     }
+    removeOrphanedIncomingCards();
     updatePeerCount();
+    if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+  } else if (msg.type === 'metrics_pong') {
+    const sentAt = Number(msg.sentAt);
+    if (Number.isFinite(sentAt)) {
+      selfClientMetrics.pingMs = Math.max(0, Date.now() - sentAt);
+      publishClientMetrics();
+      if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+    }
+  } else if (msg.type === 'client_metrics_updated') {
+    const metrics = normalizeClientMetrics(msg.metrics || {});
+    if (msg.clientId === clientId) {
+      Object.assign(selfClientMetrics, metrics);
+    } else if (connectedPeers.has(msg.clientId)) {
+      connectedPeers.get(msg.clientId).metrics = metrics;
+    }
     if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
   } else if (msg.type === 'metadata_updated') {
     debugLog(msg.senderId === clientId ? 'announce-stored' : 'metadata-updated', {
@@ -2435,19 +3730,30 @@ async function handleServerMessage(msg) {
       action: msg.action,
       stored: msg.stored,
     });
-    applyPeerMetadataUpdate(msg);
+    armRecoveryTimersForIncompleteReceives();
   } else if (msg.type === 'metadata_snapshot') {
     debugLog('foreground-check-snapshot', { sources: msg.sources?.length || 0 });
-    seedPeerMetadataFromSources(msg.sources || []);
     if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
     syncMissingFromSources(msg.sources || []);
-  } else if (msg.type === 'relay') {
-    handlePayload(msg.payload, false, null, msg.senderId);
+    armRecoveryTimersForIncompleteReceives();
+  } else if (msg.type === 'manifest_updated') {
+    await applyManifestRecord(msg.record);
+    if (msg.record?.ownerId && msg.record.ownerId !== clientId && !msg.record.deleted && !items.has(msg.record.itemId)) {
+      requestSyncFrom(msg.record.ownerId, msg.record.itemId, null, { silent: true });
+    }
+    if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+    armRecoveryTimersForIncompleteReceives();
+  } else if (msg.type === 'key_proof') {
+    await applyKeyProof(msg);
+  } else if (msg.type === 'pairing_hosts') {
+    updatePairingHosts(msg.hosts || []);
+  } else if (msg.type === 'pairing_request') {
+    await answerPairingRequest(msg);
+  } else if (msg.type === 'pairing_response') {
+    await handlePairingJoinMessage(msg);
   } else if (msg.type === 'encrypted') {
     if (msg.meta?.payloadType === 'item_deleted') {
       forgetPeerCardMetadata(msg.senderId, msg.meta.itemId);
-    } else {
-      rememberPeerCardMetadata(msg.senderId, cardMetadataFromEncryptedMeta(msg.meta));
     }
     if (encryptionKey) {
       try {
@@ -2474,65 +3780,68 @@ function markEncrypted(item) {
 
 function handlePayload(payload, receivedEncrypted = false, payloadKey = null, senderId = null) {
   if (!payload) return;
+  if (!receivedEncrypted) return;
 
   if (payload.type === 'sync_state') {
     debugLog('retrieve-sync-state', { senderId, items: payload.items?.length || 0, chatMessages: payload.chatMessages?.length || 0, encrypted: receivedEncrypted });
     (payload.chatMessages || []).forEach(message => appendChatMessage(message));
-    if (senderId) {
-      const cards = new Map();
-      (payload.items || []).forEach(item => {
-        const meta = cardMetadataFromItem(receivedEncrypted ? markEncrypted(item) : item);
-        if (meta) cards.set(meta.id, meta);
-      });
-      peerCardMetadata.set(senderId, cards);
-    }
     (payload.items || []).forEach(item => {
       if (!items.has(item.id)) {
-        if (receivedEncrypted && payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
-        items.set(item.id, receivedEncrypted ? markEncrypted(item) : item);
+        if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
+        items.set(item.id, markEncrypted(item));
       }
     });
     renderAll();
+    (payload.items || []).forEach(item => {
+      const normalized = markEncrypted(item);
+      if (expectsIncomingChunks(normalized)) showPendingReceiveProgress(normalized.id, senderId);
+    });
 
   } else if (payload.type === 'sync_request') {
-    debugLog('retrieve-request-received', { requesterId: payload.requesterId });
-    sendSyncState(payload.requesterId);
+    debugLog('retrieve-request-received', { requesterId: payload.requesterId, itemId: payload.itemId, missingChunks: payload.missingChunks?.length });
+    sendSyncState(payload.requesterId, payload.itemId || null, payload.missingChunks || null);
+
+  } else if (payload.type === 'transfer_status') {
+    applyRemoteTransferStatus(payload);
 
   } else if (payload.type === 'item_added') {
-    const item = receivedEncrypted ? markEncrypted(payload.item) : payload.item;
-    debugLog('retrieve-card-metadata', { senderId, itemId: item?.id, type: item?.type, filename: item?.filename, size: item?.size, encrypted: !!item?.encrypted });
-    rememberPeerCardMetadata(senderId, cardMetadataFromItem(item));
+    const item = markEncrypted(payload.item);
     if (item && !items.has(item.id)) {
-      if (receivedEncrypted && payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
+      debugLog('retrieve-card-metadata', { senderId, itemId: item?.id, type: item?.type, filename: item?.filename, size: item?.size, encrypted: !!item?.encrypted });
+      if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
       items.set(item.id, item);
       prependCard(item);
       updateEmpty();
+      if (expectsIncomingChunks(item)) showPendingReceiveProgress(item.id, senderId);
     }
 
   } else if (payload.type === 'item_deleted') {
     forgetPeerCardMetadata(senderId, payload.itemId);
     const hadItem = items.delete(payload.itemId);
-    if (hadItem) publishClientCardRemoval(payload.itemId, 'remote-delete');
+    if (hadItem) removeManifestMeta(payload.itemId, Date.now());
     cardEncryptionKeys.delete(payload.itemId);
-    fileTransfers.delete(payload.itemId);
+    binaryTransfers.delete(payload.itemId);
+    clearOutboundRetriesForItem(payload.itemId);
     chunkScheduler.cancelItem(payload.itemId);
     outboundTransfers.delete(payload.itemId);
+    clearAutomaticDownloadRetry(payload.itemId);
+    downloadSourceRetryAttempts.delete(payload.itemId);
+    pendingDownloadSourceIds.delete(payload.itemId);
+    pendingDownloadTriedSources.delete(payload.itemId);
+    pendingChunkRequestBatches.delete(payload.itemId);
+    downloadLogSources.delete(payload.itemId);
+    clearTransferStatusesForItem(payload.itemId);
+    updateSendWakeLock();
     removeCardAnimated(payload.itemId, updateEmpty);
 
   } else if (payload.type === 'item_updated') {
-    const peerCards = senderId ? peerCardMetadata.get(senderId) : null;
-    const peerMeta = peerCards?.get(payload.itemId);
-    if (peerMeta) peerMeta.updatedAt = Date.now();
-    if (receivedEncrypted && payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
+    if (payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
     const item = items.get(payload.itemId);
     if (!item || item.type !== 'text') return;
     item.content = payload.content;
     const el = document.querySelector(`#card-${payload.itemId} .text-content`);
     if (el && document.activeElement !== el) el.innerText = payload.content;
 
-  } else if (payload.type === 'file_chunk') {
-    if (receivedEncrypted && payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
-    handleFileChunk(payload, senderId);
   } else if (payload.type === 'chunk_ack') {
     handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
   } else if (payload.type === 'chat_line') {
@@ -2545,9 +3854,10 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
 }
 
 // ── Sync ─────────────────────────────────────────────────────────────
-function sendSyncState(targetClientId) {
+function sendSyncState(targetClientId, requestedItemId = null, requestedChunks = null) {
   const sendableItems = [...items.values()].filter(i =>
-    i.type === 'text' || i.rawBuffer || (i.dataUrl && i.dataUrl.startsWith('data:'))
+    (!requestedItemId || i.id === requestedItemId) &&
+    (i.type === 'text' || i.rawBuffer)
   );
   const syncItems = sendableItems
     .filter(item => !cardEncryptionKeys.get(item.id))
@@ -2555,12 +3865,17 @@ function sendSyncState(targetClientId) {
       const { dataUrl, rawBuffer, ...meta } = item;
       return item.type === 'text' ? item : meta;
     });
-  debugLog('retrieve-send-state', { targetClientId, items: sendableItems.length, chatMessages: chatMessages.length });
-  if (syncItems.length || chatMessages.length) {
-    wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: syncItems, chatMessages } });
+  debugLog('retrieve-send-state', { targetClientId, requestedItemId, requestedChunks: requestedChunks?.length, items: sendableItems.length, chatMessages: chatMessages.length });
+  if (syncItems.length || (!requestedItemId && chatMessages.length)) {
+    wsSend({
+      type: 'relay',
+      targetId: targetClientId,
+      payload: { type: 'sync_state', items: syncItems, chatMessages: requestedItemId ? [] : chatMessages },
+    });
   }
   sendableItems.forEach(item => {
-    const cardKey = cardEncryptionKeys.get(item.id);
+    const cardKey = cardEncryptionKeys.get(item.id) || encryptionKey;
+    if (!cardKey) return;
     debugLog('starting', { itemId: item.id, targetClientId, type: item.type, filename: item.filename, size: item.size, encrypted: !!cardKey, source: 'sync' });
     if (item.type === 'text') {
       wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'item_added', item } }, cardKey, true);
@@ -2570,23 +3885,7 @@ function sendSyncState(targetClientId) {
     const { dataUrl, rawBuffer, ...meta } = item;
     wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'item_added', item: meta } }, cardKey, true);
 
-    if (cardKey && item.rawBuffer) {
-      sendFileChunksBinaryEncrypted(item, cardKey, targetClientId); // encrypted binary path
-    } else if (cardKey) {
-      sendFileChunks(item, cardKey, targetClientId); // encrypted data-url chunks
-    } else if (item.rawBuffer) {
-      // Binary: send only the chunks this peer missed
-      const broadcast = activeBroadcasts.get(item.id);
-      if (broadcast && broadcast.nextChunk > 0) {
-        // Chunks 0..nextChunk-1 were already broadcast before peer joined;
-        // send them directly. The ongoing broadcast covers nextChunk..total.
-        sendFileChunksBinaryRange(item, targetClientId, 0, broadcast.nextChunk);
-      } else if (!broadcast) {
-        // No active broadcast — send everything directly
-        sendFileChunksBinary(item, targetClientId);
-      }
-      // If broadcast.nextChunk === 0: peer joined right at the start, broadcast covers all
-    }
+    sendFileChunksBinaryEncrypted(item, cardKey, targetClientId, requestedChunks);
   });
 }
 
@@ -2636,7 +3935,7 @@ async function handleFiles(files, { mentionInChat = false } = {}) {
     const item = { id: randomUUID(), type: itemType, filename: file.name, mimeType, size: file.size, addedAt: Date.now() };
     item.rawBuffer = await file.arrayBuffer();
     item.dataUrl = URL.createObjectURL(file);
-    await prepareImageThumbnail(item, file);
+    await prepareImageThumbnail(item, file, { force: mentionInChat });
     addAndBroadcast(item);
     if (mentionInChat) appendChatMessage(chatMessageFromCard(item), { broadcast: true });
   }
@@ -2652,12 +3951,18 @@ function createTextCard() {
 }
 
 function addAndBroadcast(item) {
-  item.encrypted = !!encryptionKey;
-  const itemKey = item.encrypted ? encryptionKey : null;
-  if (itemKey) cardEncryptionKeys.set(item.id, itemKey);
+  if (!encryptionKey) {
+    showToast('Secure share key is not ready yet.');
+    return;
+  }
+  item.encrypted = true;
+  const itemKey = encryptionKey;
+  cardEncryptionKeys.set(item.id, itemKey);
   items.set(item.id, item);
+  rememberManifestMeta(clientId, cardMetadataFromItem(item), nextManifestRevision(item.id));
   prependCard(item);
   updateEmpty();
+  publishClientCardMetadata(item);
   debugLog('starting', { itemId: item.id, type: item.type, filename: item.filename, size: item.size, encrypted: !!itemKey, source: 'broadcast' });
 
   if (item.type === 'text') {
@@ -2666,108 +3971,23 @@ function addAndBroadcast(item) {
     // Strip local-only fields before broadcasting item metadata
     const { dataUrl, rawBuffer, ...meta } = item;
     wsSend({ type: 'relay', payload: { type: 'item_added', item: meta } }, itemKey, true);
-    if (itemKey && item.rawBuffer) {
-      sendFileChunksBinaryEncrypted(item, itemKey); // encrypted binary path
-    } else if (itemKey || !item.rawBuffer) {
-      sendFileChunks(item, itemKey); // data-url chunks
-    } else {
-      sendFileChunksBinary(item, null); // broadcast binary chunks
-    }
+    sendFileChunksBinaryEncrypted(item, itemKey);
   }
 }
 
-// ── Chunked file sending (data-url path) ────────────────────────────
+// ── Chunked file sending ────────────────────────────────────────────
 
-async function sendDataUrlChunk(item, keyOverride, targetClientId, chunkIndex, totalChunks, prefix, b64) {
-  if (!items.has(item.id)) return;
-  if (!await waitForDataWS()) return;
-  await drainWS();
-  await wsSend({
-    type: 'relay',
-    targetId: targetClientId || undefined,
-    payload: {
-      type: 'file_chunk',
-      itemId: item.id,
-      chunkIndex,
-      totalChunks,
-      ...(chunkIndex === 0 ? { prefix } : {}),
-      data: b64.slice(chunkIndex * CHUNK_SIZE, (chunkIndex + 1) * CHUNK_SIZE),
-    },
-  }, keyOverride, false, true);
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function resendDataUrlChunks(item, keyOverride, targetClientId, chunkIndexes) {
-  const dataUrl = item.dataUrl && item.dataUrl.startsWith('data:') ? item.dataUrl : null;
-  if (!dataUrl) return;
-  const comma = dataUrl.indexOf(',');
-  const prefix = dataUrl.slice(0, comma + 1);
-  const b64 = dataUrl.slice(comma + 1);
-  const totalChunks = Math.ceil(b64.length / CHUNK_SIZE) || 1;
-  for (const i of chunkIndexes) {
-    if (i < 0 || i >= totalChunks) continue;
-    await sendDataUrlChunk(item, keyOverride, targetClientId, i, totalChunks, prefix, b64);
+async function sendChunkWhenDataSocketReady(item, sendOnce) {
+  while (items.has(item.id)) {
+    if (await sendOnce()) return true;
+    await sleep(250);
   }
+  return false;
 }
-
-async function* fileChunkGenerator(item, keyOverride, targetClientId, onProgress) {
-  // Get base64 content: from dataUrl (base64 form) only — rawBuffer items use binary path
-  const dataUrl = item.dataUrl && item.dataUrl.startsWith('data:') ? item.dataUrl : null;
-  if (!dataUrl) return;
-  const comma = dataUrl.indexOf(',');
-  const prefix = dataUrl.slice(0, comma + 1);
-  const b64 = dataUrl.slice(comma + 1);
-  const totalChunks = Math.ceil(b64.length / CHUNK_SIZE) || 1;
-  debugLog('starting', { itemId: item.id, targetClientId: targetClientId || 'broadcast', path: keyOverride ? 'encrypted-base64' : 'base64', totalChunks });
-
-  for (let i = 0; i < totalChunks; i++) {
-    if (!items.has(item.id)) return;
-    await sendDataUrlChunk(item, keyOverride, targetClientId, i, totalChunks, prefix, b64);
-    onProgress(i + 1, totalChunks);
-    debugProgress('progress-send', item.id, i + 1, totalChunks, { targetClientId: targetClientId || 'broadcast', path: keyOverride ? 'encrypted-base64' : 'base64' });
-    yield;
-  }
-  if (targetClientId) markOutboundInitialDone(item.id, [targetClientId]);
-  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
-  debugLog('finish-send', { itemId: item.id, targetClientId: targetClientId || 'broadcast', path: keyOverride ? 'encrypted-base64' : 'base64', totalChunks });
-}
-
-function sendFileChunks(item, keyOverride = null, targetClientId = null) {
-  if (targetClientId) {
-    // Targeted send — single row
-    const resendMissing = indexes => resendDataUrlChunks(item, keyOverride, targetClientId, indexes);
-    const onProgress = makeOutboundProgress(item.id, targetClientId, resendMissing);
-    chunkScheduler.enqueue(item.id, -(item.size || 0),
-      () => fileChunkGenerator(item, keyOverride, targetClientId, onProgress));
-    return;
-  }
-
-  // Broadcast — one row per peer
-  const peerIds = [...connectedPeers.keys()];
-  if (!peerIds.length) {
-    chunkScheduler.enqueue(item.id, item.size || 0,
-      () => fileChunkGenerator(item, keyOverride, null, () => {}));
-    return;
-  }
-
-  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendDataUrlChunks(item, keyOverride, pid, indexes));
-
-  const onProgress = (sent, total) => {
-    const pm = outboundTransfers.get(item.id);
-    for (const pid of peerIds) {
-      const p = pm?.get(pid);
-      if (p) {
-        p.total = total;
-        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
-      }
-      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
-    }
-  };
-
-  chunkScheduler.enqueue(item.id, item.size || 0,
-    () => fileChunkGenerator(item, keyOverride, null, onProgress));
-}
-
-// ── Chunked file sending (binary path) ──────────────────────────────
 
 async function drainWS() {
   // Pace sending to match actual network throughput so the sender's
@@ -2775,7 +3995,7 @@ async function drainWS() {
   const highWater = BINARY_CHUNK_SIZE * 2;
   const start = Date.now();
   while (dataWs && dataWs.readyState === WebSocket.OPEN && dataWs.bufferedAmount > highWater) {
-    await new Promise(r => setTimeout(r, 8));
+    await sleep(8);
     if (Date.now() - start > 10000) break;
   }
 }
@@ -2785,41 +4005,10 @@ async function waitForDataWS() {
   if (!dataWs || dataWs.readyState === WebSocket.CLOSED) connectDataWS();
   const start = Date.now();
   while (dataWs && dataWs.readyState === WebSocket.CONNECTING) {
-    await new Promise(r => setTimeout(r, 20));
+    await sleep(20);
     if (Date.now() - start > 5000) break;
   }
   return !!dataWs && dataWs.readyState === WebSocket.OPEN;
-}
-
-function buildBinaryFrame(targetId, itemId, chunkIndex, totalChunks, chunkBytes) {
-  const header = { t: 'fc', i: itemId, ci: chunkIndex, tc: totalChunks, sid: clientId };
-  if (targetId) header.tid = targetId;
-  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-  const frame = new Uint8Array(4 + headerBytes.length + chunkBytes.length);
-  new DataView(frame.buffer).setUint32(0, headerBytes.length, false);
-  frame.set(headerBytes, 4);
-  frame.set(chunkBytes, 4 + headerBytes.length);
-  return frame.buffer;
-}
-
-async function sendBinaryChunk(item, targetId, chunkIndex, totalChunks) {
-  if (!items.has(item.id) || !item.rawBuffer) return;
-  if (!await waitForDataWS()) return;
-  await drainWS();
-  const start = chunkIndex * BINARY_CHUNK_SIZE;
-  const chunk = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
-    dataWs.send(buildBinaryFrame(targetId, item.id, chunkIndex, totalChunks, chunk));
-  }
-}
-
-async function resendBinaryChunks(item, targetId, chunkIndexes) {
-  if (!item.rawBuffer) return;
-  const totalChunks = Math.ceil(item.rawBuffer.byteLength / BINARY_CHUNK_SIZE) || 1;
-  for (const i of chunkIndexes) {
-    if (i < 0 || i >= totalChunks) continue;
-    await sendBinaryChunk(item, targetId, i, totalChunks);
-  }
 }
 
 function trackOutboundPeer(itemId, trackKey, resendMissing = null) {
@@ -2835,22 +4024,48 @@ function trackOutboundPeer(itemId, trackKey, resendMissing = null) {
     retryTimer: existing.retryTimer || null,
     initialDone: existing.initialDone || false,
     complete: existing.complete || false,
+    currentChunk: existing.currentChunk || 0,
     resendMissing: resendMissing || existing.resendMissing || null,
   });
   refreshOutboundUI(itemId);
+  updateSendWakeLock();
   return peerMap.get(trackKey);
+}
+
+function seedContinuationProgress(itemId, peerId, totalChunks, missingChunks) {
+  const missing = normalizeChunkIndexes(missingChunks, totalChunks);
+  if (!missing || !missing.length) return;
+  const p = outboundTransfers.get(itemId)?.get(peerId);
+  if (!p) return;
+  const missingSet = new Set(missing);
+  p.total = totalChunks;
+  p.ackedChunks ||= new Set();
+  for (let i = 0; i < totalChunks; i++) {
+    if (!missingSet.has(i)) p.ackedChunks.add(i);
+  }
+  p.sent = p.ackedChunks.size;
+  updateOutboundRow(itemId, peerId, p.sent, p.total);
 }
 
 function makeOutboundProgress(itemId, trackKey, resendMissing = null) {
   trackOutboundPeer(itemId, trackKey, resendMissing);
-  return (sent, total) => {
+  return (sent, total, currentChunk = null) => {
     const peerMap = outboundTransfers.get(itemId);
     const p = peerMap?.get(trackKey);
     if (p) {
       p.total = total;
       p.sent = p.resendMissing ? p.ackedChunks.size : sent;
+      if (Number.isFinite(currentChunk)) p.currentChunk = Number(currentChunk) + 1;
     }
     updateOutboundRow(itemId, trackKey, p?.sent ?? sent, total);
+    publishTransferStatus({
+      itemId,
+      sourceId: clientId,
+      targetId: trackKey,
+      current: p?.currentChunk || currentChunk || sent,
+      done: p?.sent ?? sent,
+      total,
+    });
     if (p) finishOutboundPeerIfComplete(itemId, trackKey, p);
   };
 }
@@ -2881,15 +4096,54 @@ function clearChunkRetry(progress) {
   }
 }
 
+function clearOutboundRetriesForItem(itemId) {
+  const peerMap = outboundTransfers.get(itemId);
+  if (!peerMap) return;
+  for (const progress of peerMap.values()) clearChunkRetry(progress);
+}
+
+function clearAllOutboundRetries() {
+  for (const peerMap of outboundTransfers.values()) {
+    for (const progress of peerMap.values()) clearChunkRetry(progress);
+  }
+}
+
+function retryPendingChunksAfterDataReconnect() {
+  for (const [itemId, peerMap] of outboundTransfers) {
+    for (const [peerId, progress] of peerMap) {
+      if (!progress?.initialDone || !progress.resendMissing || progress.sent >= progress.total) continue;
+      clearChunkRetry(progress);
+      progress.retryAttempts = 0;
+      const missing = missingAckedChunks(progress);
+      if (!missing.length) continue;
+      debugLog('retry-chunks-data-socket-open', { itemId, peerId, missing: missing.length });
+      chunkScheduler.enqueue(itemId, -(progress.total || 0), () => retryChunkGenerator(itemId, peerId, missing, progress.resendMissing));
+    }
+  }
+}
+
 function finishOutboundPeerIfComplete(itemId, peerId, progress) {
   if (!progress.total || progress.sent < progress.total) return;
   if (progress.complete) return;
   progress.complete = true;
+  const item = items.get(itemId);
+  if (item?.size && progress.startTime) recordTransferMetric('upload', item.size, progress.startTime);
+  publishTransferStatus({
+    itemId,
+    sourceId: clientId,
+    targetId: peerId,
+    current: progress.total,
+    done: progress.total,
+    total: progress.total,
+    status: 'done',
+    force: true,
+  });
   clearChunkRetry(progress);
   setTimeout(() => {
     const pm = outboundTransfers.get(itemId);
     if (pm) { pm.delete(peerId); if (!pm.size) outboundTransfers.delete(itemId); }
     refreshOutboundUI(itemId);
+    updateSendWakeLock();
   }, 1500);
 }
 
@@ -2927,111 +4181,33 @@ function markOutboundInitialDone(itemId, peerIds) {
   }
 }
 
-async function* fileChunkGeneratorBinary(item, targetId, onProgress) {
-  if (!item.rawBuffer) return;
-  const buf = item.rawBuffer;
-  const totalChunks = Math.ceil(buf.byteLength / BINARY_CHUNK_SIZE) || 1;
-  const isBroadcast = !targetId;
-  onProgress(0, totalChunks); // initialise outbound row; bar advances via ACKs
-  debugLog('starting', { itemId: item.id, targetId: targetId || 'broadcast', path: 'binary', totalChunks, bytes: buf.byteLength });
-
-  for (let i = 0; i < totalChunks; i++) {
-    if (!items.has(item.id)) { if (isBroadcast) activeBroadcasts.delete(item.id); return; }
-    await sendBinaryChunk(item, targetId, i, totalChunks);
-    if (isBroadcast) activeBroadcasts.set(item.id, { nextChunk: i + 1, totalChunks });
-    debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId: targetId || 'broadcast', path: 'binary' });
-    yield;
-  }
-  if (isBroadcast) activeBroadcasts.delete(item.id);
-  if (targetId) markOutboundInitialDone(item.id, [targetId]);
-  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
-  debugLog('finish-send', { itemId: item.id, targetId: targetId || 'broadcast', path: 'binary', totalChunks });
-}
-
-async function* fileChunkGeneratorBinaryRange(item, targetId, fromChunk, toChunk, onProgress) {
-  if (!item.rawBuffer) return;
-  const buf = item.rawBuffer;
-  const totalChunks = Math.ceil(buf.byteLength / BINARY_CHUNK_SIZE) || 1;
-  const end = Math.min(toChunk, totalChunks);
-  onProgress(0, end - fromChunk); // initialise outbound row; bar advances via ACKs
-  debugLog('starting', { itemId: item.id, targetId, path: 'binary-range', fromChunk, toChunk: end, totalChunks });
-
-  for (let i = fromChunk; i < end; i++) {
-    if (!items.has(item.id)) return;
-    await sendBinaryChunk(item, targetId, i, totalChunks);
-    debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId, path: 'binary-range' });
-    yield;
-  }
-  markOutboundInitialDone(item.id, [targetId]);
-  debugLog('finish-send', { itemId: item.id, targetId, path: 'binary-range', fromChunk, toChunk: end, totalChunks });
-}
-
-function sendFileChunksBinary(item, targetId) {
-  if (targetId) {
-    // Targeted send to one peer — single progress row
-    const resendMissing = indexes => resendBinaryChunks(item, targetId, indexes);
-    const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
-    chunkScheduler.enqueue(item.id, -(item.size || 0),
-      () => fileChunkGeneratorBinary(item, targetId, onProgress));
-    return;
-  }
-
-  // Broadcast — one progress row per currently connected peer
-  const peerIds = [...connectedPeers.keys()];
-  if (!peerIds.length) {
-    chunkScheduler.enqueue(item.id, item.size || 0,
-      () => fileChunkGeneratorBinary(item, null, () => {}));
-    return;
-  }
-
-  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendBinaryChunks(item, pid, indexes));
-
-  const onProgress = (sent, total) => {
-    const pm = outboundTransfers.get(item.id);
-    for (const pid of peerIds) {
-      const p = pm?.get(pid);
-      if (p) {
-        p.total = total;
-        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
-      }
-      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
-    }
-  };
-
-  chunkScheduler.enqueue(item.id, item.size || 0,
-    () => fileChunkGeneratorBinary(item, null, onProgress));
-}
-
-function sendFileChunksBinaryRange(item, targetId, fromChunk, toChunk) {
-  if (fromChunk >= toChunk) return;
-  const resendMissing = indexes => resendBinaryChunks(item, targetId, indexes);
-  const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
-  // High priority (negative) so catch-up to new peer runs before broadcast continues
-  chunkScheduler.enqueue(item.id, -(item.size || 0),
-    () => fileChunkGeneratorBinaryRange(item, targetId, fromChunk, toChunk, onProgress));
-}
-
 // ── Chunked file sending (encrypted binary path) ─────────────────────
 
 async function sendEncryptedBinaryChunk(item, key, targetId, chunkIndex, totalChunks) {
-  if (!items.has(item.id) || !item.rawBuffer) return;
-  if (!await waitForDataWS()) return;
+  if (!items.has(item.id) || !item.rawBuffer) return false;
+  if (!await waitForDataWS()) return false;
   await drainWS();
   const start = chunkIndex * BINARY_CHUNK_SIZE;
   const chunkBytes = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, chunkBytes));
+  const payload = new Uint8Array(12 + ciphertext.length);
+  payload.set(iv, 0);
+  payload.set(ciphertext, 12);
 
-  const header = { t: 'efc', i: item.id, ci: chunkIndex, tc: totalChunks, sid: clientId };
+  const header = { t: 'efc', i: item.id, ci: chunkIndex, tc: totalChunks, sid: clientId, crc32: crc32Bytes(payload) };
   if (targetId) header.tid = targetId;
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-  const frame = new Uint8Array(4 + headerBytes.length + 12 + ciphertext.length);
+  const frame = new Uint8Array(4 + headerBytes.length + payload.length);
   new DataView(frame.buffer).setUint32(0, headerBytes.length, false);
   frame.set(headerBytes, 4);
-  frame.set(iv, 4 + headerBytes.length);
-  frame.set(ciphertext, 4 + headerBytes.length + 12);
+  frame.set(payload, 4 + headerBytes.length);
 
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) dataWs.send(frame.buffer);
+  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
+    dataWs.send(frame.buffer);
+    return true;
+  }
+  return false;
 }
 
 async function resendEncryptedBinaryChunks(item, key, targetId, chunkIndexes) {
@@ -3039,34 +4215,37 @@ async function resendEncryptedBinaryChunks(item, key, targetId, chunkIndexes) {
   const totalChunks = Math.ceil(item.rawBuffer.byteLength / BINARY_CHUNK_SIZE) || 1;
   for (const i of chunkIndexes) {
     if (i < 0 || i >= totalChunks) continue;
-    await sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks);
+    await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
   }
 }
 
-async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress) {
+async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress, requestedChunks = null) {
   if (!item.rawBuffer) return;
   const buf = item.rawBuffer;
   const totalChunks = Math.ceil(buf.byteLength / BINARY_CHUNK_SIZE) || 1;
+  const chunkIndexes = normalizeChunkIndexes(requestedChunks, totalChunks) || Array.from({ length: totalChunks }, (_, i) => i);
+  if (targetId) seedContinuationProgress(item.id, targetId, totalChunks, requestedChunks);
   onProgress(0, totalChunks); // initialise outbound row; bar advances via ACKs
-  debugLog('starting', { itemId: item.id, targetId: targetId || 'broadcast', path: 'encrypted-binary', totalChunks, bytes: buf.byteLength });
+  logUploadStart(item.id, targetId, totalChunks);
 
-  for (let i = 0; i < totalChunks; i++) {
+  for (const i of chunkIndexes) {
     if (!items.has(item.id)) return;
-    await sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks);
-    debugProgress('progress-send', item.id, i + 1, totalChunks, { targetId: targetId || 'broadcast', path: 'encrypted-binary' });
+    const sent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
+    if (!sent) return;
+    logUploadChunk(item.id, i, totalChunks, targetId);
     yield;
   }
   if (targetId) markOutboundInitialDone(item.id, [targetId]);
   else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
-  debugLog('finish-send', { itemId: item.id, targetId: targetId || 'broadcast', path: 'encrypted-binary', totalChunks });
+  logUploadDone(item.id, targetId);
 }
 
-function sendFileChunksBinaryEncrypted(item, key, targetId) {
+function sendFileChunksBinaryEncrypted(item, key, targetId, requestedChunks = null) {
   if (targetId) {
     const resendMissing = indexes => resendEncryptedBinaryChunks(item, key, targetId, indexes);
     const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
     chunkScheduler.enqueue(item.id, -(item.size || 0),
-      () => fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress));
+      () => fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress, requestedChunks));
     return;
   }
 
@@ -3086,8 +4265,17 @@ function sendFileChunksBinaryEncrypted(item, key, targetId) {
       if (p) {
         p.total = total;
         p.sent = p.resendMissing ? p.ackedChunks.size : sent;
+        p.currentChunk = sent;
       }
       updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
+      publishTransferStatus({
+        itemId: item.id,
+        sourceId: clientId,
+        targetId: pid,
+        current: p?.currentChunk || sent,
+        done: p?.sent ?? sent,
+        total,
+      });
     }
   };
 
@@ -3107,11 +4295,20 @@ function handleBinaryMessage(buffer) {
     header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, headerLen)));
   } catch { return; }
   if (header.t === 'efc') {
+    if (!isValidChunkSet(header.ci, header.tc)) {
+      debugLog('chunk-invalid', { itemId: header.i, chunkIndex: header.ci, totalChunks: header.tc, path: 'encrypted-binary' });
+      return;
+    }
     const key = cardEncryptionKeys.get(header.i) || encryptionKey;
     const payload = buffer.slice(4 + headerLen);
     const sid = header.sid;
+    if (Number.isFinite(header.crc32) && crc32Bytes(new Uint8Array(payload)) !== (header.crc32 >>> 0)) {
+      debugLog('chunk-crc-failed', { itemId: header.i, chunkIndex: header.ci, path: 'encrypted-binary' });
+      return;
+    }
     if (!key) {
       const receivedChunks = storeEncryptedBinaryChunk(header, payload);
+      continueChunkRequestBatch(header.i, header.ci, sid);
       sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       return;
     }
@@ -3122,35 +4319,37 @@ function handleBinaryMessage(buffer) {
       })
       .catch(() => {
         const receivedChunks = storeEncryptedBinaryChunk(header, payload);
+        continueChunkRequestBatch(header.i, header.ci, sid);
         sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       });
     return;
   }
-  if (header.t !== 'fc') return;
-  // Copy chunk data into its own buffer so the outer ArrayBuffer can be GC'd
-  const chunkData = buffer.slice(4 + headerLen);
-  const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, chunkData, header.sid);
-  sendChunkAck(header.i, header.tc, header.sid, receivedChunks, header.ci);
 }
 
 function sendChunkAck(itemId, totalChunks, senderId, receivedChunks, chunkIndex) {
   if (!senderId || !ws || ws.readyState !== WebSocket.OPEN) return;
-  debugProgress('progress-ack-send', itemId, receivedChunks, totalChunks, { senderId });
-  sendPriorityJson({
+  wsSend({
     type: 'relay',
     targetId: senderId,
     payload: { type: 'chunk_ack', itemId, totalChunks, receivedChunks, chunkIndex, peerId: clientId },
-  });
+  }, null, true);
 }
 
 function handleChunkAck(itemId, totalChunks, peerId, receivedChunks, chunkIndex) {
   const pm = outboundTransfers.get(itemId);
   const p = pm?.get(peerId);
   if (!p) return;
-  if (!p.total) p.total = totalChunks;
+  const normalizedTotal = Number(totalChunks);
+  if (!p.total && Number.isInteger(normalizedTotal) && normalizedTotal > 0 && normalizedTotal <= MAX_TRANSFER_CHUNKS) {
+    p.total = normalizedTotal;
+  }
+  if (!p.total) return;
   if (Number.isFinite(chunkIndex)) {
+    const index = Number(chunkIndex);
+    if (!isValidChunkIndex(index, p.total)) return;
     p.ackedChunks ||= new Set();
-    p.ackedChunks.add(chunkIndex);
+    p.ackedChunks.add(index);
+    p.currentChunk = index + 1;
     p.sent = p.ackedChunks.size;
   } else if (Number.isFinite(receivedChunks)) {
     p.sent = Math.min(Math.max(receivedChunks, p.sent || 0), p.total);
@@ -3158,36 +4357,50 @@ function handleChunkAck(itemId, totalChunks, peerId, receivedChunks, chunkIndex)
     return;
   }
   if (p.sent < p.total) scheduleChunkRetry(itemId, peerId, p);
-  debugProgress('progress-ack-received', itemId, p.sent, p.total, { peerId });
   updateOutboundRow(itemId, peerId, p.sent, p.total);
   finishOutboundPeerIfComplete(itemId, peerId, p);
 }
 
 function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, senderId) {
+  if (!isValidChunkSet(chunkIndex, totalChunks)) {
+    debugLog('chunk-invalid', { itemId, chunkIndex, totalChunks, path: 'binary-receive' });
+    return 0;
+  }
   if (!binaryTransfers.has(itemId) && items.get(itemId)?.rawBuffer) return totalChunks;
   if (!binaryTransfers.has(itemId)) {
-    binaryTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), received: 0, totalChunks, senderId, startTime: Date.now() });
-    debugLog('starting', { itemId, path: 'receive-binary', totalChunks });
+    binaryTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), chunkSources: new Array(totalChunks).fill(''), received: 0, totalChunks, senderId, currentChunk: 0, startTime: Date.now() });
+    pendingDownloadTriedSources.delete(itemId);
   }
   const t = binaryTransfers.get(itemId);
+  if (senderId) t.senderId = senderId;
+  t.currentChunk = chunkIndex + 1;
   if (t.chunks[chunkIndex] === null) {
+    logDownloadSourceStart(itemId, senderId || t.senderId, totalChunks);
+    logDownloadChunk(itemId, chunkIndex, totalChunks, senderId || t.senderId);
     t.chunks[chunkIndex] = chunkBuffer;
+    t.chunkSources[chunkIndex] = senderId || t.senderId || '';
     t.received++;
   }
-  debugProgress('progress-receive', itemId, t.received, t.totalChunks, { path: 'binary' });
+  continueChunkRequestBatch(itemId, chunkIndex, senderId || t.senderId);
   updateTransferProgress(itemId, t.received / t.totalChunks, t);
   if (t.received === t.totalChunks) {
+    logDownloadDone(itemId, t.chunkSources);
     binaryTransfers.delete(itemId);
-    finalizeTransferBinary(itemId, t.chunks);
+    clearAutomaticDownloadRetry(itemId);
+    downloadSourceRetryAttempts.delete(itemId);
+    pendingDownloadSourceIds.delete(itemId);
+    pendingDownloadTriedSources.delete(itemId);
+    pendingChunkRequestBatches.delete(itemId);
+    finalizeTransferBinary(itemId, t.chunks, t.startTime);
   }
   return t.received;
 }
 
-async function finalizeTransferBinary(itemId, chunks) {
+async function finalizeTransferBinary(itemId, chunks, startTime = Date.now()) {
   const item = items.get(itemId);
   if (!item) return;
-  debugLog('finish', { itemId, path: 'binary', filename: item.filename, chunks: chunks.length });
   const totalBytes = chunks.reduce((s, c) => s + c.byteLength, 0);
+  recordTransferMetric('download', totalBytes, startTime);
   const assembled = new Uint8Array(totalBytes);
   let offset = 0;
   for (const chunk of chunks) { assembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
@@ -3199,67 +4412,62 @@ async function finalizeTransferBinary(itemId, chunks) {
   finalizeCardInPlace(item);
 }
 
-// ── Chunked file receiving (encrypted/base64 path) ───────────────────
-function handleFileChunk({ itemId, chunkIndex, totalChunks, prefix, data }, senderId) {
-  if (!fileTransfers.has(itemId) && items.get(itemId)?.dataUrl) {
-    sendChunkAck(itemId, totalChunks, senderId, totalChunks, chunkIndex);
-    return;
-  }
-  if (!fileTransfers.has(itemId)) {
-    fileTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), received: 0, totalChunks, prefix: '', senderId, startTime: Date.now() });
-    debugLog('starting', { itemId, path: 'receive-base64', totalChunks });
-  }
-  const t = fileTransfers.get(itemId);
-  if (prefix) t.prefix = prefix;
-  if (t.chunks[chunkIndex] === null) { t.chunks[chunkIndex] = data; t.received++; }
-  sendChunkAck(itemId, totalChunks, senderId, t.received, chunkIndex);
-
-  debugProgress('progress-receive', itemId, t.received, t.totalChunks, { path: 'base64' });
-  updateTransferProgress(itemId, t.received / t.totalChunks, t);
-
-  if (t.received === t.totalChunks) {
-    const dataUrl = t.prefix + t.chunks.join('');
-    fileTransfers.delete(itemId);
-    finalizeTransfer(itemId, dataUrl);
-  }
-}
-
 function updateTransferProgress(itemId, fraction, transfer) {
   const card = document.getElementById('card-' + itemId);
   if (!card) return;
-  const pct = Math.round(fraction * 100);
+  const pct = transferPercent(fraction);
 
   let section = card.querySelector('.inbound-progress');
   if (!section) {
-    const imap = buildPeerIdentityMap();
-    const identity = transfer?.senderId ? imap.get(transfer.senderId) : null;
-    const label = identity ? identity.fullName : 'Unknown';
+    const sourceIds = transferSourceIdsFromChunks(transfer?.chunkSources, transfer?.senderId);
     section = document.createElement('div');
     section.className = 'inbound-progress';
-    section.innerHTML = `<div class="outbound-progress-title">Receiving…</div>
+    section.innerHTML = `<div class="outbound-progress-title">Receiving...</div>
 <div class="outbound-peer-row">
-  <span class="outbound-peer-label">${escHtml(label)}</span>
+  <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml(sourceIds, 'transfer-peer-icons-inline')}</div>
   <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="ib-fill-${itemId}" style="width:0%"></div></div>
-  <span class="outbound-peer-eta" id="ib-eta-${itemId}">…</span>
+  <span class="outbound-peer-eta" id="ib-eta-${itemId}">0%</span>
 </div>`;
     card.insertBefore(section, card.querySelector('.card-footer'));
     requestAnimationFrame(() => requestAnimationFrame(() => section.classList.add('ip-visible')));
   }
+  const sourceSlot = section.querySelector('.transfer-peer-slot');
+  if (sourceSlot) sourceSlot.innerHTML = peerIconStackHtml(transferSourceIdsFromChunks(transfer?.chunkSources, transfer?.senderId), 'transfer-peer-icons-inline');
 
   const fill = document.getElementById('ib-fill-' + itemId);
   if (fill) fill.style.width = pct + '%';
+  updateChatCardDownloadState(itemId);
   const eta = document.getElementById('ib-eta-' + itemId);
-  if (eta) eta.textContent = transfer ? formatETA(transfer.startTime, transfer.received, transfer.totalChunks) : (pct >= 100 ? 'Done' : '…');
+  if (eta) eta.textContent = `${pct}%`;
+  if (transfer?.senderId) {
+    publishTransferStatus({
+      itemId,
+      sourceId: transfer.senderId,
+      targetId: clientId,
+      current: transfer.currentChunk || transfer.received || 0,
+      done: transfer.received || 0,
+      total: transfer.totalChunks || 0,
+      chunkRuns: transferChunkRunsFromSources(transfer.chunkSources, transfer.totalChunks),
+      status: pct >= 100 ? 'done' : 'active',
+      force: pct >= 100,
+    });
+  }
+  if (pct >= 100) {
+    clearAutomaticDownloadRetry(itemId);
+    downloadSourceRetryAttempts.delete(itemId);
+  } else if (transfer) {
+    scheduleAutomaticDownloadRetry(itemId, transfer);
+  }
+  schedulePeersModalRefresh();
+  refreshIcons();
 }
 
-function formatETA(startTime, sent, total) {
-  if (!sent) return '...';
-  const elapsed = Date.now() - startTime;
-  const ms = Math.ceil((total - sent) * elapsed / sent);
-  if (ms < 10000) return `${Math.ceil(ms / 1000)}s`;
-  if (ms < 60000) return `${Math.round(ms / 1000)}s`;
-  const m = Math.floor(ms / 60000), s = Math.round((ms % 60000) / 1000);
-  return s ? `${m}m ${s}s` : `${m}m`;
+function transferPercent(fraction) {
+  return Math.max(0, Math.min(100, Math.round((Number(fraction) || 0) * 100)));
+}
+
+function transferPercentFromCounts(done, total) {
+  return Number(total) ? transferPercent((Number(done) || 0) / Number(total)) : 0;
 }
 
 function refreshOutboundUI(itemId) {
@@ -3279,14 +4487,11 @@ function refreshOutboundUI(itemId) {
   section.className = 'outbound-progress';
   let html = '<div class="outbound-progress-title">Sending…</div>';
   for (const [key, p] of peerMap) {
-    const identity = buildPeerIdentityMap().get(key);
-    const label = identity?.fullName ?? '?';
-    const pct = p.total ? Math.round(p.sent / p.total * 100) : 0;
-    const etaText = pct >= 100 ? 'Done' : '...';
+    const pct = transferPercentFromCounts(p.sent, p.total);
     html += `<div class="outbound-peer-row">
-      <span class="outbound-peer-label">${escHtml(label)}</span>
+      <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml([key], 'transfer-peer-icons-inline')}</div>
       <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="ob-fill-${itemId}-${key}" style="width:${pct}%"></div></div>
-      <span class="outbound-peer-eta" id="ob-eta-${itemId}-${key}">${etaText}</span>
+      <span class="outbound-peer-eta" id="ob-eta-${itemId}-${key}">${pct}%</span>
     </div>`;
   }
   section.innerHTML = html;
@@ -3297,30 +4502,17 @@ function refreshOutboundUI(itemId) {
     card.insertBefore(section, card.querySelector('.card-footer'));
     requestAnimationFrame(() => requestAnimationFrame(() => section.classList.add('op-visible')));
   }
+  refreshIcons();
 }
 
 function updateOutboundRow(itemId, key, sent, total) {
-  const pct = total ? Math.round(sent / total * 100) : 0;
+  const pct = transferPercentFromCounts(sent, total);
   const fill = document.getElementById(`ob-fill-${itemId}-${key}`);
   if (fill) fill.style.width = pct + '%';
   const eta = document.getElementById(`ob-eta-${itemId}-${key}`);
-  if (!eta) return;
-  if (pct >= 100) { eta.textContent = 'Done'; return; }
-  const p = outboundTransfers.get(itemId)?.get(key);
-  eta.textContent = p ? formatETA(p.startTime, sent, total) : '...';
-}
-
-async function finalizeTransfer(itemId, dataUrl) {
-  const item = items.get(itemId);
-  if (!item) return;
-  debugLog('finish', { itemId, path: 'base64', filename: item.filename, bytes: dataUrl.length });
-  item.dataUrl = dataUrl;
-  if (item.type === 'image' && !isBrowserViewableImage(item.mimeType)) {
-    const blob = await (await fetch(dataUrl)).blob();
-    await prepareImageThumbnail(item, blob);
-  }
-  publishClientCardMetadata(item);
-  finalizeCardInPlace(item);
+  if (!eta) { schedulePeersModalRefresh(); return; }
+  eta.textContent = `${pct}%`;
+  schedulePeersModalRefresh();
 }
 
 // ── Text editing ─────────────────────────────────────────────────────
@@ -3355,11 +4547,19 @@ function deleteItem(id) {
   items.delete(id);
   const cardKey = cardEncryptionKeys.get(id);
   cardEncryptionKeys.delete(id);
-  fileTransfers.delete(id);
   binaryTransfers.delete(id);
-  activeBroadcasts.delete(id);
   chunkScheduler.cancelItem(id);
+  clearOutboundRetriesForItem(id);
   outboundTransfers.delete(id);
+  clearAutomaticDownloadRetry(id);
+  downloadSourceRetryAttempts.delete(id);
+  pendingDownloadSourceIds.delete(id);
+  pendingDownloadTriedSources.delete(id);
+  pendingChunkRequestBatches.delete(id);
+  downloadLogSources.delete(id);
+  clearTransferStatusesForItem(id);
+  updateSendWakeLock();
+  removeManifestMeta(id, nextManifestRevision(id));
   publishClientCardRemoval(id, 'local-delete');
   if (item?.type !== 'encrypted' || cardKey) {
     wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, cardKey);
@@ -3371,12 +4571,19 @@ function deleteItem(id) {
 function renderAll() {
   const container = document.getElementById('cards');
   container.innerHTML = '';
-  [...items.values()].sort((a, b) => b.addedAt - a.addedAt).forEach(item => container.appendChild(buildCard(item)));
+  [...items.values()]
+    .filter(item => item.type !== 'encrypted')
+    .sort((a, b) => b.addedAt - a.addedAt)
+    .forEach(item => container.appendChild(buildCard(item)));
   updateEmpty();
   refreshIcons();
 }
 
 function prependCard(item) {
+  if (item.type === 'encrypted') {
+    updateEmpty();
+    return;
+  }
   const container = document.getElementById('cards');
   container.insertBefore(buildCard(item), container.firstChild);
   refreshIcons();
@@ -3389,9 +4596,12 @@ function finalizeCardInPlace(item) {
   const body = card.querySelector('.card-body');
   if (body) {
     const imagePreviewUrl = item.thumbnailDataUrl || (isBrowserViewableImage(item.mimeType) ? item.dataUrl : '');
+    const videoPreviewHtml = playableVideoCardHtml(item);
     let bodyHtml;
     if (item.type === 'image' && imagePreviewUrl) {
       bodyHtml = imageCardHtml(item, imagePreviewUrl);
+    } else if (videoPreviewHtml) {
+      bodyHtml = videoPreviewHtml;
     } else {
       bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}<div class="file-info">
   <div class="file-name" title="${escAttr(item.filename)}">${escHtml(item.filename)}</div>
@@ -3418,6 +4628,7 @@ function finalizeCardInPlace(item) {
   }
 
   refreshIcons();
+  updateChatCardDownloadState(item.id);
 }
 
 function fileMetaHtml(item) {
@@ -3433,31 +4644,28 @@ function imageCardHtml(item, imagePreviewUrl) {
 <div class="card-image-meta">${fileMetaHtml(item)}</div>`;
 }
 
+function videoCardHtml(item) {
+  return `<div class="card-video"><video src="${escAttr(item.dataUrl)}" controls preload="metadata" playsinline></video></div>
+<div class="card-image-meta">${fileMetaHtml(item)}</div>`;
+}
+
+function playableVideoCardHtml(item) {
+  return item?.dataUrl && isBrowserPlayableVideo(item.mimeType) ? videoCardHtml(item) : '';
+}
+
 function buildCard(item) {
   const card = document.createElement('div');
   card.className = 'card';
   card.id = 'card-' + item.id;
+  if (item.type === 'encrypted') {
+    card.hidden = true;
+    return card;
+  }
 
   let bodyHtml = '';
   let footerActions = '';
 
-  if (item.type === 'encrypted') {
-    const chunkText = encryptedChunkStatus(item);
-    const progressPct = item.totalEncryptedChunks
-      ? Math.round(((item.receivedEncryptedChunks || 0) / item.totalEncryptedChunks) * 100)
-      : 0;
-    const progressDisplay = item.totalEncryptedChunks ? '' : 'display:none;';
-    bodyHtml = `<div class="encrypted-card">
-  <i data-lucide="lock"></i>
-  <div class="file-info">
-    <div class="file-name">Encrypted</div>
-    <div class="file-type encrypted-status">${chunkText}</div>
-    <div class="progress-wrap encrypted-progress-wrap" style="${progressDisplay}"><div class="progress-fill encrypted-progress" style="width:${progressPct}%"></div></div>
-  </div>
-</div>`;
-    footerActions = `<button class="btn-secondary" onclick="enterPasswordForEncryptedCard('${item.id}')"><i data-lucide="key-round"></i> Open</button>`;
-
-  } else if (item.type === 'text') {
+  if (item.type === 'text') {
     bodyHtml = `<div class="card-text">
   <div class="text-content" contenteditable="true" spellcheck="false"
        oninput="onTextEdit('${item.id}', this)"
@@ -3472,6 +4680,8 @@ function buildCard(item) {
     const imagePreviewUrl = item.thumbnailDataUrl || (isBrowserViewableImage(item.mimeType) ? item.dataUrl : '');
     if (item.type === 'image' && imagePreviewUrl) {
       bodyHtml = imageCardHtml(item, imagePreviewUrl);
+    } else if (isBrowserPlayableVideo(item.mimeType)) {
+      bodyHtml = videoCardHtml(item);
     } else {
       bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
     }
@@ -3481,13 +4691,12 @@ function buildCard(item) {
     bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
   }
 
-  const encryptedIcon = item.encrypted ? '<i data-lucide="lock" title="Encrypted"></i>' : '';
   const addedAt = Number.isFinite(Number(item.addedAt)) ? Number(item.addedAt) : Date.now();
 
   card.innerHTML = `
 <div class="card-body">${bodyHtml}</div>
 <div class="card-footer">
-  <span class="card-time" data-added-at="${addedAt}">${encryptedIcon}<span class="card-time-text">${timeAgo(addedAt)}</span></span>
+  <span class="card-time" data-added-at="${addedAt}"><span class="card-time-text">${timeAgo(addedAt)}</span></span>
   ${footerActions}
   <button class="btn-icon" title="Delete" onclick="deleteItem('${item.id}')"><i data-lucide="trash-2"></i></button>
 </div>`;

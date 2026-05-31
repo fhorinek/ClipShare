@@ -17,6 +17,9 @@
   --radius: 14px;
   --shadow: 0 1px 3px rgba(0, 0, 0, .12), 0 2px 6px rgba(0, 0, 0, .08);
   --shadow-hover: 0 4px 12px rgba(0, 0, 0, .15);
+  --scrollbar-track: color-mix(in srgb, var(--surface) 78%, var(--bg));
+  --scrollbar-thumb: color-mix(in srgb, var(--text-secondary) 42%, var(--surface));
+  --scrollbar-thumb-hover: color-mix(in srgb, var(--accent) 58%, var(--text-secondary));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -33,8 +36,51 @@ body {
   font-family: 'Google Sans', Roboto, Arial, sans-serif;
   background: var(--bg);
   color: var(--text);
-  min-height: 100vh;
   overflow-x: hidden;
+}
+
+.share-main,
+#chat-messages,
+#peers-list {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+.share-main::-webkit-scrollbar,
+#chat-messages::-webkit-scrollbar,
+#peers-list::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.share-main::-webkit-scrollbar-track,
+#chat-messages::-webkit-scrollbar-track,
+#peers-list::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 999px;
+}
+
+.share-main::-webkit-scrollbar-thumb,
+#chat-messages::-webkit-scrollbar-thumb,
+#peers-list::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 2px solid var(--scrollbar-track);
+  border-radius: 999px;
+}
+
+.share-main::-webkit-scrollbar-thumb:hover,
+#chat-messages::-webkit-scrollbar-thumb:hover,
+#peers-list::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+body.app-active {
+  overflow: hidden;
+}
+
+html,
+body {
+  height: 100%;
 }
 
 /* ── Token screen ─────────────────────────────────────── */
@@ -104,6 +150,22 @@ body {
   border-color: var(--accent);
 }
 
+.token-box .pin-input {
+  font-family: monospace;
+  letter-spacing: .16em;
+}
+
+.pin-sep {
+  user-select: none;
+}
+
+.pin-error-msg {
+  color: #e05252;
+  font-size: .78rem;
+  margin: 0;
+  text-align: center;
+}
+
 .btn-row {
   display: flex;
   gap: 8px;
@@ -151,6 +213,66 @@ button:active {
 .btn-secondary.active {
   color: var(--accent);
   outline: 1px solid var(--accent);
+}
+
+.pairing-pin-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pairing-pin-row .pairing-pin {
+  flex: 1;
+  min-width: 0;
+}
+
+.pairing-pin-side {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  width: 32px;
+}
+
+.pairing-pin {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 12px 14px;
+  text-align: center;
+}
+
+.pairing-pin-value {
+  font-family: monospace;
+  font-size: 2.2rem;
+  letter-spacing: .16em;
+  color: var(--text);
+}
+
+.pairing-pin-time {
+  color: var(--text-secondary);
+  font-size: .72rem;
+}
+
+@property --sp-deg {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 360deg;
+}
+
+.pairing-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) var(--sp-deg), color-mix(in srgb, var(--accent) 25%, transparent) 0deg);
+  animation: pin-countdown 60s linear 1 forwards;
+  flex-shrink: 0;
+}
+
+@keyframes pin-countdown {
+  from { --sp-deg: 360deg; }
+  to   { --sp-deg: 0deg; }
 }
 
 .btn-ghost {
@@ -224,7 +346,8 @@ button:active {
 #app {
   display: none;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
 }
 
 header {
@@ -378,11 +501,30 @@ header {
   flex-shrink: 0;
 }
 
+.peer-pill-incompatible {
+  outline: 2px solid var(--danger);
+}
+
 .peer-row-main {
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
+  min-width: 0;
+}
+
+.peer-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-row-detail {
+  max-width: 70%;
+  line-height: 1.35;
+  text-align: right;
+  white-space: normal;
 }
 
 .peer-user-row {
@@ -390,11 +532,112 @@ header {
   align-items: stretch;
 }
 
+.peer-incompatible {
+  border: 2px solid var(--danger);
+}
+
+.peer-incompatible .peer-row-detail {
+  color: var(--danger);
+}
+
 .peer-card-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
   padding-left: 24px;
+}
+
+.peer-transfer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 24px;
+}
+
+.peer-transfer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: .72rem;
+}
+
+.peer-transfer-meta {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.peer-transfer-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.transfer-peer-icons {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.peer-transfer-source-icons {
+  max-width: 96px;
+}
+
+.peer-transfer-title {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-transfer-progress {
+  height: 12px;
+  padding: 1px;
+  background: color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 6px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.peer-transfer-fill {
+  height: 100%;
+  background: #34a853;
+  border-radius: 4px;
+}
+
+.peer-transfer-chunks {
+  display: grid;
+  grid-template-columns: repeat(var(--peer-transfer-total), minmax(0, 1fr));
+  gap: 2px;
+  background: color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+.peer-transfer-chunks-dense {
+  gap: 0;
+}
+
+.peer-transfer-chunk {
+  height: 100%;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--border) 42%, transparent);
+}
+
+.peer-transfer-chunks-dense .peer-transfer-chunk {
+  border-radius: 0;
+}
+
+.peer-transfer-chunk-done {
+  background: var(--peer-transfer-chunk, #34a853);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #fff 18%, transparent);
+}
+
+.peer-transfer-chunks-dense .peer-transfer-chunk-done {
+  box-shadow: none;
 }
 
 .peer-card-meta {
@@ -409,6 +652,11 @@ header {
 .peer-card-name {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-card-detail {
+  text-align: right;
   white-space: nowrap;
 }
 
@@ -476,17 +724,6 @@ header {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 14px;
-}
-
-.encryption-control {
-  color: var(--text-secondary);
-  border: 1px solid transparent;
-}
-
-.encryption-control.active {
-  color: var(--accent);
-  border-color: var(--border);
-  background: var(--bg);
 }
 
 .ws-dot {
@@ -558,7 +795,7 @@ header {
 }
 
 #app.chat-open .app-workspace {
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+  grid-template-columns: minmax(0, 1fr) minmax(320px, var(--chat-panel-width, 360px));
 }
 
 .share-main {
@@ -566,6 +803,8 @@ header {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 #https-warning {
@@ -580,8 +819,10 @@ header {
 #chat-panel {
   background: var(--surface);
   border-left: 1px solid var(--border);
-  min-width: 0;
+  min-width: 320px;
+  max-width: min(720px, 55vw);
   overflow: hidden;
+  resize: horizontal;
   transform: translateX(100%);
   transition: transform .25s ease;
   display: flex;
@@ -589,6 +830,19 @@ header {
   height: calc(100vh - 105px);
   position: sticky;
   top: 105px;
+}
+
+#chat-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 -5px;
+  width: 10px;
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+#chat-panel:hover::before {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 #app.chat-open #chat-panel {
@@ -746,6 +1000,7 @@ header {
 }
 
 .chat-card-mention {
+  position: relative;
   display: grid;
   grid-template-columns: 26px minmax(0, 1fr);
   gap: 6px;
@@ -760,6 +1015,7 @@ header {
   line-height: 1.15;
   text-align: left;
   white-space: normal;
+  overflow: hidden;
 }
 
 .chat-card-mention .lucide {
@@ -771,6 +1027,31 @@ header {
 
 .chat-card-mention .file-type-icon {
   font-size: 1.35rem;
+}
+
+.chat-card-mention.chat-card-image {
+  grid-template-columns: 74px minmax(0, 1fr);
+  width: min(100%, 18rem);
+  align-items: start;
+}
+
+.chat-card-preview {
+  display: block;
+  width: 74px;
+  height: 56px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: color-mix(in srgb, var(--chat-user-accent, var(--border)) 18%, #fff);
+}
+
+.chat-card-mention-compact.chat-card-image {
+  grid-template-columns: 34px minmax(0, 1fr);
+  width: min(100%, 13rem);
+}
+
+.chat-card-mention-compact .chat-card-preview {
+  width: 34px;
+  height: 28px;
 }
 
 .chat-card-mention span {
@@ -795,6 +1076,61 @@ header {
 .chat-card-mention small {
   color: #444;
   font-size: .7rem;
+}
+
+.chat-card-mention.chat-card-pending {
+  cursor: progress;
+  color: #555;
+  background: color-mix(in srgb, #d7dbe2 68%, var(--chat-bubble-bg));
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.chat-card-mention.chat-card-pending> :not(.chat-card-progress-track):not(.chat-card-progress-label) {
+  filter: grayscale(1) blur(1px);
+  opacity: .48;
+}
+
+.chat-card-progress-track {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, .14);
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chat-card-pending .chat-card-progress-track {
+  opacity: 1;
+}
+
+.chat-card-progress-track span {
+  display: block;
+  width: var(--chat-card-progress, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width .18s ease;
+}
+
+.chat-card-progress-label {
+  position: absolute;
+  right: 8px;
+  bottom: 12px;
+  color: #222;
+  font-size: .66rem;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  text-shadow: 0 1px 6px rgba(255, 255, 255, .9);
+}
+
+.chat-card-pending .chat-card-progress-label {
+  opacity: .9;
 }
 
 .chat-bubble-emote-only {
@@ -1165,12 +1501,17 @@ header {
   cursor: text;
 }
 
-.card-image img {
+.card-image img,
+.card-video video {
   width: 100%;
   border-radius: 8px;
   display: block;
   max-height: 180px;
   object-fit: cover;
+}
+
+.card-video video {
+  background: #000;
 }
 
 .card-image-meta {
@@ -1242,10 +1583,18 @@ header {
 }
 
 .outbound-peer-label {
-  font-size: .68rem;
-  color: var(--text-secondary);
   min-width: 52px;
+  max-width: 84px;
   flex-shrink: 0;
+}
+
+.transfer-peer-slot {
+  display: flex;
+  align-items: center;
+}
+
+.transfer-peer-icons-inline {
+  max-width: 84px;
 }
 
 .outbound-peer-progress {
@@ -1289,25 +1638,6 @@ header {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-}
-
-.card-time .lucide {
-  width: 12px;
-  height: 12px;
-  color: var(--accent);
-}
-
-.encrypted-card {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.encrypted-card .lucide {
-  width: 28px;
-  height: 28px;
-  color: var(--accent);
-  flex-shrink: 0;
 }
 
 /* ── Empty state ──────────────────────────────────────── */
@@ -1443,19 +1773,21 @@ header {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 10px;
+  color: var(--text);
+  font: inherit;
   font-size: .86rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;
+  outline: none;
+}
+
+input.token-modal-value:focus {
+  border-color: var(--accent);
 }
 
 .token-value {
-  font-size: 1.72rem;
-  font-family: monospace;
-}
-
-.passphrase-value {
   font-size: 1.72rem;
   font-family: monospace;
 }
@@ -1508,27 +1840,7 @@ header {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.token-url-wrap .token-modal-value {
-  white-space: normal;
-  word-break: break-all;
-}
-
-.passphrase-field {
-  width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: .95rem;
-  background: var(--bg);
-  color: var(--text);
-  outline: none;
-  margin-bottom: 12px;
-}
-
-.passphrase-field:focus {
-  border-color: var(--accent);
+  min-width: 0;
 }
 
 /* ── Confirm modals ───────────────────────────────────── */
@@ -1606,11 +1918,38 @@ header {
 
   .token-chip {
     font-size: .75rem;
-    padding: 3px 10px;
+    max-width: 42vw;
+    overflow: hidden;
+    padding: 3px 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .peer-pills {
-    display: none;
+    display: flex;
+    flex: 0 1 auto;
+    max-width: 92px;
+    overflow: hidden;
+  }
+
+  .peer-pill {
+    width: 24px;
+    height: 24px;
+    margin-right: -8px;
+    outline-width: 1px;
+  }
+
+  .peer-pill .lucide {
+    width: 13px;
+    height: 13px;
+  }
+
+  .peer-pills:hover .peer-pill {
+    margin-right: -8px;
+  }
+
+  .peer-pills:hover .peer-pill:last-child {
+    margin-right: 0;
   }
 
   .btn-label {
@@ -1639,7 +1978,16 @@ header {
 
   .app-workspace,
   #app.chat-open .app-workspace {
-    display: block;
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .share-main {
+    flex: 1;
+    min-height: 0;
+    overscroll-behavior: contain;
   }
 
   #app.chat-open {
@@ -1652,12 +2000,19 @@ header {
     top: 0;
     left: 0;
     right: 0;
+    min-width: 0;
+    max-width: none;
     width: 100vw;
     height: var(--chat-viewport-height, 100dvh);
     max-height: var(--chat-viewport-height, 100dvh);
+    resize: none;
     z-index: 1100;
     border-left: 0;
     box-shadow: none;
+  }
+
+  #chat-panel::before {
+    display: none;
   }
 
   @supports not (height: 100dvh) {
@@ -1674,6 +2029,78 @@ header {
 
   .chat-compose {
     padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  #peers-modal {
+    height: 100dvh;
+  }
+
+  #peers-modal .peers-card {
+    height: 100dvh;
+    max-height: 100dvh;
+  }
+
+  .peers-card .token-modal-head {
+    min-height: 52px;
+    padding: 0 12px;
+  }
+
+  #peers-list {
+    column-width: auto;
+    column-gap: 0;
+    padding: 10px;
+  }
+
+  #peers-list .peer-row {
+    display: flex;
+    min-width: 0;
+    margin-bottom: 10px;
+    padding: 10px;
+  }
+
+  .peer-row-main {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .peer-row-main .spacer {
+    display: none;
+  }
+
+  .peer-row-name {
+    flex: 1;
+    white-space: normal;
+  }
+
+  .peer-row-detail {
+    max-width: none;
+    text-align: right;
+    word-break: break-word;
+  }
+
+  .peer-card-list,
+  .peer-transfer-list,
+  .peer-card-empty {
+    padding-left: 0;
+  }
+
+  .peer-card-meta {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .peer-card-detail {
+    text-align: left;
+    white-space: normal;
+  }
+
+  .peer-transfer-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .peer-transfer-title {
+    white-space: normal;
   }
 
   .token-box {
