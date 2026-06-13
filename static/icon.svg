@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ClipShare">
+  <defs>
+    <linearGradient id="bg" x1="96" x2="416" y1="64" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34a853"/>
+      <stop offset="1" stop-color="#1a73e8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0b3d91" flood-opacity=".28"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g filter="url(#shadow)">
+    <path fill="#fff" d="M170 124h172c24 0 43 19 43 43v235c0 24-19 43-43 43H170c-24 0-43-19-43-43V167c0-24 19-43 43-43Z"/>
+    <path fill="#dfe9ff" d="M170 165h172v237H170z"/>
+    <path fill="#1a73e8" d="M210 88h92c18 0 32 14 32 32v35c0 8-7 15-15 15H193c-8 0-15-7-15-15v-35c0-18 14-32 32-32Z"/>
+    <rect width="54" height="32" x="229" y="72" fill="#fff" rx="16"/>
+    <path fill="#34a853" d="M334 276h-78v44h78v46l75-68-75-68v46Z"/>
+    <path fill="#1a73e8" d="M178 236h78v-44h-78v-46l-75 68 75 68v-46Z"/>
+  </g>
+</svg>

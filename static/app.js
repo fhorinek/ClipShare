@@ -43,6 +43,14 @@ function escHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+const URL_RE = /https?:\/\/[^\s<>"']+[^\s<>"'.,:;!?)\]]/g;
+function linkify(text) {
+  const escaped = escHtml(String(text));
+  return escaped.replace(URL_RE, url =>
+    `<a href="${url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${url}</a>`
+  );
+}
+
 function escAttr(str) {
   return String(str || '').replace(/"/g, '&quot;');
 }
@@ -3840,7 +3848,7 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
     if (!item || item.type !== 'text') return;
     item.content = payload.content;
     const el = document.querySelector(`#card-${payload.itemId} .text-content`);
-    if (el && document.activeElement !== el) el.innerText = payload.content;
+    if (el && document.activeElement !== el) el.innerHTML = linkify(payload.content);
 
   } else if (payload.type === 'chunk_ack') {
     handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
@@ -4516,6 +4524,26 @@ function updateOutboundRow(itemId, key, sent, total) {
 }
 
 // ── Text editing ─────────────────────────────────────────────────────
+function onTextFocus(id, el) {
+  const item = items.get(id);
+  if (!item) return;
+  el.innerText = item.content;
+  // move caret to end
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function onTextBlur(id, el) {
+  const item = items.get(id);
+  if (!item) return;
+  el.innerHTML = linkify(item.content);
+  flushTextUpdate(id);
+}
+
 function onTextEdit(id, el) {
   const item = items.get(id);
   if (!item) return;
@@ -4669,7 +4697,8 @@ function buildCard(item) {
     bodyHtml = `<div class="card-text">
   <div class="text-content" contenteditable="true" spellcheck="false"
        oninput="onTextEdit('${item.id}', this)"
-       onblur="flushTextUpdate('${item.id}')">${escHtml(item.content)}</div>
+       onfocus="onTextFocus('${item.id}', this)"
+       onblur="onTextBlur('${item.id}', this)">${linkify(item.content)}</div>
 </div>`;
     footerActions = `<button class="btn-icon" title="Copy" onclick="copyText('${item.id}')"><i data-lucide="copy"></i></button>`;
 

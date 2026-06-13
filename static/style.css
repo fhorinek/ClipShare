@@ -1501,6 +1501,12 @@ header {
   cursor: text;
 }
 
+.text-content a {
+  color: var(--accent, #4f8ef7);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .card-image img,
 .card-video video {
   width: 100%;

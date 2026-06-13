@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ClipShare">
+  <defs>
+    <linearGradient id="bg" x1="72" x2="440" y1="56" y2="456" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34a853"/>
+      <stop offset="1" stop-color="#1a73e8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="216" fill="rgba(255,255,255,.12)"/>
+  <path fill="#fff" d="M171 126h170c23 0 42 19 42 42v232c0 23-19 42-42 42H171c-23 0-42-19-42-42V168c0-23 19-42 42-42Z"/>
+  <path fill="#dfe9ff" d="M170 166h172v235H170z"/>
+  <path fill="#1a73e8" d="M210 90h92c18 0 32 14 32 32v34c0 8-7 15-15 15H193c-8 0-15-7-15-15v-34c0-18 14-32 32-32Z"/>
+  <rect width="54" height="32" x="229" y="74" fill="#fff" rx="16"/>
+  <path fill="#34a853" d="M334 276h-78v44h78v46l75-68-75-68v46Z"/>
+  <path fill="#1a73e8" d="M178 236h78v-44h-78v-46l-75 68 75 68v-46Z"/>
+</svg>
