@@ -1,5 +1,10 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
+import logging
+import os
 import struct
 import time
 import uuid
@@ -14,6 +19,9 @@ app = FastAPI()
 
 STATIC_DIR = Path(__file__).parent / "static"
 BINARY_SEND_TIMEOUT_SECONDS = 15
+PAIRING_REQUEST_MIN_INTERVAL_MS = 5_000
+PAIRING_MAX_UNUSED_PINS = 5
+PAIRING_PIN_TIMEOUT_MS = 60_000
 INDEX_ASSET_PATHS = (
     "/static/icon.svg",
     "/static/icon-maskable.svg",
@@ -21,6 +29,9 @@ INDEX_ASSET_PATHS = (
     "/static/app.js",
 )
 MANIFEST_PATH = "/static/manifest.webmanifest"
+WEBRTC_ICE_SERVERS_ENV = "WEBRTC_ICE_SERVERS_JSON"
+TURN_ENV_PATH = STATIC_DIR.parent / ".turn.env"
+TURN_CREDENTIAL_TTL_SECONDS = 3600
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -31,6 +42,7 @@ app.mount("/vendor", StaticFiles(directory=STATIC_DIR / "vendor"), name="vendor"
 app.mount("/fonts", StaticFiles(directory=STATIC_DIR / "fonts"), name="fonts")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+logger = logging.getLogger("uvicorn.error")
 
 
 class ConnectionManager:
@@ -43,8 +55,12 @@ class ConnectionManager:
         self.manifest: Dict[str, Dict[str, dict]] = {}
         # {token: {clientId: metrics}} volatile client network/device metrics for the active room
         self.client_metrics: Dict[str, Dict[str, dict]] = {}
-        # {token: {clientId: {publicKeyJwk, expiresAt}}} volatile pairing hosts
+        # {token: {clientId: {pairingVersion, pinId, expiresAt, unusedPins, currentPinUsed}}} volatile pairing host
         self.pairing_hosts: Dict[str, Dict[str, dict]] = {}
+        # {token: {clientId: {pinId, unusedPins, currentPinUsed}}} survives host expiry while pairing mode rotates
+        self.pairing_pin_limits: Dict[str, Dict[str, dict]] = {}
+        # {token: {clientId: lastRequestAtMs}} volatile per-client pairing request rate limit
+        self.pairing_request_times: Dict[str, Dict[str, int]] = {}
         # {token: int} monotonically increasing counter so numbers never reuse after a peer leaves
         self.peer_counters: Dict[str, int] = {}
 
@@ -75,15 +91,25 @@ class ConnectionManager:
         if not hosts:
             self.pairing_hosts.pop(token, None)
             return []
-        return [
+        active_hosts = [
             {
                 "clientId": client_id,
-                "publicKeyJwk": host.get("publicKeyJwk"),
+                "peerNumber": self._peer_number(token, client_id),
+                "pairingVersion": host.get("pairingVersion", "speke-v1"),
                 "expiresAt": host.get("expiresAt"),
+                "pairingWindowExpiresAt": host.get("pairingWindowExpiresAt") or host.get("expiresAt"),
+                "unusedPins": int(host.get("unusedPins") or 0),
+                "maxUnusedPins": PAIRING_MAX_UNUSED_PINS,
+                "pinTimeoutMs": PAIRING_PIN_TIMEOUT_MS,
             }
             for client_id, host in hosts.items()
             if client_id != exclude
         ]
+        return active_hosts[:1]
+
+    def _current_pairing_host_id(self, token: str):
+        hosts = self._active_pairing_hosts(token)
+        return hosts[0]["clientId"] if hosts else None
 
     def _sanitize_metrics(self, metrics: dict):
         if not isinstance(metrics, dict):
@@ -210,17 +236,31 @@ class ConnectionManager:
         peers.pop(client_id, None)
         token_metadata = self.metadata.get(token, {})
         token_metrics = self.client_metrics.get(token, {})
+        token_pairing_requests = self.pairing_request_times.get(token, {})
         token_metadata.pop(client_id, None)
-        self.pairing_hosts.get(token, {}).pop(client_id, None)
+        disconnected_pairing_host = self.pairing_hosts.get(token, {}).pop(client_id, None)
+        self.pairing_pin_limits.get(token, {}).pop(client_id, None)
+        if disconnected_pairing_host:
+            logger.info(
+                "pairing host left token=%s clientId=%s peerNumber=%s reason=disconnect",
+                token, client_id, self._peer_number(token, client_id),
+            )
+        token_pairing_requests.pop(client_id, None)
         if not peers:
             self.connections.pop(token, None)
             self.metadata.pop(token, None)
+            self.manifest.pop(token, None)
             self.client_metrics.pop(token, None)
             self.peer_counters.pop(token, None)
             self.pairing_hosts.pop(token, None)
+            self.pairing_pin_limits.pop(token, None)
+            self.pairing_request_times.pop(token, None)
         else:
+            await self._remove_manifest_holder(token, client_id)
             token_metrics.pop(client_id, None)
             await self._broadcast(token, {"type": "peer_left", "clientId": client_id})
+            if disconnected_pairing_host:
+                await self._publish_pairing_hosts(token)
 
     def _sync_sources(self, token: str, exclude: str):
         grouped: Dict[str, list] = {}
@@ -290,6 +330,40 @@ class ConnectionManager:
             "senderId": sender_id,
         })
 
+    async def _remove_manifest_holder(self, token: str, client_id: str):
+        records = self.manifest.get(token)
+        if not records:
+            return
+        now = int(time.time() * 1000)
+        updates = []
+        for item_id, existing in list(records.items()):
+            if existing.get("deleted"):
+                continue
+            holders = set(existing.get("holders") or [existing.get("ownerId")])
+            holders.discard(None)
+            if client_id not in holders and existing.get("ownerId") != client_id:
+                continue
+            holders.discard(client_id)
+            revision = max(now, int(existing.get("revision") or 0) + 1)
+            updated = dict(existing)
+            updated["revision"] = revision
+            updated["updatedAt"] = now
+            if holders:
+                updated["holders"] = sorted(holders)
+                if updated.get("ownerId") == client_id:
+                    updated["ownerId"] = updated["holders"][0]
+            else:
+                updated["holders"] = []
+                updated["deleted"] = True
+            records[item_id] = updated
+            updates.append(updated)
+        for record in updates:
+            await self._broadcast(token, {
+                "type": "manifest_updated",
+                "record": record,
+                "senderId": client_id,
+            })
+
     async def _publish_pairing_hosts(self, token: str):
         await self._broadcast(token, {
             "type": "pairing_hosts",
@@ -297,28 +371,106 @@ class ConnectionManager:
         })
 
     async def _store_pairing_host(self, token: str, sender_id: str, msg: dict):
-        public_key = msg.get("publicKeyJwk")
-        if not isinstance(public_key, dict):
+        if msg.get("pairingVersion") != "speke-v1":
+            return
+        pin_id = msg.get("pinId")
+        if not pin_id:
             return
         now = int(time.time() * 1000)
+        current_host_id = self._current_pairing_host_id(token)
+        if current_host_id and current_host_id != sender_id:
+            sender_ws = self._channel_ws(token, sender_id, "control")
+            if sender_ws:
+                await self._send(sender_ws, {
+                    "type": "pairing_rejected",
+                    "reason": "active_pairing_host",
+                    "activeHostId": current_host_id,
+                    "activeHostPeerNumber": self._peer_number(token, current_host_id),
+                    "retryAfterMs": max(0, int(self.pairing_hosts[token][current_host_id].get("expiresAt") or now) - now),
+                    "pairingWindowRetryAfterMs": max(0, int(self.pairing_hosts[token][current_host_id].get("pairingWindowExpiresAt") or now) - now),
+                })
+            return
+        token_limits = self.pairing_pin_limits.setdefault(token, {})
+        limit_state = token_limits.get(sender_id, {})
+        unused_pins = int(limit_state.get("unusedPins") or 0)
+        current_pin_used = bool(limit_state.get("currentPinUsed"))
+        old_pin_id = limit_state.get("pinId")
+        window_expires_at = int(limit_state.get("pairingWindowExpiresAt") or (now + PAIRING_MAX_UNUSED_PINS * PAIRING_PIN_TIMEOUT_MS))
+        if old_pin_id and old_pin_id != pin_id and current_pin_used:
+            unused_pins = 0
+            window_expires_at = now + PAIRING_MAX_UNUSED_PINS * PAIRING_PIN_TIMEOUT_MS
+        if old_pin_id and old_pin_id != pin_id and not current_pin_used:
+            unused_pins += 1
+            window_expires_at = min(window_expires_at, now + max(1, PAIRING_MAX_UNUSED_PINS - unused_pins) * PAIRING_PIN_TIMEOUT_MS)
+            if unused_pins >= PAIRING_MAX_UNUSED_PINS:
+                self.pairing_hosts.pop(token, None)
+                token_limits.pop(sender_id, None)
+                sender_ws = self._channel_ws(token, sender_id, "control")
+                if sender_ws:
+                    await self._send(sender_ws, {
+                        "type": "pairing_host_removed",
+                        "reason": "unused_pin_limit",
+                        "maxUnusedPins": PAIRING_MAX_UNUSED_PINS,
+                    })
+                logger.info(
+                    "pairing host removed after unused PIN limit token=%s clientId=%s peerNumber=%s unusedPins=%s",
+                    token, sender_id, self._peer_number(token, sender_id), unused_pins,
+                )
+                await self._publish_pairing_hosts(token)
+                return
+        token_limits[sender_id] = {
+            "pinId": str(pin_id),
+            "unusedPins": unused_pins,
+            "currentPinUsed": current_pin_used if old_pin_id == pin_id else False,
+            "pairingWindowExpiresAt": window_expires_at,
+        }
+        existing = self.pairing_hosts.get(token, {}).get(sender_id)
+        is_new_host = not old_pin_id
         expires_at = msg.get("expiresAt")
         if not isinstance(expires_at, (int, float)):
-            expires_at = now + 60_000
-        expires_at = int(min(max(expires_at, now + 1000), now + 70_000))
-        self.pairing_hosts.setdefault(token, {})[sender_id] = {
-            "publicKeyJwk": public_key,
-            "expiresAt": expires_at,
+            expires_at = now + PAIRING_PIN_TIMEOUT_MS
+        expires_at = int(min(max(expires_at, now + 1000), now + PAIRING_PIN_TIMEOUT_MS + 10_000))
+        if is_new_host:
+            logger.info(
+                "pairing host registered token=%s clientId=%s peerNumber=%s expiresAt=%s",
+                token, sender_id, self._peer_number(token, sender_id), expires_at,
+            )
+        self.pairing_hosts[token] = {
+            sender_id: {
+                "pairingVersion": "speke-v1",
+                "pinId": str(pin_id),
+                "expiresAt": expires_at,
+                "pairingWindowExpiresAt": max(window_expires_at, expires_at),
+                "unusedPins": unused_pins,
+            }
         }
         await self._publish_pairing_hosts(token)
 
     async def _stop_pairing_host(self, token: str, sender_id: str):
         hosts = self.pairing_hosts.get(token)
         if not hosts:
+            self.pairing_pin_limits.get(token, {}).pop(sender_id, None)
             return
-        hosts.pop(sender_id, None)
+        stopped_host = hosts.pop(sender_id, None)
+        self.pairing_pin_limits.get(token, {}).pop(sender_id, None)
+        if stopped_host:
+            logger.info(
+                "pairing host left token=%s clientId=%s peerNumber=%s reason=stop",
+                token, sender_id, self._peer_number(token, sender_id),
+            )
         if not hosts:
             self.pairing_hosts.pop(token, None)
         await self._publish_pairing_hosts(token)
+
+    def _pairing_request_retry_after_ms(self, token: str, sender_id: str):
+        now = int(time.time() * 1000)
+        token_limits = self.pairing_request_times.setdefault(token, {})
+        last_request_at = int(token_limits.get(sender_id) or 0)
+        retry_after = PAIRING_REQUEST_MIN_INTERVAL_MS - (now - last_request_at)
+        if retry_after > 0:
+            return retry_after
+        token_limits[sender_id] = now
+        return 0
 
     def _item_metadata(self, item: dict, encrypted: bool = False):
         if not isinstance(item, dict):
@@ -424,23 +576,32 @@ class ConnectionManager:
 
         if msg.get("type") == "pairing_request":
             request_id = msg.get("requestId")
-            encrypted_pin = msg.get("encryptedPin")
-            requester_public_key = msg.get("requesterPublicKeyJwk")
+            pake_start = msg.get("pakeStart")
             target_ids = msg.get("hostIds")
+            if not request_id or not isinstance(pake_start, dict):
+                return
             active_hosts = self._active_pairing_hosts(token, sender_id)
             allowed_hosts = {host["clientId"] for host in active_hosts}
             if isinstance(target_ids, list) and target_ids:
                 host_ids = [str(host_id) for host_id in target_ids if str(host_id) in allowed_hosts]
             else:
                 host_ids = list(allowed_hosts)
-            if not request_id or not isinstance(encrypted_pin, dict) or not isinstance(requester_public_key, dict):
+            if not host_ids:
+                return
+            retry_after_ms = self._pairing_request_retry_after_ms(token, sender_id)
+            if retry_after_ms > 0:
+                sender_ws = self._channel_ws(token, sender_id, channel)
+                if sender_ws:
+                    await self._send(sender_ws, {
+                        "type": "pairing_rate_limited",
+                        "retryAfterMs": retry_after_ms,
+                    })
                 return
             forwarded = {
                 "type": "pairing_request",
                 "senderId": sender_id,
                 "requestId": request_id,
-                "encryptedPin": encrypted_pin,
-                "requesterPublicKeyJwk": requester_public_key,
+                "pakeStart": pake_start,
             }
             await asyncio.gather(*[
                 self._send(peer_ws, forwarded)
@@ -453,15 +614,48 @@ class ConnectionManager:
             target_id = msg.get("targetId")
             request_id = msg.get("requestId")
             encrypted_passphrase = msg.get("encryptedPassphrase")
+            pake_finish = msg.get("pakeFinish")
             if not target_id or not request_id or not isinstance(encrypted_passphrase, dict):
                 return
             peer_ws = self._channel_ws(token, str(target_id), channel)
             if peer_ws:
-                await self._send(peer_ws, {
+                forwarded = {
                     "type": "pairing_response",
                     "senderId": sender_id,
                     "requestId": request_id,
                     "encryptedPassphrase": encrypted_passphrase,
+                }
+                if isinstance(pake_finish, dict):
+                    forwarded["pakeFinish"] = pake_finish
+                await self._send(peer_ws, forwarded)
+            return
+
+        if msg.get("type") == "pairing_confirm":
+            target_id = msg.get("targetId")
+            request_id = msg.get("requestId")
+            if not target_id or not request_id:
+                return
+            host_record = self.pairing_hosts.get(token, {}).get(str(target_id))
+            limit_state = self.pairing_pin_limits.get(token, {}).get(str(target_id))
+            if host_record is not None:
+                if limit_state is not None:
+                    limit_state["currentPinUsed"] = True
+                    limit_state["unusedPins"] = 0
+                logger.info(
+                    "new device paired token=%s hostClientId=%s hostPeerNumber=%s joinedClientId=%s joinedPeerNumber=%s requestId=%s",
+                    token,
+                    str(target_id),
+                    self._peer_number(token, str(target_id)),
+                    sender_id,
+                    self._peer_number(token, sender_id),
+                    request_id,
+                )
+            peer_ws = self._channel_ws(token, str(target_id), channel)
+            if peer_ws:
+                await self._send(peer_ws, {
+                    "type": "pairing_confirm",
+                    "senderId": sender_id,
+                    "requestId": request_id,
                 })
             return
 
@@ -571,6 +765,66 @@ def render_index() -> HTMLResponse:
     return HTMLResponse(html, headers=NO_CACHE_HEADERS)
 
 
+def _turn_env() -> dict:
+    try:
+        lines = TURN_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    values = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def _turn_ice_servers_from_env_file() -> list:
+    values = _turn_env()
+    host = values.get("TURN_HOST")
+    port = values.get("TURN_PORT") or "3478"
+    if not host:
+        return []
+    secret = values.get("TURN_AUTH_SECRET")
+    if secret:
+        username = str(int(time.time()) + TURN_CREDENTIAL_TTL_SECONDS)
+        digest = hmac.new(secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1).digest()
+        credential = base64.b64encode(digest).decode("ascii")
+    else:
+        username = values.get("TURN_USERNAME")
+        credential = values.get("TURN_PASSWORD")
+        if not username or not credential:
+            return []
+    return [
+        {"urls": [f"stun:{host}:{port}"]},
+        {
+            "urls": [
+                f"turn:{host}:{port}?transport=udp",
+                f"turn:{host}:{port}?transport=tcp",
+            ],
+            "username": username,
+            "credential": credential,
+        },
+    ]
+
+
+def webrtc_config_payload() -> dict:
+    raw = os.environ.get(WEBRTC_ICE_SERVERS_ENV, "").strip()
+    if not raw:
+        return {"iceServers": _turn_ice_servers_from_env_file()}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("%s is not valid JSON; serving empty WebRTC ICE config", WEBRTC_ICE_SERVERS_ENV)
+        return {"iceServers": []}
+    ice_servers = parsed.get("iceServers") if isinstance(parsed, dict) else parsed
+    if not isinstance(ice_servers, list):
+        logger.warning("%s must be a JSON array or object with iceServers array", WEBRTC_ICE_SERVERS_ENV)
+        return {"iceServers": []}
+    return {"iceServers": ice_servers}
+
+
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = json.loads((STATIC_DIR / "manifest.webmanifest").read_text(encoding="utf-8"))
@@ -588,6 +842,24 @@ async def manifest():
 @app.get("/")
 async def index():
     return render_index()
+
+
+@app.get("/webrtc-config")
+async def webrtc_config():
+    return Response(
+        json.dumps(webrtc_config_payload(), separators=(",", ":")),
+        media_type="application/json",
+        headers=NO_CACHE_HEADERS,
+    )
+
+
+@app.get("/pairing-hosts/{token_path:path}")
+async def pairing_hosts(token_path: str):
+    return Response(
+        json.dumps({"hosts": manager._active_pairing_hosts(token_path)}, separators=(",", ":")),
+        media_type="application/json",
+        headers=NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/{token_path:path}")

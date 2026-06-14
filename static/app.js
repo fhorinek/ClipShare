@@ -1,4 +1,6 @@
 // ── Utilities ────────────────────────────────────────────────────────
+const CLIENT_DIAGNOSTIC_BUILD = 'webrtc-existing-fix-v4';
+
 function randomUUID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c =>
@@ -47,12 +49,21 @@ const URL_RE = /https?:\/\/[^\s<>"']+[^\s<>"'.,:;!?)\]]/g;
 function linkify(text) {
   const escaped = escHtml(String(text));
   return escaped.replace(URL_RE, url =>
-    `<a href="${url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${url}</a>`
+    `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
   );
 }
 
 function escAttr(str) {
-  return String(str || '').replace(/"/g, '&quot;');
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function cardElement(itemId) {
+  return document.getElementById('card-' + itemId);
 }
 
 const ESTIMATED_MIME_BY_EXTENSION = {
@@ -466,7 +477,8 @@ const PASSKEY_LENGTH = 64;
 const PASSKEY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const PAIRING_PIN_LENGTH = 8;
 const PAIRING_PIN_TTL_MS = 60000;
-const PAIRING_JOIN_TIMEOUT_MS = 3000;
+const PAIRING_JOIN_TIMEOUT_MS = 8000;
+const PAIRING_MAX_UNUSED_PINS = 5;
 const TOKEN_ADJECTIVES = [
   'able', 'active', 'blue', 'bold', 'brave', 'bright', 'calm', 'clean',
   'clear', 'clever', 'cool', 'deep', 'dry', 'early', 'easy', 'fair',
@@ -565,6 +577,11 @@ function generatePairingPin() {
     }
   }
   return digits.join('');
+}
+
+function formatPairingPinInput(value) {
+  const digits = String(value || '').replace(/\D/g, '').slice(0, PAIRING_PIN_LENGTH);
+  return digits.length > 4 ? `${digits.slice(0, 4)} ${digits.slice(4)}` : digits;
 }
 
 function isGeneratedPasskey(value) {
@@ -719,7 +736,15 @@ function updatePeerCount() {
   for (const [peerId, peer] of connectedPeers) {
     const id = imap.get(peerId);
     const compatibility = peerCompatibilityLabel(peer);
-    html += `<div class="peer-pill${peer.compatibility === 'incompatible' ? ' peer-pill-incompatible' : ''}" style="background:${id.bg}" title="${escHtml([id.fullName, compatibility].filter(Boolean).join(' - '))}"><i data-lucide="${id.animalIcon}" style="color:${id.iconColor}"></i></div>`;
+    const rtcState = webRtcPeerState(peerId);
+    const classes = [
+      'peer-pill',
+      peer.compatibility === 'incompatible' ? 'peer-pill-incompatible' : '',
+      rtcState === 'connected' ? 'peer-pill-webrtc-connected' : '',
+      rtcState === 'connecting' ? 'peer-pill-webrtc-connecting' : '',
+      rtcState === 'failed' ? 'peer-pill-webrtc-failed' : '',
+    ].filter(Boolean).join(' ');
+    html += `<div class="${escAttr(classes)}" style="background:${id.bg}" title="${escHtml([id.fullName, compatibility, webRtcStateLabel(peerId)].filter(Boolean).join(' - '))}"><i data-lucide="${id.animalIcon}" style="color:${id.iconColor}"></i></div>`;
   }
   container.innerHTML = html;
   container.title = `${clientCount} connected user${clientCount === 1 ? '' : 's'}`;
@@ -745,6 +770,200 @@ async function copyShareUrl() {
     showToast('URL copied!');
   } catch {
     showToast(url);
+  }
+}
+
+function redactedIceConfig(config) {
+  return {
+    iceServers: (config?.iceServers || []).map(server => ({
+      urls: server.urls || [],
+      username: server.username ? String(server.username) : '',
+      credentialPresent: !!server.credential,
+    })),
+  };
+}
+
+function itemDiagnosticMeta(item) {
+  if (!item) return null;
+  return {
+    id: item.id,
+    type: item.type,
+    filename: item.filename || '',
+    mimeType: item.mimeType || '',
+    size: item.size || 0,
+    addedAt: item.addedAt || 0,
+    encrypted: !!item.encrypted,
+    hasRawBuffer: !!item.rawBuffer,
+    hasDataUrl: !!item.dataUrl,
+    hasThumbnail: !!item.thumbnailDataUrl,
+    receivedEncryptedChunks: item.receivedEncryptedChunks || 0,
+    totalEncryptedChunks: item.totalEncryptedChunks || 0,
+  };
+}
+
+function mapObject(map, valueMapper = value => value) {
+  return Object.fromEntries([...map.entries()].map(([key, value]) => [key, valueMapper(value, key)]));
+}
+
+function setArray(set) {
+  return [...(set || [])];
+}
+
+function webRtcDiagnosticRecord(record) {
+  if (!record) return null;
+  return {
+    state: record.state || '',
+    error: record.error || '',
+    startBlockedReason: record.startBlockedReason || '',
+    startAttempts: record.startAttempts || 0,
+    lastStartAttemptAt: record.lastStartAttemptAt || null,
+    initiator: !!record.initiator,
+    createdAt: record.createdAt || null,
+    updatedAt: record.updatedAt || null,
+    connectionState: record.connectionState || record.pc?.connectionState || '',
+    iceConnectionState: record.iceConnectionState || record.pc?.iceConnectionState || '',
+    iceGatheringState: record.iceGatheringState || record.pc?.iceGatheringState || '',
+    signalingState: record.signalingState || record.pc?.signalingState || '',
+    channelState: record.channelState || record.channel?.readyState || '',
+    pendingCandidates: record.pendingCandidates?.length || 0,
+    iceCandidatesSent: record.iceCandidatesSent || 0,
+    iceCandidatesReceived: record.iceCandidatesReceived || 0,
+    localDescriptionType: record.localDescriptionType || '',
+    remoteDescriptionType: record.remoteDescriptionType || '',
+    lastSignalSentAt: record.lastSignalSentAt || null,
+    lastSignalSentType: record.lastSignalSentType || '',
+    lastSignalReceivedAt: record.lastSignalReceivedAt || null,
+    lastSignalReceivedType: record.lastSignalReceivedType || '',
+  };
+}
+
+function transferDiagnosticRecord(transfer) {
+  return {
+    received: transfer.received || 0,
+    totalChunks: transfer.totalChunks || 0,
+    senderId: transfer.senderId || '',
+    currentChunk: transfer.currentChunk || 0,
+    startTime: transfer.startTime || null,
+    chunkSources: [...(transfer.chunkSources || [])],
+  };
+}
+
+function outboundDiagnosticRecord(progress) {
+  return {
+    sent: progress.sent || 0,
+    total: progress.total || 0,
+    currentChunk: progress.currentChunk || 0,
+    startTime: progress.startTime || null,
+    initialDone: !!progress.initialDone,
+    retryAttempts: progress.retryAttempts || 0,
+    ackedChunks: setArray(progress.ackedChunks),
+  };
+}
+
+async function buildDiagnosticSnapshot() {
+  const config = await loadWebRtcConfig();
+  await startWebRtcForCompatiblePeers();
+  await sleep(150);
+  const imap = buildPeerIdentityMap();
+  return {
+    kind: 'clipshare-diagnostic-v1',
+    exportedAt: new Date().toISOString(),
+    app: {
+      clientDiagnosticBuild: CLIENT_DIAGNOSTIC_BUILD,
+      token,
+      clientId,
+      peerName: imap.get(clientId)?.fullName || '',
+      clientCount,
+      encryptionEnabled,
+      hasEncryptionKey: !!encryptionKey,
+      wsState: wsStateLabel(ws),
+      dataWsState: wsStateLabel(dataWs),
+      webRtcSupported: isWebRtcSupported(),
+      webRtcConfig: redactedIceConfig(config),
+      selfPeerInfo,
+      selfClientMetrics,
+      pairingActive: pairingIsActive(),
+      pairingHosts: [...pairingHosts.values()],
+    },
+    browser: {
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      platform: navigator.platform,
+      online: navigator.onLine,
+      visibilityState: document.visibilityState,
+      locationProtocol: location.protocol,
+      locationHost: location.host,
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+      },
+    },
+    peers: [...connectedPeers.entries()].map(([peerId, peer]) => ({
+      clientId: peerId,
+      name: imap.get(peerId)?.fullName || '',
+      label: peer.label || '',
+      ip: peer.ip || '',
+      compatibility: peer.compatibility || '',
+      compatibilityDetail: peerCompatibilityDetail(peer),
+      metrics: peer.metrics || {},
+      webRtcStatus: webRtcStateLabel(peerId),
+      webRtcStartEligible: !webRtcStartBlockReason(peerId),
+      webRtcStartBlockReason: webRtcStartBlockReason(peerId),
+      webRtcUnavailableReason: webRtcPeerState(peerId) === 'unavailable' ? webRtcUnavailableReason(peerId) : '',
+      webRtc: webRtcDiagnosticRecord(webRtcPeers.get(peerId)),
+      cards: [...(peerCardMetadata.get(peerId) || new Map()).values()].map(itemDiagnosticMeta),
+    })),
+    items: [...items.values()].map(itemDiagnosticMeta),
+    roomManifest: [...roomManifest.values()].map(record => ({
+      ownerId: record.ownerId || '',
+      holders: record.holders || [],
+      revision: record.revision || 0,
+      meta: itemDiagnosticMeta(record.meta),
+    })),
+    manifestRevisions: mapObject(manifestRevisions),
+    transfers: {
+      incoming: mapObject(binaryTransfers, transferDiagnosticRecord),
+      outbound: mapObject(outboundTransfers, peerMap => mapObject(peerMap, outboundDiagnosticRecord)),
+      remoteStatuses: [...remoteTransferStatuses.values()],
+      pendingDownloadSourceIds: mapObject(pendingDownloadSourceIds),
+      pendingDownloadTriedSources: mapObject(pendingDownloadTriedSources, setArray),
+      pendingChunkRequestBatches: mapObject(pendingChunkRequestBatches, batch => ({
+        sourceClientId: batch.sourceClientId,
+        chunks: setArray(batch.chunks),
+      })),
+    },
+    chat: {
+      messageCount: chatMessages.length,
+      unreadChatCount,
+      panelOpen: chatPanelOpen,
+      replyTargetId: chatReplyTargetId,
+    },
+  };
+}
+
+async function exportDiagnostics() {
+  try {
+    const snapshot = await buildDiagnosticSnapshot();
+    const text = JSON.stringify(snapshot, null, 2);
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch { }
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `clipshare-diagnostics-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(copied ? 'Diagnostics copied and downloaded' : 'Diagnostics downloaded');
+  } catch (err) {
+    console.error('diagnostic-export-failed', err);
+    showToast('Could not export diagnostics');
   }
 }
 
@@ -780,6 +999,8 @@ const MAX_TRANSFER_CHUNKS = Math.ceil((128 * 1024 * 1024) / BINARY_CHUNK_SIZE) +
 const DOWNLOAD_SOURCE_RETRY_DELAY_MS = 2000;
 const METRICS_PING_INTERVAL_MS = 10000;
 const KEY_PROOF_TIMEOUT_MS = 3500;
+const WEBRTC_ICE_CONFIG_FALLBACK = { iceServers: [] };
+const WEBRTC_HEARTBEAT_INTERVAL_MS = 15000;
 let clientCount = 0;
 let draggingInternal = false;
 let tokenQr = null;
@@ -789,19 +1010,24 @@ let lastForegroundCheckAt = 0;
 let startPairingCreated = false;
 let modalPairingActive = false;
 let pairingPin = '';
+let pairingPinId = '';
 let pairingPinExpiresAt = 0;
-let pairingKeyPair = null;
+let pairingUnusedPinCount = 0;
+let pairingCurrentPinUsed = false;
 let pairingRotateTimer = null;
 let pairingUiTimer = null;
 let pairingHostWs = null;
 let pairingJoinWs = null;
-let pairingJoinKeyPair = null;
+let pairingJoinPakeSecret = null;
+let pairingJoinPakeStart = null;
 let pairingJoinRequestId = null;
 let pairingJoinTimer = null;
 let pairingJoinToken = '';
+const pairingHostPendingRequests = new Map();
 const pairingHosts = new Map();
 let metricsPingTimer = null;
 let peersModalRefreshTimer = null;
+let openPeerDetailId = null;
 let pendingInitialSyncSources = null;
 const selfClientMetrics = {
   deviceType: detectDeviceType(),
@@ -881,6 +1107,21 @@ function buildPeerIdentityMap() {
   }
   return map;
 }
+
+function identityForPeerNumber(peerNumber) {
+  const slot = Math.max(0, (Number(peerNumber) || 1) - 1);
+  const color = PEER_COLORS[slot % PEER_COLORS.length];
+  const animal = PEER_ANIMALS[slot % PEER_ANIMALS.length];
+  return { bg: color.bg, iconColor: color.icon, animalIcon: animal.icon, fullName: `${color.name} ${animal.name}` };
+}
+
+function peerDisplayName(peerId, peerNumber = null) {
+  const current = buildPeerIdentityMap().get(peerId);
+  if (current?.fullName) return current.fullName;
+  if (peerNumber) return identityForPeerNumber(peerNumber).fullName;
+  return fallbackPeerIdentity(peerId).fullName;
+}
+
 function peerPillHtml(identity, extraClass = '', title = '') {
   const hint = title || identity.fullName || '';
   return `<div class="peer-pill${extraClass ? ' ' + extraClass : ''}" style="background:${identity.bg}"${hint ? ` title="${escAttr(hint)}"` : ''}><i data-lucide="${identity.animalIcon}" style="color:${identity.iconColor}"></i></div>`;
@@ -888,6 +1129,14 @@ function peerPillHtml(identity, extraClass = '', title = '') {
 
 function peerCompatibilityLabel(peer) {
   if (!peer || peer.compatibility === 'compatible') return '';
+  if (peer.compatibility === 'incompatible') return 'Incompatible key';
+  return 'Checking key';
+}
+
+function peerCompatibilityDetail(peer, isSelf = false) {
+  if (isSelf) return 'This device';
+  if (!peer) return 'Unknown';
+  if (peer.compatibility === 'compatible') return 'Compatible key';
   if (peer.compatibility === 'incompatible') return 'Incompatible key';
   return 'Checking key';
 }
@@ -1508,6 +1757,10 @@ const peerCardMetadata = new Map(); // peerId -> Map<itemId, metadata>
 const roomManifest = new Map(); // itemId -> {ownerId, revision, meta}
 const manifestRevisions = new Map();
 const peerCompatibilityTimers = new Map();
+const webRtcPeers = new Map(); // peerId -> {pc, channel, state, initiator, heartbeatTimer, pendingCandidates}
+const webRtcStartTimers = new Map();
+let webRtcConfig = null;
+let webRtcConfigPromise = null;
 let selfPeerInfo = { label: '1', ip: '' };
 let peerCounter = 0;
 const outboundTransfers = new Map(); // itemId -> Map<trackKey, {sent,total,startTime}>
@@ -1521,6 +1774,424 @@ const pendingChunkRequestBatches = new Map();
 const downloadLogSources = new Map();
 let sendWakeLock = null;
 let sendWakeLockRequest = null;
+
+function isWebRtcSupported() {
+  return typeof RTCPeerConnection === 'function';
+}
+
+function sanitizeIceServers(iceServers) {
+  if (!Array.isArray(iceServers)) return [];
+  return iceServers
+    .filter(server => server && (typeof server.urls === 'string' || Array.isArray(server.urls)))
+    .map(server => ({
+      urls: server.urls,
+      ...(typeof server.username === 'string' ? { username: server.username } : {}),
+      ...(typeof server.credential === 'string' ? { credential: server.credential } : {}),
+    }));
+}
+
+async function loadWebRtcConfig() {
+  if (webRtcConfig) return webRtcConfig;
+  if (webRtcConfigPromise) return webRtcConfigPromise;
+  webRtcConfigPromise = fetch('/webrtc-config', { cache: 'no-store' })
+    .then(response => response.ok ? response.json() : WEBRTC_ICE_CONFIG_FALLBACK)
+    .then(config => {
+      webRtcConfig = { iceServers: sanitizeIceServers(config?.iceServers) };
+      return webRtcConfig;
+    })
+    .catch(() => {
+      webRtcConfig = WEBRTC_ICE_CONFIG_FALLBACK;
+      return webRtcConfig;
+    })
+    .finally(() => { webRtcConfigPromise = null; });
+  return webRtcConfigPromise;
+}
+
+function webRtcStartBlockReason(peerId) {
+  if (!peerId) return 'Peer id is missing';
+  if (peerId === clientId) return 'This device has no WebRTC peer connection to itself';
+  if (!isWebRtcSupported()) return 'RTCPeerConnection is not available in this browser';
+  if (!encryptionKey) return 'Room passphrase key is not available';
+  const peer = connectedPeers.get(peerId);
+  if (!peer) return 'Peer is not connected through the relay';
+  if (peer.compatibility !== 'compatible') return `Waiting for compatible key proof (${peer.compatibility || 'unknown'})`;
+  return '';
+}
+
+function webRtcPeerState(peerId) {
+  if (peerId === clientId) return 'self';
+  if (!isWebRtcSupported()) return 'unavailable';
+  const record = webRtcPeers.get(peerId);
+  if (record?.state) return record.state;
+  const peer = connectedPeers.get(peerId);
+  if (peer?.compatibility === 'compatible') {
+    scheduleWebRtcStart(peerId);
+    return 'starting';
+  }
+  return 'unavailable';
+}
+
+function webRtcUnavailableReason(peerId) {
+  const startBlockReason = webRtcStartBlockReason(peerId);
+  if (startBlockReason) return startBlockReason;
+  if (!webRtcPeers.has(peerId)) return 'Peer connection is starting';
+  return '';
+}
+
+function webRtcStateLabel(peerId) {
+  const state = webRtcPeerState(peerId);
+  if (state === 'self') return 'This device';
+  if (state === 'connected') return 'WebRTC connected';
+  if (state === 'starting') return 'WebRTC starting';
+  if (state === 'connecting') return 'WebRTC connecting';
+  if (state === 'failed') return 'WebRTC failed';
+  return 'WebRTC unavailable';
+}
+
+function refreshWebRtcUi() {
+  updatePeerCount();
+  schedulePeersModalRefresh();
+}
+
+function setWebRtcPeerState(peerId, state) {
+  const record = webRtcPeers.get(peerId);
+  if (record) {
+    record.state = state;
+    record.updatedAt = Date.now();
+    record.connectionState = record.pc?.connectionState || '';
+    record.iceConnectionState = record.pc?.iceConnectionState || '';
+    record.iceGatheringState = record.pc?.iceGatheringState || '';
+    record.signalingState = record.pc?.signalingState || '';
+    record.channelState = record.channel?.readyState || '';
+  }
+  const peer = connectedPeers.get(peerId);
+  if (peer) peer.webrtcState = state;
+  refreshWebRtcUi();
+}
+
+function setWebRtcStartFailed(peerId, error) {
+  const message = error?.message || String(error || 'WebRTC start failed');
+  let record = webRtcPeers.get(peerId);
+  if (!record) {
+    record = {
+      pc: null,
+      channel: null,
+      state: 'failed',
+      initiator: clientId < peerId,
+      heartbeatTimer: null,
+      pendingCandidates: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      iceCandidatesSent: 0,
+      iceCandidatesReceived: 0,
+      lastSignalSentAt: null,
+      lastSignalSentType: '',
+      lastSignalReceivedAt: null,
+      lastSignalReceivedType: '',
+      connectionState: '',
+      iceConnectionState: '',
+      iceGatheringState: '',
+      signalingState: '',
+      channelState: '',
+      error: message,
+      startBlockedReason: message,
+      startAttempts: 1,
+      lastStartAttemptAt: Date.now(),
+    };
+    webRtcPeers.set(peerId, record);
+  } else {
+    record.state = 'failed';
+    record.error = message;
+    record.startBlockedReason = message;
+    record.startAttempts = (record.startAttempts || 0) + 1;
+    record.lastStartAttemptAt = Date.now();
+    record.updatedAt = Date.now();
+  }
+  const peer = connectedPeers.get(peerId);
+  if (peer) peer.webrtcState = 'failed';
+  refreshWebRtcUi();
+}
+
+function scheduleWebRtcStart(peerId) {
+  if (!peerId || peerId === clientId || webRtcPeers.has(peerId) || webRtcStartTimers.has(peerId)) return;
+  if (webRtcStartBlockReason(peerId)) return;
+  const timer = setTimeout(() => {
+    webRtcStartTimers.delete(peerId);
+    ensureWebRtcPeer(peerId)
+      .then(record => {
+        if (!record) setWebRtcStartFailed(peerId, new Error(webRtcStartBlockReason(peerId) || 'WebRTC peer creation returned no record'));
+      })
+      .catch(error => setWebRtcStartFailed(peerId, error));
+  }, 0);
+  webRtcStartTimers.set(peerId, timer);
+}
+
+function closeWebRtcPeer(peerId, state = 'unavailable') {
+  const timer = webRtcStartTimers.get(peerId);
+  if (timer) {
+    clearTimeout(timer);
+    webRtcStartTimers.delete(peerId);
+  }
+  const record = webRtcPeers.get(peerId);
+  if (record) {
+    if (record.heartbeatTimer) clearInterval(record.heartbeatTimer);
+    try { record.channel?.close(); } catch { }
+    try { record.pc?.close(); } catch { }
+    webRtcPeers.delete(peerId);
+  }
+  const peer = connectedPeers.get(peerId);
+  if (peer) peer.webrtcState = state;
+  refreshWebRtcUi();
+}
+
+function closeAllWebRtcPeers() {
+  for (const peerId of [...webRtcPeers.keys()]) closeWebRtcPeer(peerId);
+  for (const timer of webRtcStartTimers.values()) clearTimeout(timer);
+  webRtcStartTimers.clear();
+  webRtcConfigPromise = null;
+}
+
+function sendWebRtcSignal(peerId, payload) {
+  if (!peerId || !payload?.type) return false;
+  const record = webRtcPeers.get(peerId);
+  if (record) {
+    record.lastSignalSentAt = Date.now();
+    record.lastSignalSentType = payload.type;
+    if (payload.type === 'webrtc_ice') record.iceCandidatesSent = (record.iceCandidatesSent || 0) + 1;
+  }
+  return wsSend({ type: 'relay', targetId: peerId, payload }, null, true);
+}
+
+function sendWebRtcChannelJson(peerId, payload) {
+  const channel = webRtcPeers.get(peerId)?.channel;
+  if (!channel || channel.readyState !== 'open') return false;
+  try {
+    channel.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function webRtcChannelOpen(peerId) {
+  return webRtcPeers.get(peerId)?.channel?.readyState === 'open';
+}
+
+async function drainWebRtcChannel(peerId) {
+  const channel = webRtcPeers.get(peerId)?.channel;
+  if (!channel || channel.readyState !== 'open') return false;
+  const highWater = BINARY_CHUNK_SIZE * 2;
+  const start = Date.now();
+  while (channel.readyState === 'open' && channel.bufferedAmount > highWater) {
+    await sleep(8);
+    if (Date.now() - start > 10000) break;
+  }
+  return channel.readyState === 'open';
+}
+
+async function sendWebRtcBinaryFrame(peerId, frame) {
+  const channel = webRtcPeers.get(peerId)?.channel;
+  if (!channel || channel.readyState !== 'open') return false;
+  if (!await drainWebRtcChannel(peerId)) return false;
+  try {
+    channel.send(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
+    return true;
+  } catch (error) {
+    debugLog('webrtc-binary-send-failed', { peerId, error: error?.message || String(error) });
+    return false;
+  }
+}
+
+function handleWebRtcChannelMessage(peerId, event) {
+  if (event.data instanceof ArrayBuffer) {
+    handleBinaryMessage(event.data, 'webrtc');
+    return;
+  }
+  if (event.data instanceof Blob) {
+    event.data.arrayBuffer().then(buffer => handleBinaryMessage(buffer, 'webrtc')).catch(() => {});
+    return;
+  }
+  let msg = null;
+  try {
+    msg = JSON.parse(String(event.data || ''));
+  } catch {
+    return;
+  }
+  if (msg?.type === 'webrtc_ping') {
+    sendWebRtcChannelJson(peerId, { type: 'webrtc_pong', sentAt: msg.sentAt, receivedAt: Date.now() });
+  } else if (msg?.type === 'webrtc_pong') {
+    const peer = connectedPeers.get(peerId);
+    if (peer) peer.webrtcLastPongAt = Date.now();
+  }
+}
+
+function attachWebRtcChannel(peerId, channel) {
+  const record = webRtcPeers.get(peerId);
+  if (!record || !channel) return;
+  record.channel = channel;
+  channel.binaryType = 'arraybuffer';
+  channel.onopen = () => {
+    setWebRtcPeerState(peerId, 'connected');
+    sendWebRtcChannelJson(peerId, { type: 'webrtc_ping', sentAt: Date.now() });
+    if (record.heartbeatTimer) clearInterval(record.heartbeatTimer);
+    record.heartbeatTimer = setInterval(() => {
+      sendWebRtcChannelJson(peerId, { type: 'webrtc_ping', sentAt: Date.now() });
+    }, WEBRTC_HEARTBEAT_INTERVAL_MS);
+  };
+  channel.onmessage = event => handleWebRtcChannelMessage(peerId, event);
+  channel.onclose = () => {
+    if (record.heartbeatTimer) clearInterval(record.heartbeatTimer);
+    record.heartbeatTimer = null;
+    if (webRtcPeers.has(peerId) && webRtcPeerState(peerId) === 'connected') setWebRtcPeerState(peerId, 'connecting');
+  };
+  channel.onerror = () => setWebRtcPeerState(peerId, 'failed');
+}
+
+async function addQueuedWebRtcCandidates(peerId) {
+  const record = webRtcPeers.get(peerId);
+  if (!record?.pc?.remoteDescription) return;
+  const queued = record.pendingCandidates.splice(0);
+  for (const candidate of queued) {
+    try { await record.pc.addIceCandidate(candidate); } catch { }
+  }
+}
+
+async function ensureWebRtcPeer(peerId) {
+  const startBlockReason = webRtcStartBlockReason(peerId);
+  if (startBlockReason) throw new Error(startBlockReason);
+  const peer = connectedPeers.get(peerId);
+  const existing = webRtcPeers.get(peerId);
+  if (existing?.pc && existing.pc.connectionState !== 'closed') return existing;
+  if (existing) closeWebRtcPeer(peerId, 'connecting');
+
+  const config = await loadWebRtcConfig();
+  const pc = new RTCPeerConnection(config);
+  const record = {
+    pc,
+    channel: null,
+    state: 'connecting',
+    initiator: clientId < peerId,
+    heartbeatTimer: null,
+    pendingCandidates: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    iceCandidatesSent: 0,
+    iceCandidatesReceived: 0,
+    lastSignalSentAt: null,
+    lastSignalSentType: '',
+    lastSignalReceivedAt: null,
+    lastSignalReceivedType: '',
+    connectionState: pc.connectionState || '',
+    iceConnectionState: pc.iceConnectionState || '',
+    iceGatheringState: pc.iceGatheringState || '',
+    signalingState: pc.signalingState || '',
+    channelState: '',
+    error: '',
+    startBlockedReason: '',
+    startAttempts: 1,
+    lastStartAttemptAt: Date.now(),
+  };
+  webRtcPeers.set(peerId, record);
+  peer.webrtcState = 'connecting';
+
+  pc.onicecandidate = event => {
+    if (event.candidate) {
+      sendWebRtcSignal(peerId, { type: 'webrtc_ice', candidate: event.candidate.toJSON?.() || event.candidate });
+    }
+  };
+  pc.ondatachannel = event => attachWebRtcChannel(peerId, event.channel);
+  pc.onconnectionstatechange = () => {
+    const state = pc.connectionState;
+    if (state === 'connected') setWebRtcPeerState(peerId, 'connected');
+    else if (state === 'failed' || state === 'disconnected') setWebRtcPeerState(peerId, 'failed');
+    else if (state === 'closed') closeWebRtcPeer(peerId);
+    else setWebRtcPeerState(peerId, 'connecting');
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'failed') setWebRtcPeerState(peerId, 'failed');
+  };
+
+  if (record.initiator) {
+    attachWebRtcChannel(peerId, pc.createDataChannel('clipshare-control', { ordered: true }));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    record.localDescriptionType = pc.localDescription?.type || '';
+    sendWebRtcSignal(peerId, { type: 'webrtc_offer', sdp: pc.localDescription });
+  }
+
+  refreshWebRtcUi();
+  return record;
+}
+
+function startWebRtcForCompatiblePeers() {
+  return Promise.all([...connectedPeers.entries()]
+    .filter(([, peer]) => peer.compatibility === 'compatible')
+    .map(async ([peerId]) => {
+      try {
+        const record = await ensureWebRtcPeer(peerId);
+        if (!record) setWebRtcStartFailed(peerId, new Error(webRtcStartBlockReason(peerId) || 'WebRTC peer creation returned no record'));
+        return record;
+      } catch (error) {
+        setWebRtcStartFailed(peerId, error);
+        return null;
+      }
+    }));
+}
+
+async function handleWebRtcOffer(payload, senderId) {
+  if (!payload?.sdp || !senderId || senderId === clientId) return;
+  const peer = connectedPeers.get(senderId);
+  if (!peer || peer.compatibility !== 'compatible') return;
+  try {
+    const record = await ensureWebRtcPeer(senderId);
+    if (!record?.pc) return;
+    record.lastSignalReceivedAt = Date.now();
+    record.lastSignalReceivedType = payload.type;
+    await record.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    record.remoteDescriptionType = payload.sdp?.type || '';
+    await addQueuedWebRtcCandidates(senderId);
+    const answer = await record.pc.createAnswer();
+    await record.pc.setLocalDescription(answer);
+    record.localDescriptionType = record.pc.localDescription?.type || '';
+    sendWebRtcSignal(senderId, { type: 'webrtc_answer', sdp: record.pc.localDescription });
+  } catch {
+    setWebRtcPeerState(senderId, 'failed');
+  }
+}
+
+async function handleWebRtcAnswer(payload, senderId) {
+  const record = webRtcPeers.get(senderId);
+  if (!payload?.sdp || !record?.pc) return;
+  try {
+    record.lastSignalReceivedAt = Date.now();
+    record.lastSignalReceivedType = payload.type;
+    if (!record.pc.remoteDescription) {
+      await record.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      record.remoteDescriptionType = payload.sdp?.type || '';
+      await addQueuedWebRtcCandidates(senderId);
+    }
+  } catch {
+    setWebRtcPeerState(senderId, 'failed');
+  }
+}
+
+async function handleWebRtcIce(payload, senderId) {
+  try {
+    const record = webRtcPeers.get(senderId) || await ensureWebRtcPeer(senderId);
+    if (!payload?.candidate || !record?.pc) return;
+    record.lastSignalReceivedAt = Date.now();
+    record.lastSignalReceivedType = payload.type;
+    record.iceCandidatesReceived = (record.iceCandidatesReceived || 0) + 1;
+    const candidate = new RTCIceCandidate(payload.candidate);
+    if (!record.pc.remoteDescription) {
+      record.pendingCandidates.push(candidate);
+      return;
+    }
+    await record.pc.addIceCandidate(candidate);
+  } catch {
+    setWebRtcPeerState(senderId, 'failed');
+  }
+}
 
 function hasPendingChunkSends() {
   return !!chunkScheduler?.hasPending();
@@ -1620,9 +2291,11 @@ document.addEventListener('DOMContentLoaded', () => {
   if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
     document.getElementById('https-warning').style.display = 'block';
   }
+  loadWebRtcConfig().catch(() => {});
 
   document.getElementById('btn-join').addEventListener('click', joinFromInput);
   document.getElementById('btn-create').addEventListener('click', regenerateTokenInput);
+  document.getElementById('modal-start-pairing')?.addEventListener('click', () => startPairingMode({ modal: true }));
   document.getElementById('copy-start-url-btn').addEventListener('click', async () => {
     const url = document.getElementById('start-share-url').textContent;
     if (!url) return;
@@ -1633,7 +2306,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (startPairingCreated && normalizeToken(e.target.value) !== token) stopPairingMode({ start: true });
     updateStartSharePreview();
   });
-  document.getElementById('pin-input').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, PAIRING_PIN_LENGTH); clearPinError(); });
+  document.getElementById('pin-input').addEventListener('input', e => { e.target.value = formatPairingPinInput(e.target.value); clearPinError(); });
   document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
   document.getElementById('pin-input').addEventListener('keydown', e => { if (e.key === 'Enter') joinFromInput(); });
   document.getElementById('btn-clear').addEventListener('click', openClearModal);
@@ -1673,6 +2346,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
   document.getElementById('header-token').addEventListener('click', openTokenModal);
+  document.getElementById('header-logo').addEventListener('dblclick', exportDiagnostics);
   document.getElementById('peer-pills').addEventListener('click', openPeersModal);
   document.getElementById('token-modal-close').addEventListener('click', closeTokenModal);
   document.getElementById('token-modal').addEventListener('click', e => { if (e.target.id === 'token-modal') closeTokenModal(); });
@@ -1680,6 +2354,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('copy-url-btn').addEventListener('click', copyShareUrl);
   document.getElementById('peers-modal-close').addEventListener('click', closePeersModal);
   document.getElementById('peers-modal').addEventListener('click', e => { if (e.target.id === 'peers-modal') closePeersModal(); });
+  document.getElementById('peer-detail-modal-close').addEventListener('click', closePeerDetailModal);
+  document.getElementById('peer-detail-modal').addEventListener('click', e => { if (e.target.id === 'peer-detail-modal') closePeerDetailModal(); });
   document.getElementById('clear-modal').addEventListener('click', e => { if (e.target.id === 'clear-modal') closeClearModal(); });
   document.getElementById('chat-archive-modal').addEventListener('click', e => { if (e.target.id === 'chat-archive-modal') closeChatArchiveModal(); });
   document.getElementById('chat-clear-modal').addEventListener('click', e => { if (e.target.id === 'chat-clear-modal') closeChatClearModal(); });
@@ -1753,60 +2429,192 @@ document.addEventListener('DOMContentLoaded', () => {
   refreshIcons();
 });
 
-// ── Token management ────────────────────────────────────────────────
-function arrayBufferToBytes(buffer) {
-  return Array.from(new Uint8Array(buffer));
+const PAKE_GROUP_P_HEX = `
+FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08
+8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B
+302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9
+A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6
+49286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8
+FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D
+670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C
+180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718
+3995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFF
+FFFFFFFF`;
+const PAKE_GROUP_P = BigInt('0x' + PAKE_GROUP_P_HEX.replace(/\s+/g, ''));
+const PAKE_GROUP_Q = (PAKE_GROUP_P - 1n) / 2n;
+
+function modPow(base, exponent, mod) {
+  let result = 1n;
+  let b = ((base % mod) + mod) % mod;
+  let e = exponent;
+  while (e > 0n) {
+    if (e & 1n) result = (result * b) % mod;
+    b = (b * b) % mod;
+    e >>= 1n;
+  }
+  return result;
 }
 
-function bytesToArrayBuffer(bytes) {
-  return new Uint8Array(bytes || []).buffer;
+function bytesToBase64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-async function generateRsaKeyPair() {
-  return await crypto.subtle.generateKey(
-    {
-      name: 'RSA-OAEP',
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256',
+function base64UrlToBytes(value) {
+  const raw = String(value || '');
+  const padded = raw.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - raw.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
+function bigIntToBytes(value) {
+  let hex = value.toString(16);
+  if (hex.length % 2) hex = '0' + hex;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+function bytesToBigInt(bytes) {
+  const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  return BigInt('0x' + (hex || '0'));
+}
+
+function bigIntToBase64Url(value) {
+  return bytesToBase64Url(bigIntToBytes(value));
+}
+
+function base64UrlToBigInt(value) {
+  return bytesToBigInt(base64UrlToBytes(value));
+}
+
+function concatBytes(...parts) {
+  const length = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+async function sha256Bytes(...parts) {
+  const digest = await crypto.subtle.digest('SHA-256', concatBytes(...parts));
+  return new Uint8Array(digest);
+}
+
+function randomPakeScalar() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return (bytesToBigInt(bytes) % (PAKE_GROUP_Q - 2n)) + 2n;
+}
+
+function isValidPakePublic(value) {
+  return value > 1n && value < PAKE_GROUP_P - 1n && modPow(value, PAKE_GROUP_Q, PAKE_GROUP_P) === 1n;
+}
+
+async function pakeGenerator(pin, tokenValue, hostId, requestId) {
+  const encoder = new TextEncoder();
+  const seed = await sha256Bytes(encoder.encode(`ClipShare SPEKE v1|${tokenValue}|${hostId}|${requestId}|${pin}`));
+  const candidate = (bytesToBigInt(seed) % (PAKE_GROUP_P - 3n)) + 2n;
+  const generator = modPow(candidate, 2n, PAKE_GROUP_P);
+  return generator > 1n ? generator : 4n;
+}
+
+async function makePakeStart(pin, tokenValue, hostId, requestId) {
+  const secret = randomPakeScalar();
+  const generator = await pakeGenerator(pin, tokenValue, hostId, requestId);
+  const publicValue = modPow(generator, secret, PAKE_GROUP_P);
+  return {
+    secret,
+    start: {
+      version: 'speke-v1',
+      group: 'rfc3526-2048',
+      A: bigIntToBase64Url(publicValue),
     },
-    true,
-    ['encrypt', 'decrypt']
+  };
+}
+
+async function derivePakeKey(pin, tokenValue, hostId, requestId, secret, peerPublic, aPublic, bPublic) {
+  if (!isValidPakePublic(aPublic) || !isValidPakePublic(bPublic) || !isValidPakePublic(peerPublic)) {
+    throw new Error('invalid PAKE public value');
+  }
+  const shared = modPow(peerPublic, secret, PAKE_GROUP_P);
+  const encoder = new TextEncoder();
+  const material = await sha256Bytes(
+    encoder.encode('ClipShare PAKE key v1'),
+    bigIntToBytes(shared),
+    encoder.encode(`${tokenValue}|${hostId}|${requestId}|${bigIntToBase64Url(aPublic)}|${bigIntToBase64Url(bPublic)}`)
   );
+  return crypto.subtle.importKey('raw', material, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-async function exportRsaPublicKey(keyPair) {
-  return await crypto.subtle.exportKey('jwk', keyPair.publicKey);
-}
-
-async function importRsaPublicKey(jwk) {
-  return await crypto.subtle.importKey(
-    'jwk',
-    jwk,
-    { name: 'RSA-OAEP', hash: 'SHA-256' },
-    false,
-    ['encrypt']
+async function encryptPakeJson(key, payload, aad) {
+  const encoder = new TextEncoder();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: encoder.encode(aad) },
+    key,
+    encoder.encode(JSON.stringify(payload))
   );
+  return {
+    iv: Array.from(iv),
+    ciphertext: Array.from(new Uint8Array(ciphertext)),
+  };
 }
 
-async function rsaEncryptJson(publicKeyJwk, payload) {
-  const publicKey = await importRsaPublicKey(publicKeyJwk);
-  const encoded = new TextEncoder().encode(JSON.stringify(payload));
-  const ciphertext = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, encoded);
-  return { ciphertext: arrayBufferToBytes(ciphertext) };
-}
-
-async function rsaDecryptJson(privateKey, encryptedPayload) {
+async function decryptPakeJson(key, encryptedPayload, aad) {
+  const encoder = new TextEncoder();
   const plaintext = await crypto.subtle.decrypt(
-    { name: 'RSA-OAEP' },
-    privateKey,
-    bytesToArrayBuffer(encryptedPayload?.ciphertext)
+    {
+      name: 'AES-GCM',
+      iv: new Uint8Array(encryptedPayload?.iv || []),
+      additionalData: encoder.encode(aad),
+    },
+    key,
+    new Uint8Array(encryptedPayload?.ciphertext || [])
   );
   return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
 function pairingIsActive() {
   return startPairingCreated || modalPairingActive;
+}
+
+function activeRemotePairingHost() {
+  const now = Date.now();
+  return [...pairingHosts.values()]
+    .filter(host => Number(host.expiresAt) > now)
+    .sort((a, b) => Number(a.expiresAt || 0) - Number(b.expiresAt || 0))[0] || null;
+}
+
+function pairingHostRemainingSeconds(host) {
+  const expiresAt = Number(host?.pairingWindowExpiresAt || host?.expiresAt || 0);
+  return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+}
+
+function pairingHostWindowDurationMs(host) {
+  const maxUnusedPins = Math.max(1, Number(host?.maxUnusedPins) || PAIRING_MAX_UNUSED_PINS);
+  const pinTimeoutMs = Math.max(1000, Number(host?.pinTimeoutMs) || PAIRING_PIN_TTL_MS);
+  return maxUnusedPins * pinTimeoutMs;
+}
+
+function updateRemotePairingSpinner(host) {
+  const expiresAt = Number(host?.pairingWindowExpiresAt || host?.expiresAt || 0);
+  const duration = pairingHostWindowDurationMs(host);
+  const remaining = Math.max(0, expiresAt - Date.now());
+  const degrees = host ? Math.max(0, Math.min(360, remaining / duration * 360)) : 360;
+  document.querySelectorAll('.remote-pairing-row .pairing-spinner').forEach(el => {
+    el.style.animation = host ? 'none' : '';
+    el.style.setProperty('--sp-deg', `${degrees}deg`);
+  });
+}
+
+function pairingHostStatusText(host) {
+  if (!host) return '';
+  return `${peerDisplayName(host.clientId, host.peerNumber)} is in pairing mode`;
 }
 
 function setPinInputEnabled(enabled) {
@@ -1817,18 +2625,38 @@ function setPinInputEnabled(enabled) {
 function updatePairingUi() {
   const active = pairingIsActive() && pairingPin;
   const remaining = Math.max(0, Math.ceil((pairingPinExpiresAt - Date.now()) / 1000));
+  const remoteHost = activeRemotePairingHost();
+  const remoteSeconds = pairingHostRemainingSeconds(remoteHost);
+  updateRemotePairingSpinner(!modalPairingActive && remoteHost ? remoteHost : null);
   const startBox = document.getElementById('start-pairing-pin');
   const modalBox = document.getElementById('modal-pairing-pin');
+  const modalRemoteBox = document.getElementById('modal-remote-pairing');
+  const modalRemoteTime = document.getElementById('modal-remote-pairing-time');
+  const modalPairingLabel = document.getElementById('modal-pairing-label');
+  const modalStartPairing = document.getElementById('modal-start-pairing');
   const pinField = document.getElementById('start-pin-field');
   const showPairing = startPairingCreated && active;
   if (startBox) startBox.style.display = showPairing ? '' : 'none';
   if (pinField) pinField.style.display = showPairing ? 'none' : '';
   const createBtn = document.getElementById('btn-create');
-  if (createBtn) createBtn.innerHTML = startPairingCreated
-    ? '<i data-lucide="refresh-cw"></i> Regenerate'
-    : '<i data-lucide="plus"></i> Create space';
+  if (createBtn) {
+    createBtn.style.display = '';
+    createBtn.innerHTML = startPairingCreated
+      ? '<i data-lucide="refresh-cw"></i> Regenerate'
+      : '<i data-lucide="plus"></i> Create space';
+  }
   if (createBtn) lucide.createIcons({ nodes: [createBtn] });
-  if (modalBox) modalBox.style.display = modalPairingActive && active ? '' : 'none';
+  const showModalPin = modalPairingActive && active;
+  const showModalRemote = !modalPairingActive && !!remoteHost;
+  if (modalBox) modalBox.style.display = showModalPin ? '' : 'none';
+  if (modalRemoteBox) modalRemoteBox.style.display = showModalRemote ? '' : 'none';
+  if (modalRemoteTime) modalRemoteTime.textContent = showModalRemote ? `${remoteSeconds}s remaining` : '';
+  if (modalPairingLabel) {
+    if (showModalPin) modalPairingLabel.textContent = 'Pairing PIN';
+    else if (showModalRemote) modalPairingLabel.textContent = pairingHostStatusText(remoteHost);
+    else modalPairingLabel.textContent = 'Pairing';
+  }
+  if (modalStartPairing) modalStartPairing.style.display = (!showModalPin && !showModalRemote) ? '' : 'none';
   const pinHtml = pairingPin
     ? `<span>${pairingPin.slice(0, 4)}</span><span class="pin-sep" aria-hidden="true"> </span><span>${pairingPin.slice(4)}</span>`
     : '';
@@ -1841,6 +2669,7 @@ function updatePairingUi() {
   if (modalValue) modalValue.innerHTML = pinHtml;
   if (startTime) startTime.textContent = label;
   if (modalTime) modalTime.textContent = label;
+  if (!active && !remoteHost) stopPairingUiTimer();
 }
 
 function stopPairingUiTimer() {
@@ -1892,20 +2721,30 @@ function ensurePairingHostSocket(tokenValue) {
 }
 
 async function publishPairingMode() {
-  if (!pairingIsActive() || !token || !pairingKeyPair || pairingPinExpiresAt <= Date.now()) return false;
-  const publicKeyJwk = await exportRsaPublicKey(pairingKeyPair);
+  if (!pairingIsActive() || !token || !pairingPinId || pairingPinExpiresAt <= Date.now()) return false;
   return sendPairingJson({
     type: 'pairing_mode',
-    publicKeyJwk,
+    pairingVersion: 'speke-v1',
+    pinId: pairingPinId,
     expiresAt: pairingPinExpiresAt,
   });
 }
 
 async function rotatePairingPin() {
   if (!pairingIsActive() || !token || !currentPassphrase) return;
+  if (pairingPin && !pairingCurrentPinUsed) {
+    pairingUnusedPinCount++;
+    if (pairingUnusedPinCount >= PAIRING_MAX_UNUSED_PINS) {
+      showToast('Pairing timed out');
+      closeTokenModal();
+      stopPairingMode({ all: true });
+      return;
+    }
+  }
   pairingPin = generatePairingPin();
+  pairingPinId = randomUUID();
+  pairingCurrentPinUsed = false;
   pairingPinExpiresAt = Date.now() + PAIRING_PIN_TTL_MS;
-  pairingKeyPair = await generateRsaKeyPair();
   document.querySelectorAll('.pairing-spinner').forEach(el => {
     el.style.animation = 'none';
     el.offsetWidth;
@@ -1929,8 +2768,11 @@ function stopPairingMode({ start = false, modal = false, all = false } = {}) {
   pairingRotateTimer = null;
   stopPairingUiTimer();
   pairingPin = '';
+  pairingPinId = '';
   pairingPinExpiresAt = 0;
-  pairingKeyPair = null;
+  pairingUnusedPinCount = 0;
+  pairingCurrentPinUsed = false;
+  pairingHostPendingRequests.clear();
   sendPairingJson({ type: 'pairing_stop' });
   closePairingHostSocket();
   updatePairingUi();
@@ -1938,6 +2780,11 @@ function stopPairingMode({ start = false, modal = false, all = false } = {}) {
 
 async function startPairingMode({ start = false, modal = false } = {}) {
   if (!token || !currentPassphrase) return;
+  if (modal && activeRemotePairingHost()) {
+    showToast(pairingHostStatusText(activeRemotePairingHost()));
+    updatePairingUi();
+    return;
+  }
   if (start) startPairingCreated = true;
   if (modal) modalPairingActive = true;
   if (!pairingPin || pairingPinExpiresAt <= Date.now()) await rotatePairingPin();
@@ -1951,10 +2798,12 @@ async function startPairingMode({ start = false, modal = false } = {}) {
 function updatePairingHosts(hosts = []) {
   pairingHosts.clear();
   for (const host of hosts || []) {
-    if (!host?.clientId || host.clientId === clientId || !host.publicKeyJwk) continue;
+    if (!host?.clientId || host.clientId === clientId || host.pairingVersion !== 'speke-v1') continue;
     if (Number(host.expiresAt) <= Date.now()) continue;
     pairingHosts.set(host.clientId, host);
   }
+  if (activeRemotePairingHost() && !pairingUiTimer) startPairingUiTimer();
+  else updatePairingUi();
 }
 
 function closePairingJoinSocket() {
@@ -1972,7 +2821,8 @@ function clearPairingJoinTimer() {
 
 function resetPairingJoin() {
   clearPairingJoinTimer();
-  pairingJoinKeyPair = null;
+  pairingJoinPakeSecret = null;
+  pairingJoinPakeStart = null;
   pairingJoinRequestId = null;
   pairingJoinToken = '';
   closePairingJoinSocket();
@@ -1990,7 +2840,7 @@ function clearPinError() {
   if (el) el.style.display = 'none';
 }
 
-function pairingJoinFailed(message = 'PIN does not match any peer') {
+function pairingJoinFailed(message = 'Invalid PIN') {
   showPinError(message);
   resetPairingJoin();
   setPinInputEnabled(true);
@@ -1998,30 +2848,30 @@ function pairingJoinFailed(message = 'PIN does not match any peer') {
 
 async function requestPairingWithHosts() {
   const pin = (document.getElementById('pin-input')?.value || '').replace(/\D/g, '');
-  if (!pairingJoinWs || pairingJoinWs.readyState !== WebSocket.OPEN || !pairingJoinKeyPair || !pin || pin.length !== PAIRING_PIN_LENGTH) return;
+  if (!pairingJoinWs || pairingJoinWs.readyState !== WebSocket.OPEN || !pin || pin.length !== PAIRING_PIN_LENGTH) return;
   const hosts = [...pairingHosts.values()].filter(host => Number(host.expiresAt) > Date.now());
   if (!hosts.length) {
     pairingJoinFailed('No peer found with an active pairing PIN on this token');
     return;
   }
-  const requesterPublicKeyJwk = await exportRsaPublicKey(pairingJoinKeyPair);
+  const host = hosts[0];
   pairingJoinRequestId = randomUUID();
-  for (const host of hosts) {
-    const encryptedPin = await rsaEncryptJson(host.publicKeyJwk, {
-      kind: 'clipshare-pairing-pin',
-      requestId: pairingJoinRequestId,
-      pin,
-    });
-    pairingJoinWs.send(JSON.stringify({
-      type: 'pairing_request',
-      requestId: pairingJoinRequestId,
-      hostIds: [host.clientId],
-      requesterPublicKeyJwk,
-      encryptedPin,
-    }));
-  }
+  const pake = await makePakeStart(pin, pairingJoinToken, host.clientId, pairingJoinRequestId);
+  pairingJoinPakeSecret = pake.secret;
+  pairingJoinPakeStart = {
+    hostId: host.clientId,
+    hostPeerNumber: host.peerNumber,
+    A: pake.start.A,
+    pin,
+  };
+  pairingJoinWs.send(JSON.stringify({
+    type: 'pairing_request',
+    requestId: pairingJoinRequestId,
+    hostIds: [host.clientId],
+    pakeStart: pake.start,
+  }));
   clearPairingJoinTimer();
-  pairingJoinTimer = setTimeout(() => pairingJoinFailed('PIN does not match any peer'), PAIRING_JOIN_TIMEOUT_MS);
+  pairingJoinTimer = setTimeout(() => pairingJoinFailed('Invalid PIN'), PAIRING_JOIN_TIMEOUT_MS);
 }
 
 async function handlePairingJoinMessage(msg) {
@@ -2030,25 +2880,50 @@ async function handlePairingJoinMessage(msg) {
     await requestPairingWithHosts();
     return;
   }
-  if (msg.type !== 'pairing_response' || msg.requestId !== pairingJoinRequestId || !pairingJoinKeyPair) return;
+  if (msg.type !== 'pairing_response' || msg.requestId !== pairingJoinRequestId || !pairingJoinPakeSecret || !pairingJoinPakeStart) return;
   try {
-    const payload = await rsaDecryptJson(pairingJoinKeyPair.privateKey, msg.encryptedPassphrase);
+    const bPublic = base64UrlToBigInt(msg.pakeFinish?.B);
+    const aPublic = base64UrlToBigInt(pairingJoinPakeStart.A);
+    const key = await derivePakeKey(
+      pairingJoinPakeStart.pin,
+      pairingJoinToken,
+      pairingJoinPakeStart.hostId,
+      pairingJoinRequestId,
+      pairingJoinPakeSecret,
+      bPublic,
+      aPublic,
+      bPublic
+    );
+    const aad = `ClipShare PAKE response v1|${pairingJoinToken}|${pairingJoinPakeStart.hostId}|${pairingJoinRequestId}|${pairingJoinPakeStart.A}|${msg.pakeFinish?.B || ''}`;
+    const payload = await decryptPakeJson(key, msg.encryptedPassphrase, aad);
     if (payload?.kind !== 'clipshare-pairing-passphrase' || !isGeneratedPasskey(payload.passphrase)) throw new Error('bad passphrase');
     const pairedToken = pairingJoinToken;
+    const pairedHostId = pairingJoinPakeStart.hostId;
+    const pairedRequestId = pairingJoinRequestId;
+    const pairedDeviceName = peerDisplayName(pairingJoinPakeStart.hostId, pairingJoinPakeStart.hostPeerNumber);
     currentPassphrase = payload.passphrase;
     saveTokenInputsToStorage(pairedToken, currentPassphrase);
+    if (pairingJoinWs?.readyState === WebSocket.OPEN) {
+      pairingJoinWs.send(JSON.stringify({
+        type: 'pairing_confirm',
+        targetId: pairedHostId,
+        requestId: pairedRequestId,
+      }));
+    }
     resetPairingJoin();
     clearPinError();
     setPinInputEnabled(true);
     setToken(pairedToken);
+    showToast(`${pairedDeviceName} paired successfully`);
   } catch {
-    pairingJoinFailed('Invalid pairing response');
+    pairingJoinFailed('Invalid PIN');
   }
 }
 
 async function joinWithPairingPin(tokenValue, pin) {
   pairingJoinToken = tokenValue;
-  pairingJoinKeyPair = await generateRsaKeyPair();
+  pairingJoinPakeSecret = null;
+  pairingJoinPakeStart = null;
   setPinInputEnabled(false);
   closePairingJoinSocket();
   pairingJoinWs = new WebSocket(pairingSocketUrl(tokenValue));
@@ -2061,27 +2936,46 @@ async function joinWithPairingPin(tokenValue, pin) {
     if (pairingJoinRequestId) pairingJoinFailed('Pairing disconnected');
   };
   clearPairingJoinTimer();
-  pairingJoinTimer = setTimeout(() => pairingJoinFailed('PIN does not match any peer'), PAIRING_JOIN_TIMEOUT_MS);
+  pairingJoinTimer = setTimeout(() => pairingJoinFailed('Invalid PIN'), PAIRING_JOIN_TIMEOUT_MS);
 }
 
 async function answerPairingRequest(msg) {
-  if (!pairingIsActive() || !pairingKeyPair || !currentPassphrase || pairingPinExpiresAt <= Date.now()) return;
+  if (!pairingIsActive() || !currentPassphrase || pairingPinExpiresAt <= Date.now()) return;
   try {
-    const request = await rsaDecryptJson(pairingKeyPair.privateKey, msg.encryptedPin);
-    if (request?.kind !== 'clipshare-pairing-pin' || request.pin !== pairingPin || request.requestId !== msg.requestId) return;
-    const encryptedPassphrase = await rsaEncryptJson(msg.requesterPublicKeyJwk, {
+    if (!msg.pakeStart || msg.pakeStart.version !== 'speke-v1' || msg.pakeStart.group !== 'rfc3526-2048') return;
+    const aPublic = base64UrlToBigInt(msg.pakeStart.A);
+    const secret = randomPakeScalar();
+    const generator = await pakeGenerator(pairingPin, token, clientId, msg.requestId);
+    const bPublic = modPow(generator, secret, PAKE_GROUP_P);
+    const key = await derivePakeKey(
+      pairingPin,
+      token,
+      clientId,
+      msg.requestId,
+      secret,
+      aPublic,
+      aPublic,
+      bPublic
+    );
+    const bEncoded = bigIntToBase64Url(bPublic);
+    const aad = `ClipShare PAKE response v1|${token}|${clientId}|${msg.requestId}|${msg.pakeStart.A}|${bEncoded}`;
+    const encryptedPassphrase = await encryptPakeJson(key, {
       kind: 'clipshare-pairing-passphrase',
       requestId: msg.requestId,
       passphrase: currentPassphrase,
-    });
+    }, aad);
     sendPairingJson({
       type: 'pairing_response',
       targetId: msg.senderId,
       requestId: msg.requestId,
+      pakeFinish: {
+        version: 'speke-v1',
+        group: 'rfc3526-2048',
+        B: bEncoded,
+      },
       encryptedPassphrase,
     });
-    showToast('Device paired successfully');
-    await rotatePairingPin();
+    pairingHostPendingRequests.set(msg.requestId, msg.senderId);
   } catch {}
 }
 
@@ -2151,6 +3045,10 @@ async function joinFromInput() {
     showToast('Enter a token first');
     return;
   }
+  if (pin.length === PAIRING_PIN_LENGTH) {
+    await joinWithPairingPin(t, pin);
+    return;
+  }
   if (isGeneratedPasskey(currentPassphrase)) {
     saveTokenInputsToStorage(t, currentPassphrase);
     enterAppWithToken(t);
@@ -2161,10 +3059,6 @@ async function joinFromInput() {
     currentPassphrase = hashPassphrase;
     saveTokenInputsToStorage(t, currentPassphrase);
     enterAppWithToken(t);
-    return;
-  }
-  if (pin.length === PAIRING_PIN_LENGTH) {
-    await joinWithPairingPin(t, pin);
     return;
   }
   showToast('Enter an 8 digit PIN or use a full share URL');
@@ -2193,6 +3087,7 @@ function setToken(t) {
 function leaveSpace() {
   stopPairingMode({ all: true });
   resetPairingJoin();
+  closeAllWebRtcPeers();
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
   if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
   if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
@@ -2210,6 +3105,8 @@ function leaveSpace() {
   toggleChatPanel(false);
   cardEncryptionKeys.clear();
   peerCardMetadata.clear();
+  roomManifest.clear();
+  manifestRevisions.clear();
   binaryTransfers.clear();
   clearAllOutboundRetries();
   outboundTransfers.clear();
@@ -2335,41 +3232,45 @@ function uploadLogTargetLabel(targetId) {
   return targetId ? downloadLogSourceLabel(targetId) : 'Broadcast';
 }
 
-function logDownloadSourceStart(itemId, sourceId, totalChunks) {
+function transferLogPrefix(base, transport = '') {
+  return `${base}${transport === 'webrtc' ? '+' : ''}`;
+}
+
+function logDownloadSourceStart(itemId, sourceId, totalChunks, transport = '') {
   if (!itemId || !sourceId) return;
   if (!downloadLogSources.has(itemId)) downloadLogSources.set(itemId, new Set());
   const sources = downloadLogSources.get(itemId);
   if (sources.has(sourceId)) return;
   sources.add(sourceId);
-  console.log(`DN ${downloadLogFileLabel(itemId)} chunks ${downloadLogSourceLabel(sourceId)} start`, {
+  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunks ${downloadLogSourceLabel(sourceId)} start`, {
     chunks: totalChunks || 0,
   });
 }
 
-function logDownloadChunk(itemId, chunkIndex, totalChunks, sourceId) {
+function logDownloadChunk(itemId, chunkIndex, totalChunks, sourceId, transport = '') {
   if (!itemId || !sourceId || !Number.isFinite(chunkIndex)) return;
-  console.log(`DN ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${downloadLogSourceLabel(sourceId)}`);
+  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${downloadLogSourceLabel(sourceId)}`);
 }
 
-function logDownloadDone(itemId, sourceIds = []) {
+function logDownloadDone(itemId, sourceIds = [], transport = '') {
   const names = [...new Set(sourceIds.filter(Boolean).map(downloadLogSourceLabel))];
-  console.log(`DN ${downloadLogFileLabel(itemId)} chunks ${names.join(' + ') || 'Unknown source'} done`);
+  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunks ${names.join(' + ') || 'Unknown source'} done`);
   downloadLogSources.delete(itemId);
 }
 
-function logUploadStart(itemId, targetId, totalChunks) {
-  console.log(`UP ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} start`, {
+function logUploadStart(itemId, targetId, totalChunks, transport = '') {
+  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} start`, {
     chunks: totalChunks || 0,
   });
 }
 
-function logUploadChunk(itemId, chunkIndex, totalChunks, targetId) {
+function logUploadChunk(itemId, chunkIndex, totalChunks, targetId, transport = '') {
   if (!itemId || !Number.isFinite(chunkIndex)) return;
-  console.log(`UP ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${uploadLogTargetLabel(targetId)}`);
+  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${uploadLogTargetLabel(targetId)}`);
 }
 
-function logUploadDone(itemId, targetId) {
-  console.log(`UP ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} done`);
+function logUploadDone(itemId, targetId, transport = '') {
+  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} done`);
 }
 
 const CRC32_TABLE = (() => {
@@ -2502,9 +3403,13 @@ function publishClientCardRemoval(itemId, reason = 'delete') {
   });
 }
 
+function canPublishCardHolder(item) {
+  return !!item && item.type !== 'encrypted' && (item.type === 'text' || !!item.rawBuffer);
+}
+
 function publishLocalManifest() {
   for (const item of items.values()) {
-    if (item.type === 'encrypted') continue;
+    if (!canPublishCardHolder(item)) continue;
     publishClientCardMetadata(item);
   }
 }
@@ -2523,6 +3428,17 @@ function forgetPeerCardMetadata(peerId, itemId) {
   if (!cards.size) peerCardMetadata.delete(peerId);
 }
 
+function rebuildPeerCardMetadataFromManifest() {
+  peerCardMetadata.clear();
+  for (const record of roomManifest.values()) {
+    const meta = record?.meta;
+    if (!meta?.id) continue;
+    for (const holderId of record.holders || []) {
+      if (holderId !== clientId && connectedPeers.has(holderId)) rememberPeerCardMetadata(holderId, meta);
+    }
+  }
+}
+
 function rememberManifestMeta(ownerId, meta, revision = 0, holders = null) {
   if (!ownerId || !meta?.id) return;
   const existing = roomManifest.get(meta.id);
@@ -2530,10 +3446,7 @@ function rememberManifestMeta(ownerId, meta, revision = 0, holders = null) {
   const holderIds = [...new Set((holders?.length ? holders : [ownerId]).filter(Boolean))];
   roomManifest.set(meta.id, { ownerId, holders: holderIds, revision, meta });
   manifestRevisions.set(meta.id, Math.max(manifestRevisions.get(meta.id) || 0, revision || 0));
-  for (const peerId of [...peerCardMetadata.keys()]) forgetPeerCardMetadata(peerId, meta.id);
-  for (const holderId of holderIds) {
-    if (holderId !== clientId) rememberPeerCardMetadata(holderId, meta);
-  }
+  rebuildPeerCardMetadataFromManifest();
 }
 
 function removeManifestMeta(itemId, revision = 0) {
@@ -2542,7 +3455,7 @@ function removeManifestMeta(itemId, revision = 0) {
   if (existing && (existing.revision || 0) > revision) return;
   roomManifest.delete(itemId);
   manifestRevisions.set(itemId, Math.max(manifestRevisions.get(itemId) || 0, revision || 0));
-  for (const peerId of peerCardMetadata.keys()) forgetPeerCardMetadata(peerId, itemId);
+  rebuildPeerCardMetadataFromManifest();
 }
 
 async function applyManifestRecord(record) {
@@ -2690,7 +3603,7 @@ function clearTransferStatusesForItem(itemId) {
   }
 }
 
-function publishTransferStatus({ itemId, sourceId, targetId, current, done, total, chunkRuns = null, status = 'active', force = false }) {
+function publishTransferStatus({ itemId, sourceId, targetId, current, done, total, chunkRuns = null, transport = '', status = 'active', force = false }) {
   if (!itemId || !sourceId || !targetId || !ws || ws.readyState !== WebSocket.OPEN) return;
   const key = `${itemId}:${sourceId}:${targetId}`;
   const now = Date.now();
@@ -2708,6 +3621,7 @@ function publishTransferStatus({ itemId, sourceId, targetId, current, done, tota
       receivedChunks: Math.max(0, Number(done) || 0),
       totalChunks: Math.max(0, Number(total) || 0),
       chunkRuns: normalizeTransferChunkRuns(chunkRuns),
+      transport: transport === 'webrtc' ? 'webrtc' : '',
       status,
       updatedAt: now,
     },
@@ -2726,11 +3640,13 @@ function applyRemoteTransferStatus(status) {
     receivedChunks: Math.max(0, Number(status.receivedChunks) || 0),
     totalChunks: Math.max(0, Number(status.totalChunks) || 0),
     chunkRuns: normalizeTransferChunkRuns(status.chunkRuns),
+    transport: status.transport === 'webrtc' ? 'webrtc' : '',
     status: status.status === 'done' ? 'done' : 'active',
     updatedAt: Number(status.updatedAt) || Date.now(),
   };
   const key = transferStatusKey(normalized);
   const previous = remoteTransferStatuses.get(key);
+  if (previous?.status === 'done' && normalized.status !== 'done' && normalized.updatedAt <= previous.updatedAt) return;
   if (!normalized.chunkRuns.length && previous?.chunkRuns?.length) normalized.chunkRuns = previous.chunkRuns;
   if (normalized.status === 'done') {
     remoteTransferStatuses.set(key, normalized);
@@ -2740,7 +3656,7 @@ function applyRemoteTransferStatus(status) {
         remoteTransferStatuses.delete(key);
         schedulePeersModalRefresh();
       }
-    }, 1500);
+    }, 900);
   } else {
     remoteTransferStatuses.set(key, normalized);
   }
@@ -2795,7 +3711,7 @@ function transferStatusRowsForPeer(peerId) {
     if (peerId !== clientId) continue;
     rows.push({
       itemId,
-      direction: 'Receiving',
+      direction: 'DN',
       sourceId: transfer.senderId || '',
       sourceIds: transferSourceIdsFromChunks(transfer.chunkSources, transfer.senderId),
       source: imap.get(transfer.senderId)?.fullName || 'Peer',
@@ -2804,6 +3720,7 @@ function transferStatusRowsForPeer(peerId) {
       done: transfer.received || 0,
       total: transfer.totalChunks || 0,
       chunkRuns: transferChunkRunsFromSources(transfer.chunkSources, transfer.totalChunks),
+      transport: transfer.transport || '',
     });
   }
   for (const [itemId, peerMap] of outboundTransfers) {
@@ -2811,7 +3728,7 @@ function transferStatusRowsForPeer(peerId) {
     if (!progress) continue;
     rows.push({
       itemId,
-      direction: 'Receiving',
+      direction: 'UP',
       sourceId: clientId,
       sourceIds: [clientId],
       source: 'You',
@@ -2820,13 +3737,14 @@ function transferStatusRowsForPeer(peerId) {
       done: progress.sent || 0,
       total: progress.total || 0,
       chunkRuns: transferChunkRunsFromAcked(progress, clientId),
+      transport: progress.transport || '',
     });
   }
   for (const status of remoteTransferStatuses.values()) {
     if (status.targetId !== peerId) continue;
     rows.push({
       itemId: status.itemId,
-      direction: 'Receiving',
+      direction: 'DN',
       sourceId: status.sourceId,
       sourceIds: [status.sourceId],
       source: imap.get(status.sourceId)?.fullName || 'Peer',
@@ -2835,6 +3753,7 @@ function transferStatusRowsForPeer(peerId) {
       done: status.receivedChunks || 0,
       total: status.totalChunks || 0,
       chunkRuns: status.chunkRuns || [],
+      transport: status.transport || '',
     });
   }
   return mergeTransferStatusRows(rows);
@@ -2854,6 +3773,7 @@ function mergeTransferStatusRows(rows) {
     existing.current = Math.max(existing.current || 0, row.current || 0);
     existing.done = Math.max(existing.done || 0, row.done || 0);
     existing.total = Math.max(existing.total || 0, row.total || 0);
+    if (row.transport === 'webrtc') existing.transport = 'webrtc';
     if ((row.chunkRuns?.length || 0) > (existing.chunkRuns?.length || 0)) existing.chunkRuns = row.chunkRuns;
   }
   return [...merged.values()].map(row => ({
@@ -2869,9 +3789,10 @@ function renderTransferStatus(rows) {
     const pct = row.total ? Math.round((row.done / row.total) * 100) : 0;
     const chunk = row.total ? `${Math.min(row.current, row.total)}/${row.total}` : '...';
     const chunkBar = renderTransferChunkBar(row);
+    const direction = `${row.direction || 'DN'}${row.transport === 'webrtc' ? '+' : ''}`;
     return `<div class="peer-transfer-row">
       <div class="peer-transfer-meta">
-        <span class="peer-transfer-title" title="${escAttr(row.title)}">${escHtml(row.direction)}: ${escHtml(row.title)}</span>
+        <span class="peer-transfer-title" title="${escAttr(row.title)}">${escHtml(direction)}: ${escHtml(row.title)}</span>
         <span class="peer-transfer-source"><span>Source</span>${peerIconStackHtml(row.sourceIds, 'peer-transfer-source-icons')}<span>| Chunk ${escHtml(chunk)} | ${pct}%</span></span>
       </div>
       ${chunkBar}
@@ -2901,11 +3822,15 @@ function renderTransferChunkBar(row) {
 }
 
 function schedulePeersModalRefresh() {
-  const modal = document.getElementById('peers-modal');
-  if (!modal?.classList.contains('open') || peersModalRefreshTimer) return;
+  const peersModal = document.getElementById('peers-modal');
+  const detailModal = document.getElementById('peer-detail-modal');
+  const shouldRefreshPeers = peersModal?.classList.contains('open');
+  const shouldRefreshDetail = detailModal?.classList.contains('open') && openPeerDetailId;
+  if ((!shouldRefreshPeers && !shouldRefreshDetail) || peersModalRefreshTimer) return;
   peersModalRefreshTimer = setTimeout(() => {
     peersModalRefreshTimer = null;
-    if (modal.classList.contains('open')) openPeersModal();
+    if (peersModal?.classList.contains('open')) openPeersModal();
+    if (detailModal?.classList.contains('open') && openPeerDetailId) openPeerDetailModal(openPeerDetailId);
   }, 250);
 }
 
@@ -2923,8 +3848,135 @@ function renderPeerCardMetadata(cards) {
   }).join('')}</div>`;
 }
 
-function peerDetail(id, peer) {
-  return [peerCompatibilityLabel(peer), peer?.ip, id.slice(0, 8), metricsDetail(peer?.metrics)].filter(Boolean).join(' | ');
+function peerStatusDetail(id, peer) {
+  if (id === clientId) return '';
+  const metrics = normalizeClientMetrics(peer?.metrics || {});
+  const icon = metrics.deviceType === 'mobile' ? 'smartphone' : 'monitor';
+  const ip = peer?.ip || 'IP unknown';
+  const rtc = webRtcPeerState(id) === 'connected' ? '<span>WebRTC</span>' : '';
+  return `${rtc}<span class="peer-row-device"><span>${escHtml(ip)}</span><i data-lucide="${icon}"></i></span>`;
+}
+
+function formatDetailTime(ts) {
+  const value = Number(ts);
+  if (!Number.isFinite(value) || value <= 0) return '...';
+  return `${new Date(value).toLocaleString()} (${timeAgo(value)})`;
+}
+
+function wsStateLabel(socket) {
+  if (!socket) return 'closed';
+  if (socket.readyState === WebSocket.CONNECTING) return 'connecting';
+  if (socket.readyState === WebSocket.OPEN) return 'open';
+  if (socket.readyState === WebSocket.CLOSING) return 'closing';
+  return 'closed';
+}
+
+function detailRowsHtml(rows) {
+  return rows
+    .filter(row => row && row[0] && row[1] !== '')
+    .map(([label, value]) => `<div class="peer-detail-row"><span>${escHtml(label)}</span><strong>${escHtml(value ?? '')}</strong></div>`)
+    .join('');
+}
+
+function peerDetailSnapshot(peerId) {
+  const isSelf = peerId === clientId;
+  const imap = buildPeerIdentityMap();
+  const identity = imap.get(peerId) || fallbackPeerIdentity(peerId);
+  const peer = isSelf ? { ...selfPeerInfo, metrics: selfClientMetrics, compatibility: 'self' } : connectedPeers.get(peerId);
+  const metrics = normalizeClientMetrics(peer?.metrics || {});
+  const rtc = webRtcPeers.get(peerId);
+  const cards = isSelf
+    ? new Map([...items.values()].map(item => [item.id, cardMetadataFromItem(item)]).filter(([, meta]) => meta))
+    : (peerCardMetadata.get(peerId) || new Map());
+  const transferRows = transferStatusRowsForPeer(peerId);
+  return {
+    peerId,
+    isSelf,
+    identity,
+    peer,
+    metrics,
+    rtc,
+    cards,
+    transferRows,
+  };
+}
+
+function openPeerDetailModal(peerId) {
+  const modal = document.getElementById('peer-detail-modal');
+  const body = document.getElementById('peer-detail-body');
+  const title = document.getElementById('peer-detail-title');
+  if (!modal || !body || !title || !peerId) return;
+  const snap = peerDetailSnapshot(peerId);
+  const { identity, peer, metrics, rtc, cards, transferRows } = snap;
+  if (!peer && !snap.isSelf) return;
+  openPeerDetailId = peerId;
+  title.textContent = identity.fullName + (snap.isSelf ? ' (You)' : '');
+  const rtcState = webRtcPeerState(peerId);
+  const rtcRows = [
+    ['Status', webRtcStateLabel(peerId)],
+    ['Unavailable reason', rtcState === 'unavailable' ? webRtcUnavailableReason(peerId) : ''],
+    ['Start blocked reason', webRtcStartBlockReason(peerId)],
+    ['Start attempts', rtc ? String(rtc.startAttempts || 0) : '0'],
+    ['Last start attempt', rtc?.lastStartAttemptAt ? formatDetailTime(rtc.lastStartAttemptAt) : '...'],
+    ['Last start error', rtc?.error || ''],
+    ['Supported by browser', isWebRtcSupported() ? 'yes' : 'no'],
+    ['Initiator', rtc ? (rtc.initiator ? 'yes' : 'no') : '...'],
+    ['PeerConnection state', rtc?.connectionState || rtc?.pc?.connectionState || '...'],
+    ['ICE connection state', rtc?.iceConnectionState || rtc?.pc?.iceConnectionState || '...'],
+    ['ICE gathering state', rtc?.iceGatheringState || rtc?.pc?.iceGatheringState || '...'],
+    ['Signaling state', rtc?.signalingState || rtc?.pc?.signalingState || '...'],
+    ['Data channel state', rtc?.channelState || rtc?.channel?.readyState || '...'],
+    ['Pending ICE candidates', String(rtc?.pendingCandidates?.length || 0)],
+    ['ICE sent / received', rtc ? `${rtc.iceCandidatesSent || 0} / ${rtc.iceCandidatesReceived || 0}` : '0 / 0'],
+    ['Local / remote SDP', rtc ? `${rtc.localDescriptionType || '...'} / ${rtc.remoteDescriptionType || '...'}` : '... / ...'],
+    ['Last signal sent', rtc?.lastSignalSentType ? `${rtc.lastSignalSentType} - ${formatDetailTime(rtc.lastSignalSentAt)}` : '...'],
+    ['Last signal received', rtc?.lastSignalReceivedType ? `${rtc.lastSignalReceivedType} - ${formatDetailTime(rtc.lastSignalReceivedAt)}` : '...'],
+    ['Last heartbeat pong', peer?.webrtcLastPongAt ? formatDetailTime(peer.webrtcLastPongAt) : '...'],
+    ['Created', rtc?.createdAt ? formatDetailTime(rtc.createdAt) : '...'],
+    ['Updated', rtc?.updatedAt ? formatDetailTime(rtc.updatedAt) : '...'],
+  ];
+  const generalRows = [
+    ['Full ID', peerId],
+    ['Short ID', peerId.slice(0, 8)],
+    ['Peer number', peer?.label || selfPeerInfo.label || '...'],
+    ['IP', peer?.ip || 'unknown'],
+    ['Device', metrics.deviceType === 'mobile' ? 'Mobile' : 'Desktop'],
+    ['Compatibility', peerCompatibilityDetail(peer, snap.isSelf)],
+    ['Cards known', String(cards.size || 0)],
+    ['Transfer rows', String(transferRows.length || 0)],
+  ];
+  const metricRows = [
+    ['Relay ping', formatPing(metrics.pingMs)],
+    ['Upload speed', formatSpeed(metrics.uploadBps)],
+    ['Download speed', formatSpeed(metrics.downloadBps)],
+    ['Metrics updated', formatDetailTime(metrics.updatedAt)],
+  ];
+  const localRows = snap.isSelf ? [
+    ['Token', token || '...'],
+    ['Control WebSocket', wsStateLabel(ws)],
+    ['Data WebSocket', wsStateLabel(dataWs)],
+    ['Encryption enabled', encryptionEnabled ? 'yes' : 'no'],
+    ['ICE servers configured', String(webRtcConfig?.iceServers?.length || 0)],
+  ] : [];
+  body.innerHTML = `
+    <div class="peer-detail-identity">${peerPillHtml(identity, 'peer-pill-sm')}<span>${escHtml(identity.fullName)}${snap.isSelf ? ' (You)' : ''}</span></div>
+    <div class="peer-detail-section"><h3>General</h3>${detailRowsHtml(generalRows)}</div>
+    <div class="peer-detail-section"><h3>WebRTC</h3>${detailRowsHtml(rtcRows)}</div>
+    <div class="peer-detail-section"><h3>Network</h3>${detailRowsHtml(metricRows)}</div>
+    ${localRows.length ? `<div class="peer-detail-section"><h3>This Device</h3>${detailRowsHtml(localRows)}</div>` : ''}
+    <div class="peer-detail-section"><h3>Transfers</h3>${transferRows.length ? renderTransferStatus(transferRows) : '<div class="peer-card-empty">No active transfers</div>'}</div>
+    <div class="peer-detail-section"><h3>Known Cards</h3>${renderPeerCardMetadata(cards)}</div>
+  `;
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  refreshIcons();
+}
+
+function closePeerDetailModal() {
+  const modal = document.getElementById('peer-detail-modal');
+  modal?.classList.remove('open');
+  modal?.setAttribute('aria-hidden', 'true');
+  openPeerDetailId = null;
 }
 
 function openPeersModal() {
@@ -2933,19 +3985,20 @@ function openPeersModal() {
   const imap = buildPeerIdentityMap();
   const selfId = imap.get(clientId);
   const rows = [
-    { id: clientId, identity: selfId, label: `${selfId.fullName} (You)`, detail: peerDetail(clientId, { ...selfPeerInfo, metrics: selfClientMetrics }), cards: new Map([...items.values()].map(item => [item.id, cardMetadataFromItem(item)]).filter(([, meta]) => meta)) },
+    { id: clientId, identity: selfId, label: `${selfId.fullName} (You)`, detail: peerStatusDetail(clientId, { ...selfPeerInfo, metrics: selfClientMetrics }), cards: new Map([...items.values()].map(item => [item.id, cardMetadataFromItem(item)]).filter(([, meta]) => meta)) },
     ...[...connectedPeers.entries()].map(([id, peer]) => {
       const pid = imap.get(id);
       const compatible = peer.compatibility === 'compatible';
-      return { id, identity: pid, label: pid.fullName, detail: peerDetail(id, peer), cards: compatible ? (peerCardMetadata.get(id) || new Map()) : new Map(), compatibility: peer.compatibility };
+      return { id, identity: pid, label: pid.fullName, detail: peerStatusDetail(id, peer), cards: compatible ? (peerCardMetadata.get(id) || new Map()) : new Map(), compatibility: peer.compatibility };
     })
   ];
 
   for (const row of rows) {
     const el = document.createElement('div');
     el.className = `peer-row peer-user-row${row.compatibility === 'incompatible' ? ' peer-incompatible' : ''}`;
-    const itemCount = row.cards?.size || 0;
-    el.innerHTML = `<div class="peer-row-main">${peerPillHtml(row.identity, 'peer-pill-sm')}<span class="peer-row-name">${escHtml(row.label)}</span><span class="spacer"></span><span class="token-modal-label peer-row-detail">${itemCount} card${itemCount === 1 ? '' : 's'} | ${escHtml(row.detail)}</span></div>${renderTransferStatus(transferStatusRowsForPeer(row.id))}${renderPeerCardMetadata(row.cards)}`;
+    const detailHtml = row.detail ? `<span class="spacer"></span><span class="token-modal-label peer-row-detail">${row.detail}</span>` : '';
+    el.innerHTML = `<div class="peer-row-main"><button class="peer-detail-trigger" type="button" data-peer-id="${escAttr(row.id)}" title="Show details">${peerPillHtml(row.identity, 'peer-pill-sm')}<span class="peer-row-name">${escHtml(row.label)}</span></button>${detailHtml}</div>${renderTransferStatus(transferStatusRowsForPeer(row.id))}${renderPeerCardMetadata(row.cards)}`;
+    el.querySelector('.peer-detail-trigger')?.addEventListener('click', () => openPeerDetailModal(row.id));
     list.appendChild(el);
   }
 
@@ -3175,6 +4228,7 @@ function showPendingReceiveProgress(itemId, senderId) {
 function closeAllModals() {
   closeTokenModal();
   closePeersModal();
+  closePeerDetailModal();
   closeClearModal();
   closeChatArchiveModal();
   closeChatClearModal();
@@ -3355,6 +4409,7 @@ async function applyEncryptedWithRememberedKey(msg) {
   const key = itemId ? cardEncryptionKeys.get(itemId) : null;
   if (!key) return false;
   await applyEncryptedMessage(msg.data, key, msg.senderId);
+  if (msg.senderId && connectedPeers.has(msg.senderId)) setPeerCompatibility(msg.senderId, 'compatible');
   return true;
 }
 
@@ -3493,7 +4548,7 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
     existing.encryptedMeta = { ...existing.encryptedMeta, ...meta };
     if (meta.addedAt) {
       existing.addedAt = meta.addedAt;
-      const timeEl = document.querySelector(`#card-${existing.id} .card-time`);
+      const timeEl = cardElement(existing.id)?.querySelector('.card-time');
       if (timeEl) timeEl.dataset.addedAt = meta.addedAt;
       refreshCardTimes();
     }
@@ -3530,7 +4585,7 @@ function connectDataWS() {
   };
   dataWs.onmessage = async e => {
     try {
-      if (e.data instanceof ArrayBuffer) handleBinaryMessage(e.data);
+      if (e.data instanceof ArrayBuffer) handleBinaryMessage(e.data, 'ws');
     } catch { }
   };
   dataWs.onclose = () => {
@@ -3560,6 +4615,7 @@ async function connectWS() {
   ws.onopen = () => {
     wsRetryDelay = 1000;
     setDot('connected');
+    loadWebRtcConfig().catch(() => {});
     publishKeyProof();
     publishPairingMode();
     publishClientMetrics();
@@ -3575,6 +4631,7 @@ async function connectWS() {
   };
   ws.onclose = () => {
     setDot('disconnected');
+    closeAllWebRtcPeers();
     stopMetricsPing();
     if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
     if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
@@ -3601,6 +4658,8 @@ function setPeerCompatibility(peerId, status) {
   const peer = connectedPeers.get(peerId);
   if (!peer) return;
   peer.compatibility = status;
+  if (status === 'compatible') ensureWebRtcPeer(peerId).catch(error => setWebRtcStartFailed(peerId, error));
+  else closeWebRtcPeer(peerId);
   const timer = peerCompatibilityTimers.get(peerId);
   if (timer) {
     clearTimeout(timer);
@@ -3661,6 +4720,8 @@ async function handleServerMessage(msg) {
     clientCount = msg.peerCount + 1;
     connectedPeers.clear();
     peerCardMetadata.clear();
+    roomManifest.clear();
+    manifestRevisions.clear();
     peerCounter = 0;
     selfPeerInfo = { label: String(msg.selfPeerNumber || 1), ip: msg.clientIp || '' };
     Object.assign(selfClientMetrics, normalizeClientMetrics({ ...selfClientMetrics, ...(msg.metrics || {}) }));
@@ -3700,6 +4761,7 @@ async function handleServerMessage(msg) {
     armRecoveryTimersForIncompleteReceives();
   } else if (msg.type === 'peer_left') {
     clientCount = Math.max(1, clientCount - 1);
+    closeWebRtcPeer(msg.clientId);
     connectedPeers.delete(msg.clientId);
     const timer = peerCompatibilityTimers.get(msg.clientId);
     if (timer) clearTimeout(timer);
@@ -3755,10 +4817,39 @@ async function handleServerMessage(msg) {
     await applyKeyProof(msg);
   } else if (msg.type === 'pairing_hosts') {
     updatePairingHosts(msg.hosts || []);
+  } else if (msg.type === 'pairing_rejected') {
+    showToast(`${peerDisplayName(msg.activeHostId, msg.activeHostPeerNumber)} is already in pairing mode`);
+    if (msg.activeHostId) {
+      updatePairingHosts([{
+        clientId: msg.activeHostId,
+        peerNumber: msg.activeHostPeerNumber,
+        pairingVersion: 'speke-v1',
+        expiresAt: Date.now() + Math.max(0, Number(msg.retryAfterMs) || 0),
+        pairingWindowExpiresAt: Date.now() + Math.max(0, Number(msg.pairingWindowRetryAfterMs || msg.retryAfterMs) || 0),
+      }]);
+    }
+    stopPairingMode({ all: true });
+  } else if (msg.type === 'pairing_host_removed') {
+    showToast(msg.reason === 'unused_pin_limit' ? 'Pairing timed out' : 'Pairing stopped by server');
+    updatePairingHosts([]);
+    closeTokenModal();
+    stopPairingMode({ all: true });
+  } else if (msg.type === 'pairing_rate_limited') {
+    const seconds = Math.max(1, Math.ceil((Number(msg.retryAfterMs) || 0) / 1000));
+    pairingJoinFailed(`Wait ${seconds}s before trying again`);
   } else if (msg.type === 'pairing_request') {
     await answerPairingRequest(msg);
   } else if (msg.type === 'pairing_response') {
     await handlePairingJoinMessage(msg);
+  } else if (msg.type === 'pairing_confirm') {
+    const expectedSenderId = pairingHostPendingRequests.get(msg.requestId);
+    if (expectedSenderId && expectedSenderId === msg.senderId) {
+      pairingHostPendingRequests.delete(msg.requestId);
+      pairingCurrentPinUsed = true;
+      pairingUnusedPinCount = 0;
+      showToast(`${peerDisplayName(msg.senderId)} paired successfully`);
+      await rotatePairingPin();
+    }
   } else if (msg.type === 'encrypted') {
     if (msg.meta?.payloadType === 'item_deleted') {
       forgetPeerCardMetadata(msg.senderId, msg.meta.itemId);
@@ -3766,6 +4857,7 @@ async function handleServerMessage(msg) {
     if (encryptionKey) {
       try {
         await applyEncryptedMessage(msg.data, encryptionKey, msg.senderId);
+        if (msg.senderId && connectedPeers.has(msg.senderId)) setPeerCompatibility(msg.senderId, 'compatible');
         if (msg.meta?.itemId) cardEncryptionKeys.set(msg.meta.itemId, encryptionKey);
       } catch {
         try {
@@ -3796,7 +4888,9 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
     (payload.items || []).forEach(item => {
       if (!items.has(item.id)) {
         if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
-        items.set(item.id, markEncrypted(item));
+        const normalized = markEncrypted(item);
+        items.set(item.id, normalized);
+        if (canPublishCardHolder(normalized)) publishClientCardMetadata(normalized);
       }
     });
     renderAll();
@@ -3820,6 +4914,7 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
       items.set(item.id, item);
       prependCard(item);
       updateEmpty();
+      if (canPublishCardHolder(item)) publishClientCardMetadata(item);
       if (expectsIncomingChunks(item)) showPendingReceiveProgress(item.id, senderId);
     }
 
@@ -3847,11 +4942,17 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
     const item = items.get(payload.itemId);
     if (!item || item.type !== 'text') return;
     item.content = payload.content;
-    const el = document.querySelector(`#card-${payload.itemId} .text-content`);
+    const el = cardElement(payload.itemId)?.querySelector('.text-content');
     if (el && document.activeElement !== el) el.innerHTML = linkify(payload.content);
 
   } else if (payload.type === 'chunk_ack') {
     handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
+  } else if (payload.type === 'webrtc_offer') {
+    handleWebRtcOffer(payload, senderId);
+  } else if (payload.type === 'webrtc_answer') {
+    handleWebRtcAnswer(payload, senderId);
+  } else if (payload.type === 'webrtc_ice') {
+    handleWebRtcIce(payload, senderId);
   } else if (payload.type === 'chat_line') {
     appendChatMessage(payload.message);
   } else if (payload.type === 'chat_reaction') {
@@ -3953,7 +5054,7 @@ function createTextCard() {
   const item = { id: randomUUID(), type: 'text', content: '', addedAt: Date.now() };
   addAndBroadcast(item);
   requestAnimationFrame(() => {
-    const el = document.querySelector(`#card-${item.id} .text-content`);
+    const el = cardElement(item.id)?.querySelector('.text-content');
     if (el) el.focus();
   });
 }
@@ -4066,14 +5167,15 @@ function makeOutboundProgress(itemId, trackKey, resendMissing = null) {
       if (Number.isFinite(currentChunk)) p.currentChunk = Number(currentChunk) + 1;
     }
     updateOutboundRow(itemId, trackKey, p?.sent ?? sent, total);
-    publishTransferStatus({
-      itemId,
-      sourceId: clientId,
-      targetId: trackKey,
-      current: p?.currentChunk || currentChunk || sent,
-      done: p?.sent ?? sent,
-      total,
-    });
+  publishTransferStatus({
+    itemId,
+    sourceId: clientId,
+    targetId: trackKey,
+    current: p?.currentChunk || currentChunk || sent,
+    done: p?.sent ?? sent,
+    total,
+    transport: p?.transport || '',
+  });
     if (p) finishOutboundPeerIfComplete(itemId, trackKey, p);
   };
 }
@@ -4143,6 +5245,7 @@ function finishOutboundPeerIfComplete(itemId, peerId, progress) {
     current: progress.total,
     done: progress.total,
     total: progress.total,
+    transport: progress.transport || '',
     status: 'done',
     force: true,
   });
@@ -4151,6 +5254,7 @@ function finishOutboundPeerIfComplete(itemId, peerId, progress) {
     const pm = outboundTransfers.get(itemId);
     if (pm) { pm.delete(peerId); if (!pm.size) outboundTransfers.delete(itemId); }
     refreshOutboundUI(itemId);
+    schedulePeersModalRefresh();
     updateSendWakeLock();
   }, 1500);
 }
@@ -4193,8 +5297,6 @@ function markOutboundInitialDone(itemId, peerIds) {
 
 async function sendEncryptedBinaryChunk(item, key, targetId, chunkIndex, totalChunks) {
   if (!items.has(item.id) || !item.rawBuffer) return false;
-  if (!await waitForDataWS()) return false;
-  await drainWS();
   const start = chunkIndex * BINARY_CHUNK_SIZE;
   const chunkBytes = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -4211,9 +5313,15 @@ async function sendEncryptedBinaryChunk(item, key, targetId, chunkIndex, totalCh
   frame.set(headerBytes, 4);
   frame.set(payload, 4 + headerBytes.length);
 
+  if (targetId && webRtcChannelOpen(targetId) && await sendWebRtcBinaryFrame(targetId, frame)) {
+    return 'webrtc';
+  }
+
+  if (!await waitForDataWS()) return false;
+  await drainWS();
   if (dataWs && dataWs.readyState === WebSocket.OPEN) {
     dataWs.send(frame.buffer);
-    return true;
+    return 'ws';
   }
   return false;
 }
@@ -4234,18 +5342,41 @@ async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgres
   const chunkIndexes = normalizeChunkIndexes(requestedChunks, totalChunks) || Array.from({ length: totalChunks }, (_, i) => i);
   if (targetId) seedContinuationProgress(item.id, targetId, totalChunks, requestedChunks);
   onProgress(0, totalChunks); // initialise outbound row; bar advances via ACKs
-  logUploadStart(item.id, targetId, totalChunks);
+  logUploadStart(item.id, targetId, totalChunks, targetId && webRtcChannelOpen(targetId) ? 'webrtc' : '');
 
   for (const i of chunkIndexes) {
     if (!items.has(item.id)) return;
-    const sent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
+    let sent = false;
+    let chunkTransport = '';
+    if (targetId) {
+      sent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
+      const progress = outboundTransfers.get(item.id)?.get(targetId);
+      if (sent === 'webrtc' && progress) progress.transport = 'webrtc';
+      if (sent === 'webrtc') chunkTransport = 'webrtc';
+    } else {
+      const peers = [...connectedPeers.keys()];
+      if (!peers.length) sent = true;
+      else {
+        sent = true;
+        for (const peerId of peers) {
+          const peerSent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, peerId, i, totalChunks));
+          const progress = outboundTransfers.get(item.id)?.get(peerId);
+          if (peerSent === 'webrtc' && progress) progress.transport = 'webrtc';
+          if (peerSent === 'webrtc') chunkTransport = 'webrtc';
+          if (!peerSent) sent = false;
+        }
+      }
+    }
     if (!sent) return;
-    logUploadChunk(item.id, i, totalChunks, targetId);
+    logUploadChunk(item.id, i, totalChunks, targetId, chunkTransport);
     yield;
   }
   if (targetId) markOutboundInitialDone(item.id, [targetId]);
   else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
-  logUploadDone(item.id, targetId);
+  const doneTransport = targetId
+    ? outboundTransfers.get(item.id)?.get(targetId)?.transport
+    : [...(outboundTransfers.get(item.id)?.values() || [])].some(progress => progress.transport === 'webrtc') ? 'webrtc' : '';
+  logUploadDone(item.id, targetId, doneTransport);
 }
 
 function sendFileChunksBinaryEncrypted(item, key, targetId, requestedChunks = null) {
@@ -4283,6 +5414,7 @@ function sendFileChunksBinaryEncrypted(item, key, targetId, requestedChunks = nu
         current: p?.currentChunk || sent,
         done: p?.sent ?? sent,
         total,
+        transport: p?.transport || '',
       });
     }
   };
@@ -4293,7 +5425,7 @@ function sendFileChunksBinaryEncrypted(item, key, targetId, requestedChunks = nu
 
 // ── Chunked file receiving (binary path) ────────────────────────────
 
-function handleBinaryMessage(buffer) {
+function handleBinaryMessage(buffer, transport = 'ws') {
   if (buffer.byteLength < 4) return;
   const view = new DataView(buffer);
   const headerLen = view.getUint32(0, false);
@@ -4322,7 +5454,7 @@ function handleBinaryMessage(buffer) {
     }
     crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(payload, 0, 12) }, key, payload.slice(12))
       .then(plain => {
-        const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, plain, sid);
+        const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, plain, sid, transport);
         sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
       })
       .catch(() => {
@@ -4369,7 +5501,7 @@ function handleChunkAck(itemId, totalChunks, peerId, receivedChunks, chunkIndex)
   finishOutboundPeerIfComplete(itemId, peerId, p);
 }
 
-function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, senderId) {
+function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, senderId, transport = '') {
   if (!isValidChunkSet(chunkIndex, totalChunks)) {
     debugLog('chunk-invalid', { itemId, chunkIndex, totalChunks, path: 'binary-receive' });
     return 0;
@@ -4381,10 +5513,11 @@ function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, sen
   }
   const t = binaryTransfers.get(itemId);
   if (senderId) t.senderId = senderId;
+  if (transport === 'webrtc') t.transport = 'webrtc';
   t.currentChunk = chunkIndex + 1;
   if (t.chunks[chunkIndex] === null) {
-    logDownloadSourceStart(itemId, senderId || t.senderId, totalChunks);
-    logDownloadChunk(itemId, chunkIndex, totalChunks, senderId || t.senderId);
+    logDownloadSourceStart(itemId, senderId || t.senderId, totalChunks, transport);
+    logDownloadChunk(itemId, chunkIndex, totalChunks, senderId || t.senderId, transport);
     t.chunks[chunkIndex] = chunkBuffer;
     t.chunkSources[chunkIndex] = senderId || t.senderId || '';
     t.received++;
@@ -4392,8 +5525,23 @@ function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, sen
   continueChunkRequestBatch(itemId, chunkIndex, senderId || t.senderId);
   updateTransferProgress(itemId, t.received / t.totalChunks, t);
   if (t.received === t.totalChunks) {
-    logDownloadDone(itemId, t.chunkSources);
+    logDownloadDone(itemId, t.chunkSources, t.transport || '');
+    if (t.senderId) {
+      publishTransferStatus({
+        itemId,
+        sourceId: t.senderId,
+        targetId: clientId,
+        current: t.totalChunks,
+        done: t.totalChunks,
+        total: t.totalChunks,
+        chunkRuns: transferChunkRunsFromSources(t.chunkSources, t.totalChunks),
+        transport: t.transport || '',
+        status: 'done',
+        force: true,
+      });
+    }
     binaryTransfers.delete(itemId);
+    schedulePeersModalRefresh();
     clearAutomaticDownloadRetry(itemId);
     downloadSourceRetryAttempts.delete(itemId);
     pendingDownloadSourceIds.delete(itemId);
@@ -4421,8 +5569,11 @@ async function finalizeTransferBinary(itemId, chunks, startTime = Date.now()) {
 }
 
 function updateTransferProgress(itemId, fraction, transfer) {
-  const card = document.getElementById('card-' + itemId);
-  if (!card) return;
+  const card = cardElement(itemId);
+  if (!card) {
+    schedulePeersModalRefresh();
+    return;
+  }
   const pct = transferPercent(fraction);
 
   let section = card.querySelector('.inbound-progress');
@@ -4433,8 +5584,8 @@ function updateTransferProgress(itemId, fraction, transfer) {
     section.innerHTML = `<div class="outbound-progress-title">Receiving...</div>
 <div class="outbound-peer-row">
   <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml(sourceIds, 'transfer-peer-icons-inline')}</div>
-  <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="ib-fill-${itemId}" style="width:0%"></div></div>
-  <span class="outbound-peer-eta" id="ib-eta-${itemId}">0%</span>
+  <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="${escAttr('ib-fill-' + itemId)}" style="width:0%"></div></div>
+  <span class="outbound-peer-eta" id="${escAttr('ib-eta-' + itemId)}">0%</span>
 </div>`;
     card.insertBefore(section, card.querySelector('.card-footer'));
     requestAnimationFrame(() => requestAnimationFrame(() => section.classList.add('ip-visible')));
@@ -4456,6 +5607,7 @@ function updateTransferProgress(itemId, fraction, transfer) {
       done: transfer.received || 0,
       total: transfer.totalChunks || 0,
       chunkRuns: transferChunkRunsFromSources(transfer.chunkSources, transfer.totalChunks),
+      transport: transfer.transport || '',
       status: pct >= 100 ? 'done' : 'active',
       force: pct >= 100,
     });
@@ -4479,7 +5631,7 @@ function transferPercentFromCounts(done, total) {
 }
 
 function refreshOutboundUI(itemId) {
-  const card = document.getElementById('card-' + itemId);
+  const card = cardElement(itemId);
   if (!card) return;
   const peerMap = outboundTransfers.get(itemId);
   const existing = card.querySelector('.outbound-progress');
@@ -4498,8 +5650,8 @@ function refreshOutboundUI(itemId) {
     const pct = transferPercentFromCounts(p.sent, p.total);
     html += `<div class="outbound-peer-row">
       <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml([key], 'transfer-peer-icons-inline')}</div>
-      <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="ob-fill-${itemId}-${key}" style="width:${pct}%"></div></div>
-      <span class="outbound-peer-eta" id="ob-eta-${itemId}-${key}">${pct}%</span>
+      <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="${escAttr(`ob-fill-${itemId}-${key}`)}" style="width:${pct}%"></div></div>
+      <span class="outbound-peer-eta" id="${escAttr(`ob-eta-${itemId}-${key}`)}">${pct}%</span>
     </div>`;
   }
   section.innerHTML = html;
@@ -4618,7 +5770,7 @@ function prependCard(item) {
 }
 
 function finalizeCardInPlace(item) {
-  const card = document.getElementById('card-' + item.id);
+  const card = cardElement(item.id);
   if (!card) return;
 
   const body = card.querySelector('.card-body');
@@ -4644,8 +5796,13 @@ function finalizeCardInPlace(item) {
   if (footer && !footer.querySelector('[title="Download"]')) {
     const deleteBtn = footer.querySelector('[title="Delete"]');
     if (deleteBtn) {
-      deleteBtn.insertAdjacentHTML('beforebegin',
-        `<button class="btn-icon" title="Download" onclick="downloadItem('${item.id}')"><i data-lucide="download"></i></button>`);
+      const downloadBtn = document.createElement('button');
+      downloadBtn.className = 'btn-icon';
+      downloadBtn.title = 'Download';
+      downloadBtn.type = 'button';
+      downloadBtn.innerHTML = '<i data-lucide="download"></i>';
+      downloadBtn.addEventListener('click', () => downloadItem(item.id));
+      deleteBtn.before(downloadBtn);
     }
   }
 
@@ -4695,12 +5852,9 @@ function buildCard(item) {
 
   if (item.type === 'text') {
     bodyHtml = `<div class="card-text">
-  <div class="text-content" contenteditable="true" spellcheck="false"
-       oninput="onTextEdit('${item.id}', this)"
-       onfocus="onTextFocus('${item.id}', this)"
-       onblur="onTextBlur('${item.id}', this)">${linkify(item.content)}</div>
+  <div class="text-content" contenteditable="true" spellcheck="false">${linkify(item.content)}</div>
 </div>`;
-    footerActions = `<button class="btn-icon" title="Copy" onclick="copyText('${item.id}')"><i data-lucide="copy"></i></button>`;
+    footerActions = `<button class="btn-icon" title="Copy" type="button" data-card-action="copy"><i data-lucide="copy"></i></button>`;
 
   } else if (item.type === 'image' && item.thumbnailDataUrl && !item.dataUrl) {
     bodyHtml = imageCardHtml(item, item.thumbnailDataUrl);
@@ -4714,7 +5868,7 @@ function buildCard(item) {
     } else {
       bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
     }
-    footerActions = `<button class="btn-icon" title="Download" onclick="downloadItem('${item.id}')"><i data-lucide="download"></i></button>`;
+    footerActions = `<button class="btn-icon" title="Download" type="button" data-card-action="download"><i data-lucide="download"></i></button>`;
 
   } else {
     bodyHtml = `<div class="card-file">${fileTypeIcon(item.mimeType)}${fileMetaHtml(item)}</div>`;
@@ -4727,10 +5881,23 @@ function buildCard(item) {
 <div class="card-footer">
   <span class="card-time" data-added-at="${addedAt}"><span class="card-time-text">${timeAgo(addedAt)}</span></span>
   ${footerActions}
-  <button class="btn-icon" title="Delete" onclick="deleteItem('${item.id}')"><i data-lucide="trash-2"></i></button>
+  <button class="btn-icon" title="Delete" type="button" data-card-action="delete"><i data-lucide="trash-2"></i></button>
 </div>`;
 
+  bindCardEvents(card, item.id);
   return card;
+}
+
+function bindCardEvents(card, itemId) {
+  const text = card.querySelector('.text-content');
+  if (text) {
+    text.addEventListener('input', () => onTextEdit(itemId, text));
+    text.addEventListener('focus', () => onTextFocus(itemId, text));
+    text.addEventListener('blur', () => onTextBlur(itemId, text));
+  }
+  card.querySelector('[data-card-action="copy"]')?.addEventListener('click', () => copyText(itemId));
+  card.querySelector('[data-card-action="download"]')?.addEventListener('click', () => downloadItem(itemId));
+  card.querySelector('[data-card-action="delete"]')?.addEventListener('click', () => deleteItem(itemId));
 }
 
 function updateEmpty() {

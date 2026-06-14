@@ -33,7 +33,7 @@
       </div>
       <div class="token-field" id="start-pin-field">
         <label for="pin-input">PIN</label>
-        <input id="pin-input" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="12345678" maxlength="8" autocomplete="off"
+        <input id="pin-input" class="pin-input" type="text" inputmode="numeric" pattern="[0-9 ]*" placeholder="1234 5678" maxlength="9" autocomplete="off"
           spellcheck="false">
         <p id="pin-error" class="pin-error-msg" style="display:none"></p>
       </div>
@@ -42,10 +42,10 @@
         <div class="pairing-pin-row">
           <div class="pairing-pin">
             <div class="pairing-pin-value" id="start-pin-value"></div>
-          </div>
-          <div class="pairing-pin-side">
-            <span class="pairing-spinner" aria-hidden="true"></span>
-            <div class="pairing-pin-time" id="start-pin-time"></div>
+            <div class="pairing-pin-side">
+              <span class="pairing-spinner" aria-hidden="true"></span>
+              <div class="pairing-pin-time" id="start-pin-time"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -71,7 +71,7 @@
   <!-- Main app -->
   <div id="app">
     <header>
-      <div class="logo">Clip<span>Share</span></div>
+      <button class="logo logo-button" id="header-logo" type="button" title="Double-click to export diagnostics">Clip<span>Share</span></button>
       <div class="token-group">
         <div class="token-chip" id="header-token" title="Share token"></div>
         <div class="ws-dot" id="ws-dot" title="Disconnected"></div>
@@ -149,17 +149,24 @@
         </div>
       </div>
       <div class="token-modal-row">
-        <div class="token-modal-field">
-          <div class="token-modal-label">Pairing PIN</div>
+        <div class="token-modal-field" id="modal-pairing-field">
+          <div class="token-modal-label" id="modal-pairing-label">Pairing PIN</div>
           <div class="pairing-pin-row" id="modal-pairing-pin" style="display:none">
             <div class="pairing-pin pairing-pin-compact">
               <div class="pairing-pin-value" id="modal-pin-value"></div>
-            </div>
-            <div class="pairing-pin-side">
-              <span class="pairing-spinner" aria-hidden="true"></span>
-              <span id="modal-pin-time" class="pairing-pin-time"></span>
+              <div class="pairing-pin-side">
+                <span class="pairing-spinner" aria-hidden="true"></span>
+                <span id="modal-pin-time" class="pairing-pin-time"></span>
+              </div>
             </div>
           </div>
+          <div class="remote-pairing-field" id="modal-remote-pairing" style="display:none">
+            <div class="remote-pairing-row">
+              <span class="pairing-spinner" aria-hidden="true"></span>
+              <span class="pairing-pin-time" id="modal-remote-pairing-time"></span>
+            </div>
+          </div>
+          <button class="btn-secondary start-pairing-btn" id="modal-start-pairing" type="button" style="display:none">Start pairing</button>
         </div>
       </div>
       <div class="token-modal-qr">
@@ -183,6 +190,15 @@
         <button class="btn-icon" id="peers-modal-close" title="Close"><i data-lucide="x"></i></button>
       </div>
       <div class="peer-list" id="peers-list"></div>
+    </div>
+  </div>
+  <div id="peer-detail-modal" class="confirm-modal" aria-hidden="true">
+    <div class="confirm-card peer-detail-card" role="dialog" aria-modal="true" aria-labelledby="peer-detail-title">
+      <div class="token-modal-head">
+        <div class="confirm-title" id="peer-detail-title">User Details</div>
+        <button class="btn-icon" id="peer-detail-modal-close" title="Close"><i data-lucide="x"></i></button>
+      </div>
+      <div class="peer-detail-body" id="peer-detail-body"></div>
     </div>
   </div>
   <div id="clear-modal" class="confirm-modal" aria-hidden="true">

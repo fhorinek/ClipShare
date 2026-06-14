@@ -1,0 +1,15 @@
+[Unit]
+Description=ClipShare app with bundled TURN/STUN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ClipShare
+ExecStart=/root/ClipShare/run.sh
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
