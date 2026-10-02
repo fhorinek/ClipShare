@@ -5714,6 +5714,25 @@ function flushTextUpdate(id) {
   wsSend({ type: 'relay', payload: { type: 'item_updated', itemId: id, content: item.content } }, cardEncryptionKeys.get(id));
 }
 
+function textContentLinkFromEvent(event, textEl) {
+  const link = event.target?.closest?.('a[href]');
+  return link && textEl.contains(link) ? link : null;
+}
+
+function openTextContentLink(link) {
+  const opened = window.open(link.href, link.target || '_blank', 'noopener,noreferrer');
+  if (opened) opened.opener = null;
+}
+
+function handleTextContentLinkActivation(event, textEl) {
+  const link = textContentLinkFromEvent(event, textEl);
+  if (!link) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  openTextContentLink(link);
+  return true;
+}
+
 // ── Delete with animation ─────────────────────────────────────────────
 function removeCardAnimated(id, done) {
   const el = document.getElementById('card-' + id);
@@ -5891,6 +5910,27 @@ function buildCard(item) {
 function bindCardEvents(card, itemId) {
   const text = card.querySelector('.text-content');
   if (text) {
+    let linkPointerType = '';
+    text.addEventListener('pointerdown', event => {
+      if (!textContentLinkFromEvent(event, text)) return;
+      linkPointerType = event.pointerType || 'mouse';
+      event.preventDefault();
+    });
+    text.addEventListener('pointerup', event => {
+      if (linkPointerType !== 'touch' && linkPointerType !== 'pen') return;
+      linkPointerType = '';
+      handleTextContentLinkActivation(event, text);
+    });
+    text.addEventListener('click', event => {
+      if (linkPointerType === 'touch' || linkPointerType === 'pen') {
+        linkPointerType = '';
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      linkPointerType = '';
+      handleTextContentLinkActivation(event, text);
+    });
     text.addEventListener('input', () => onTextEdit(itemId, text));
     text.addEventListener('focus', () => onTextFocus(itemId, text));
     text.addEventListener('blur', () => onTextBlur(itemId, text));
