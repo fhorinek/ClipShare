@@ -1,0 +1,11 @@
+{
+  "name": "clipshare",
+  "private": true,
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/transfer-core.test.cjs",
+    "test:browser": "node tests/transfer-browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

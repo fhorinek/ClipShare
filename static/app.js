@@ -1,20 +1,11 @@
 // ── Utilities ────────────────────────────────────────────────────────
-const CLIENT_DIAGNOSTIC_BUILD = 'webrtc-existing-fix-v4';
+const CLIENT_DIAGNOSTIC_BUILD = 'transfer-coordinator-v2';
 
 function randomUUID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c =>
     (+c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> +c / 4).toString(16)
   );
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
 }
 
 function humanSize(bytes) {
@@ -590,11 +581,6 @@ function isGeneratedPasskey(value) {
     && /^[A-Za-z0-9]+$/.test(value);
 }
 
-function storedOrNewPasskey() {
-  const saved = localStorage.getItem('clipshare_passphrase') || '';
-  return isGeneratedPasskey(saved) ? saved : generatePassphrase();
-}
-
 function tokenFromPath() {
   const seg = decodeURIComponent(location.pathname || '/').replace(/^\/+|\/+$/g, '');
   return normalizeToken(seg);
@@ -796,8 +782,6 @@ function itemDiagnosticMeta(item) {
     hasRawBuffer: !!item.rawBuffer,
     hasDataUrl: !!item.dataUrl,
     hasThumbnail: !!item.thumbnailDataUrl,
-    receivedEncryptedChunks: item.receivedEncryptedChunks || 0,
-    totalEncryptedChunks: item.totalEncryptedChunks || 0,
   };
 }
 
@@ -863,7 +847,7 @@ function outboundDiagnosticRecord(progress) {
 async function buildDiagnosticSnapshot() {
   const config = await loadWebRtcConfig();
   await startWebRtcForCompatiblePeers();
-  await sleep(150);
+  await new Promise(resolve => setTimeout(resolve, 150));
   const imap = buildPeerIdentityMap();
   return {
     kind: 'clipshare-diagnostic-v1',
@@ -926,12 +910,7 @@ async function buildDiagnosticSnapshot() {
       incoming: mapObject(binaryTransfers, transferDiagnosticRecord),
       outbound: mapObject(outboundTransfers, peerMap => mapObject(peerMap, outboundDiagnosticRecord)),
       remoteStatuses: [...remoteTransferStatuses.values()],
-      pendingDownloadSourceIds: mapObject(pendingDownloadSourceIds),
-      pendingDownloadTriedSources: mapObject(pendingDownloadTriedSources, setArray),
-      pendingChunkRequestBatches: mapObject(pendingChunkRequestBatches, batch => ({
-        sourceClientId: batch.sourceClientId,
-        chunks: setArray(batch.chunks),
-      })),
+      coordinator: transferCoordinator.snapshot(),
     },
     chat: {
       messageCount: chatMessages.length,
@@ -977,6 +956,9 @@ function isEditableTarget(el) {
 // ── State ───────────────────────────────────────────────────────────
 const clientId = randomUUID();
 let token = null;
+let roomGeneration = 0;
+let cardInputGeneration = 0;
+const deletedItemIds = new Set();
 let ws = null;
 let dataWs = null;
 let wsRetryDelay = 1000;
@@ -988,15 +970,32 @@ const chatMessages = [];
 let chatPanelOpen = false;
 let unreadChatCount = 0;
 let chatReplyTargetId = null;
-const binaryTransfers = new Map(); // itemId -> {chunks,received,totalChunks}
+let roomSnapshotReady = false;
+const pendingTextSync = new Set();
+const transferCoordinator = new ClipShareTransfers.TransferCoordinator({
+  clientId,
+  crypto: window.crypto,
+  uuid: randomUUID,
+  getItem: id => items.get(id),
+  getKey: id => cardEncryptionKeys.get(id) || encryptionKey,
+  sendControl: (peerId, payload, live) => wsSend({ type: 'relay', targetId: peerId, payload },
+    cardEncryptionKeys.get(payload.itemId) || encryptionKey, true, live),
+  sendFrame: sendTransferFrame,
+  commitFile: commitTransferredFile,
+  onIncoming: onIncomingTransfer,
+  onOutgoing: onOutgoingTransfer,
+  onActivity: () => { updateSendWakeLock(); schedulePeersModalRefresh(); },
+  onFailure: (id, reason) => {
+    disposeSharedItem(id, { deleted: false });
+    showToast(reason === 'interrupted' ? 'Transfer interrupted.' : reason === 'validation'
+      ? 'File validation failed.' : 'Transfer failed: sources did not respond.');
+  },
+  onError: error => debugLog('transfer-error', { error: error?.message || String(error) }),
+});
+const binaryTransfers = transferCoordinator.incoming;
+const outboundTransfers = transferCoordinator.outgoing;
 const editTimers = new Map();
 const BINARY_CHUNK_SIZE = 65536; // bytes per chunk
-const CHUNK_REQUEST_TARGET_BYTES = 1024 * 1024;
-const CHUNK_REQUEST_MAX_CHUNKS = Math.max(1, Math.floor(CHUNK_REQUEST_TARGET_BYTES / BINARY_CHUNK_SIZE));
-const CHUNK_RETRY_DELAY_MS = 1200;
-const CHUNK_RETRY_MAX_ATTEMPTS = 3;
-const MAX_TRANSFER_CHUNKS = Math.ceil((128 * 1024 * 1024) / BINARY_CHUNK_SIZE) + 1;
-const DOWNLOAD_SOURCE_RETRY_DELAY_MS = 2000;
 const METRICS_PING_INTERVAL_MS = 10000;
 const KEY_PROOF_TIMEOUT_MS = 3500;
 const WEBRTC_ICE_CONFIG_FALLBACK = { iceServers: [] };
@@ -1028,7 +1027,7 @@ const pairingHosts = new Map();
 let metricsPingTimer = null;
 let peersModalRefreshTimer = null;
 let openPeerDetailId = null;
-let pendingInitialSyncSources = null;
+
 const selfClientMetrics = {
   deviceType: detectDeviceType(),
   pingMs: null,
@@ -1377,11 +1376,11 @@ function chatCardDownloadState(cardId) {
   const id = String(cardId);
   const item = items.get(id);
   const transfer = binaryTransfers.get(id);
-  if (transfer?.totalChunks) {
-    const percent = Math.max(0, Math.min(100, Math.round((transfer.received || 0) / transfer.totalChunks * 100)));
+  if (transfer?.totalChunks && transfer.state !== 'complete') {
+    const percent = Math.max(0, Math.min(99, Math.round((transfer.received || 0) / transfer.totalChunks * 100)));
     return { pending: true, percent };
   }
-  if (expectsIncomingChunks(item) || transfer) return { pending: true, percent: 0 };
+  if (expectsIncomingChunks(item) || (transfer && transfer.state !== 'complete')) return { pending: true, percent: 0 };
   return { pending: false, percent: 100 };
 }
 
@@ -1746,32 +1745,23 @@ function archiveAndClearChat() {
   clearChat({ broadcast: true });
 }
 
-function sendChatHistory(targetClientId) {
-  if (!targetClientId || !chatMessages.length) return;
-  wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: [], chatMessages } });
-}
-
 // ── Transfer scheduling & outbound tracking ──────────────────────────
 const connectedPeers = new Map(); // peerId -> {label: string}
 const peerCardMetadata = new Map(); // peerId -> Map<itemId, metadata>
 const roomManifest = new Map(); // itemId -> {ownerId, revision, meta}
 const manifestRevisions = new Map();
 const peerCompatibilityTimers = new Map();
+const webRtcCreations = new Map();
 const webRtcPeers = new Map(); // peerId -> {pc, channel, state, initiator, heartbeatTimer, pendingCandidates}
 const webRtcStartTimers = new Map();
 let webRtcConfig = null;
 let webRtcConfigPromise = null;
 let selfPeerInfo = { label: '1', ip: '' };
 let peerCounter = 0;
-const outboundTransfers = new Map(); // itemId -> Map<trackKey, {sent,total,startTime}>
+
 const remoteTransferStatuses = new Map(); // transferKey -> transfer status from other clients
 const transferStatusPublishTimes = new Map();
-const downloadSourceRetryTimers = new Map();
-const downloadSourceRetryAttempts = new Map();
-const pendingDownloadSourceIds = new Map();
-const pendingDownloadTriedSources = new Map();
-const pendingChunkRequestBatches = new Map();
-const downloadLogSources = new Map();
+
 let sendWakeLock = null;
 let sendWakeLockRequest = null;
 
@@ -1917,16 +1907,14 @@ function scheduleWebRtcStart(peerId) {
   if (webRtcStartBlockReason(peerId)) return;
   const timer = setTimeout(() => {
     webRtcStartTimers.delete(peerId);
-    ensureWebRtcPeer(peerId)
-      .then(record => {
-        if (!record) setWebRtcStartFailed(peerId, new Error(webRtcStartBlockReason(peerId) || 'WebRTC peer creation returned no record'));
-      })
-      .catch(error => setWebRtcStartFailed(peerId, error));
+    ensureWebRtcPeer(peerId).catch(() => {});
   }, 0);
   webRtcStartTimers.set(peerId, timer);
 }
 
 function closeWebRtcPeer(peerId, state = 'unavailable') {
+  const creation = webRtcCreations.get(peerId);
+  if (creation) { creation.cancelled = true; webRtcCreations.delete(peerId); }
   const timer = webRtcStartTimers.get(peerId);
   if (timer) {
     clearTimeout(timer);
@@ -1945,6 +1933,8 @@ function closeWebRtcPeer(peerId, state = 'unavailable') {
 }
 
 function closeAllWebRtcPeers() {
+  for (const operation of webRtcCreations.values()) operation.cancelled = true;
+  webRtcCreations.clear();
   for (const peerId of [...webRtcPeers.keys()]) closeWebRtcPeer(peerId);
   for (const timer of webRtcStartTimers.values()) clearTimeout(timer);
   webRtcStartTimers.clear();
@@ -1973,42 +1963,15 @@ function sendWebRtcChannelJson(peerId, payload) {
   }
 }
 
-function webRtcChannelOpen(peerId) {
-  return webRtcPeers.get(peerId)?.channel?.readyState === 'open';
-}
-
-async function drainWebRtcChannel(peerId) {
-  const channel = webRtcPeers.get(peerId)?.channel;
-  if (!channel || channel.readyState !== 'open') return false;
-  const highWater = BINARY_CHUNK_SIZE * 2;
-  const start = Date.now();
-  while (channel.readyState === 'open' && channel.bufferedAmount > highWater) {
-    await sleep(8);
-    if (Date.now() - start > 10000) break;
-  }
-  return channel.readyState === 'open';
-}
-
-async function sendWebRtcBinaryFrame(peerId, frame) {
-  const channel = webRtcPeers.get(peerId)?.channel;
-  if (!channel || channel.readyState !== 'open') return false;
-  if (!await drainWebRtcChannel(peerId)) return false;
-  try {
-    channel.send(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
-    return true;
-  } catch (error) {
-    debugLog('webrtc-binary-send-failed', { peerId, error: error?.message || String(error) });
-    return false;
-  }
-}
-
-function handleWebRtcChannelMessage(peerId, event) {
+function handleWebRtcChannelMessage(peerId, event, live) {
   if (event.data instanceof ArrayBuffer) {
-    handleBinaryMessage(event.data, 'webrtc');
+    handleBinaryMessage(event.data, 'webrtc', peerId).catch(error => debugLog('binary-receive-error', { error: error.message }));
     return;
   }
   if (event.data instanceof Blob) {
-    event.data.arrayBuffer().then(buffer => handleBinaryMessage(buffer, 'webrtc')).catch(() => {});
+    event.data.arrayBuffer().then(buffer => {
+      if (live()) return handleBinaryMessage(buffer, 'webrtc', peerId);
+    }).catch(() => {});
     return;
   }
   let msg = null;
@@ -2031,6 +1994,7 @@ function attachWebRtcChannel(peerId, channel) {
   record.channel = channel;
   channel.binaryType = 'arraybuffer';
   channel.onopen = () => {
+    if (webRtcPeers.get(peerId) !== record || record.channel !== channel) return;
     setWebRtcPeerState(peerId, 'connected');
     sendWebRtcChannelJson(peerId, { type: 'webrtc_ping', sentAt: Date.now() });
     if (record.heartbeatTimer) clearInterval(record.heartbeatTimer);
@@ -2038,13 +2002,15 @@ function attachWebRtcChannel(peerId, channel) {
       sendWebRtcChannelJson(peerId, { type: 'webrtc_ping', sentAt: Date.now() });
     }, WEBRTC_HEARTBEAT_INTERVAL_MS);
   };
-  channel.onmessage = event => handleWebRtcChannelMessage(peerId, event);
+  const live = () => webRtcPeers.get(peerId) === record && record.channel === channel;
+  channel.onmessage = event => { if (live()) handleWebRtcChannelMessage(peerId, event, live); };
   channel.onclose = () => {
+    if (webRtcPeers.get(peerId) !== record || record.channel !== channel) return;
     if (record.heartbeatTimer) clearInterval(record.heartbeatTimer);
     record.heartbeatTimer = null;
     if (webRtcPeers.has(peerId) && webRtcPeerState(peerId) === 'connected') setWebRtcPeerState(peerId, 'connecting');
   };
-  channel.onerror = () => setWebRtcPeerState(peerId, 'failed');
+  channel.onerror = () => { if (webRtcPeers.get(peerId) === record && record.channel === channel) setWebRtcPeerState(peerId, 'failed'); };
 }
 
 async function addQueuedWebRtcCandidates(peerId) {
@@ -2052,19 +2018,38 @@ async function addQueuedWebRtcCandidates(peerId) {
   if (!record?.pc?.remoteDescription) return;
   const queued = record.pendingCandidates.splice(0);
   for (const candidate of queued) {
+    if (webRtcPeers.get(peerId) !== record) return;
     try { await record.pc.addIceCandidate(candidate); } catch { }
   }
 }
 
-async function ensureWebRtcPeer(peerId) {
+function ensureWebRtcPeer(peerId) {
+  const pending = webRtcCreations.get(peerId);
+  if (pending) return pending.promise;
+  const operation = { generation: roomGeneration, cancelled: false };
+  webRtcCreations.set(peerId, operation);
+  operation.promise = createWebRtcPeer(peerId, operation).catch(error => {
+    if (!operation.cancelled && operation.generation === roomGeneration
+      && webRtcCreations.get(peerId) === operation && !webRtcStartBlockReason(peerId)) {
+      setWebRtcStartFailed(peerId, error);
+    }
+    throw error;
+  }).finally(() => {
+    if (webRtcCreations.get(peerId) === operation) webRtcCreations.delete(peerId);
+  });
+  return operation.promise;
+}
+
+async function createWebRtcPeer(peerId, operation) {
   const startBlockReason = webRtcStartBlockReason(peerId);
   if (startBlockReason) throw new Error(startBlockReason);
   const peer = connectedPeers.get(peerId);
   const existing = webRtcPeers.get(peerId);
   if (existing?.pc && existing.pc.connectionState !== 'closed') return existing;
-  if (existing) closeWebRtcPeer(peerId, 'connecting');
+  if (existing) { try { existing.pc?.close(); } catch { } webRtcPeers.delete(peerId); }
 
   const config = await loadWebRtcConfig();
+  if (operation.cancelled || operation.generation !== roomGeneration || webRtcStartBlockReason(peerId)) return null;
   const pc = new RTCPeerConnection(config);
   const record = {
     pc,
@@ -2095,12 +2080,14 @@ async function ensureWebRtcPeer(peerId) {
   peer.webrtcState = 'connecting';
 
   pc.onicecandidate = event => {
+    if (webRtcPeers.get(peerId) !== record) return;
     if (event.candidate) {
       sendWebRtcSignal(peerId, { type: 'webrtc_ice', candidate: event.candidate.toJSON?.() || event.candidate });
     }
   };
-  pc.ondatachannel = event => attachWebRtcChannel(peerId, event.channel);
+  pc.ondatachannel = event => { if (webRtcPeers.get(peerId) === record) attachWebRtcChannel(peerId, event.channel); };
   pc.onconnectionstatechange = () => {
+    if (webRtcPeers.get(peerId) !== record) return;
     const state = pc.connectionState;
     if (state === 'connected') setWebRtcPeerState(peerId, 'connected');
     else if (state === 'failed' || state === 'disconnected') setWebRtcPeerState(peerId, 'failed');
@@ -2108,13 +2095,15 @@ async function ensureWebRtcPeer(peerId) {
     else setWebRtcPeerState(peerId, 'connecting');
   };
   pc.oniceconnectionstatechange = () => {
-    if (pc.iceConnectionState === 'failed') setWebRtcPeerState(peerId, 'failed');
+    if (webRtcPeers.get(peerId) === record && pc.iceConnectionState === 'failed') setWebRtcPeerState(peerId, 'failed');
   };
 
   if (record.initiator) {
     attachWebRtcChannel(peerId, pc.createDataChannel('clipshare-control', { ordered: true }));
     const offer = await pc.createOffer();
+    if (webRtcPeers.get(peerId) !== record || operation.cancelled) return null;
     await pc.setLocalDescription(offer);
+    if (webRtcPeers.get(peerId) !== record || operation.cancelled) return null;
     record.localDescriptionType = pc.localDescription?.type || '';
     sendWebRtcSignal(peerId, { type: 'webrtc_offer', sdp: pc.localDescription });
   }
@@ -2129,10 +2118,8 @@ function startWebRtcForCompatiblePeers() {
     .map(async ([peerId]) => {
       try {
         const record = await ensureWebRtcPeer(peerId);
-        if (!record) setWebRtcStartFailed(peerId, new Error(webRtcStartBlockReason(peerId) || 'WebRTC peer creation returned no record'));
         return record;
-      } catch (error) {
-        setWebRtcStartFailed(peerId, error);
+      } catch {
         return null;
       }
     }));
@@ -2142,20 +2129,25 @@ async function handleWebRtcOffer(payload, senderId) {
   if (!payload?.sdp || !senderId || senderId === clientId) return;
   const peer = connectedPeers.get(senderId);
   if (!peer || peer.compatibility !== 'compatible') return;
+  let record;
   try {
-    const record = await ensureWebRtcPeer(senderId);
-    if (!record?.pc) return;
+    record = await ensureWebRtcPeer(senderId);
+    if (!record?.pc || webRtcPeers.get(senderId) !== record) return;
     record.lastSignalReceivedAt = Date.now();
     record.lastSignalReceivedType = payload.type;
     await record.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    if (webRtcPeers.get(senderId) !== record) return;
     record.remoteDescriptionType = payload.sdp?.type || '';
     await addQueuedWebRtcCandidates(senderId);
+    if (webRtcPeers.get(senderId) !== record) return;
     const answer = await record.pc.createAnswer();
+    if (webRtcPeers.get(senderId) !== record) return;
     await record.pc.setLocalDescription(answer);
+    if (webRtcPeers.get(senderId) !== record) return;
     record.localDescriptionType = record.pc.localDescription?.type || '';
     sendWebRtcSignal(senderId, { type: 'webrtc_answer', sdp: record.pc.localDescription });
   } catch {
-    setWebRtcPeerState(senderId, 'failed');
+    if (record && webRtcPeers.get(senderId) === record) setWebRtcPeerState(senderId, 'failed');
   }
 }
 
@@ -2167,18 +2159,21 @@ async function handleWebRtcAnswer(payload, senderId) {
     record.lastSignalReceivedType = payload.type;
     if (!record.pc.remoteDescription) {
       await record.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      if (webRtcPeers.get(senderId) !== record) return;
       record.remoteDescriptionType = payload.sdp?.type || '';
       await addQueuedWebRtcCandidates(senderId);
     }
   } catch {
-    setWebRtcPeerState(senderId, 'failed');
+    if (record && webRtcPeers.get(senderId) === record) setWebRtcPeerState(senderId, 'failed');
   }
 }
 
 async function handleWebRtcIce(payload, senderId) {
+  if (!payload?.candidate || !senderId || connectedPeers.get(senderId)?.compatibility !== 'compatible') return;
+  let record;
   try {
-    const record = webRtcPeers.get(senderId) || await ensureWebRtcPeer(senderId);
-    if (!payload?.candidate || !record?.pc) return;
+    record = webRtcPeers.get(senderId) || await ensureWebRtcPeer(senderId);
+    if (!record?.pc || webRtcPeers.get(senderId) !== record) return;
     record.lastSignalReceivedAt = Date.now();
     record.lastSignalReceivedType = payload.type;
     record.iceCandidatesReceived = (record.iceCandidatesReceived || 0) + 1;
@@ -2189,7 +2184,7 @@ async function handleWebRtcIce(payload, senderId) {
     }
     await record.pc.addIceCandidate(candidate);
   } catch {
-    setWebRtcPeerState(senderId, 'failed');
+    if (record && webRtcPeers.get(senderId) === record) setWebRtcPeerState(senderId, 'failed');
   }
 }
 
@@ -2232,59 +2227,7 @@ function updateSendWakeLock() {
   else releaseSendWakeLock();
 }
 
-class ChunkScheduler {
-  constructor() {
-    this.queue = []; // [{itemId, priority, iter, cancelled}]
-    this.running = false;
-  }
-  enqueue(itemId, priority, makeIter) {
-    let cancelled = false;
-    const entry = {
-      itemId, priority,
-      iter: makeIter(),
-      get cancelled() { return cancelled; },
-      cancel() { cancelled = true; },
-    };
-    this.queue.push(entry);
-    this.queue.sort((a, b) => a.priority - b.priority);
-    this._run();
-    updateSendWakeLock();
-    return entry;
-  }
-  cancelItem(itemId) {
-    for (const e of this.queue) if (e.itemId === itemId) e.cancel();
-    updateSendWakeLock();
-  }
-  hasPending() {
-    return this.running || this.queue.some(e => !e.cancelled);
-  }
-  async _run() {
-    if (this.running) return;
-    this.running = true;
-    updateSendWakeLock();
-    try {
-      while (this.queue.length > 0) {
-        this.queue = this.queue.filter(e => !e.cancelled);
-        if (!this.queue.length) break;
-        this.queue.sort((a, b) => a.priority - b.priority);
-        const entry = this.queue[0];
-        try {
-          const result = await entry.iter.next();
-          if (result.done) this.queue.shift();
-        } catch (err) {
-          console.warn('Chunk send failed', err);
-          this.queue.shift();
-        }
-        await new Promise(r => setTimeout(r, 0));
-      }
-    } finally {
-      this.running = false;
-      if (this.queue.some(e => !e.cancelled)) this._run();
-      updateSendWakeLock();
-    }
-  }
-}
-const chunkScheduler = new ChunkScheduler();
+const chunkScheduler = transferCoordinator.scheduler;
 
 // ── Startup ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -2685,7 +2628,7 @@ function startPairingUiTimer() {
 
 function pairingSocketUrl(tokenValue) {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${location.host}/ws/${encodeURIComponent(tokenValue)}?clientId=${clientId}&channel=control`;
+  return `${protocol}://${location.host}/ws/${encodeURIComponent(tokenValue)}?clientId=${clientId}&channel=control&protocolVersion=2`;
 }
 
 function activePairingSocket() {
@@ -3072,6 +3015,11 @@ function enterAppWithToken(t) {
 function setToken(t) {
   token = normalizeToken(t);
   if (!token) return;
+  roomGeneration++;
+  deletedItemIds.clear();
+  transferCoordinator.disposeRoom();
+  roomSnapshotReady = false;
+  pendingTextSync.clear();
   localStorage.setItem('clipshare_token', token);
   history.replaceState({}, '', `/${encodeURIComponent(token)}`);
   document.body.classList.add('app-active');
@@ -3085,6 +3033,13 @@ function setToken(t) {
 }
 
 function leaveSpace() {
+  roomGeneration++;
+  cardInputGeneration++;
+  for (const id of [...items.keys()]) disposeSharedItem(id);
+  transferCoordinator.disposeRoom();
+  pendingTextSync.clear();
+  roomSnapshotReady = false;
+  deletedItemIds.clear();
   stopPairingMode({ all: true });
   resetPairingJoin();
   closeAllWebRtcPeers();
@@ -3105,21 +3060,15 @@ function leaveSpace() {
   toggleChatPanel(false);
   cardEncryptionKeys.clear();
   peerCardMetadata.clear();
+  connectedPeers.clear();
+  for (const timer of peerCompatibilityTimers.values()) clearTimeout(timer);
+  peerCompatibilityTimers.clear();
+  encryptionKey = null;
+  encryptionEnabled = false;
   roomManifest.clear();
   manifestRevisions.clear();
-  binaryTransfers.clear();
-  clearAllOutboundRetries();
-  outboundTransfers.clear();
   remoteTransferStatuses.clear();
   transferStatusPublishTimes.clear();
-  for (const timer of downloadSourceRetryTimers.values()) clearTimeout(timer);
-  downloadSourceRetryTimers.clear();
-  downloadSourceRetryAttempts.clear();
-  pendingDownloadSourceIds.clear();
-  pendingDownloadTriedSources.clear();
-  pendingChunkRequestBatches.clear();
-  downloadLogSources.clear();
-  pendingInitialSyncSources = null;
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   clientCount = 0;
@@ -3193,6 +3142,8 @@ function cardMetadataFromItem(item) {
     filename: item.filename,
     mimeType: item.mimeType,
     size: item.size,
+    chunkSize: item.chunkSize,
+    totalChunks: item.totalChunks,
     addedAt: item.addedAt,
     encrypted: !!item.encrypted,
     thumbnailDataUrl: item.thumbnailDataUrl,
@@ -3218,95 +3169,6 @@ function debugLog(event, details = {}) {
     token,
     ...details,
   });
-}
-
-function downloadLogFileLabel(itemId) {
-  return transferItemTitle(itemId) || String(itemId || 'file');
-}
-
-function downloadLogSourceLabel(sourceId) {
-  return buildPeerIdentityMap().get(sourceId)?.fullName || (sourceId ? `Peer ${String(sourceId).slice(0, 8)}` : 'Unknown source');
-}
-
-function uploadLogTargetLabel(targetId) {
-  return targetId ? downloadLogSourceLabel(targetId) : 'Broadcast';
-}
-
-function transferLogPrefix(base, transport = '') {
-  return `${base}${transport === 'webrtc' ? '+' : ''}`;
-}
-
-function logDownloadSourceStart(itemId, sourceId, totalChunks, transport = '') {
-  if (!itemId || !sourceId) return;
-  if (!downloadLogSources.has(itemId)) downloadLogSources.set(itemId, new Set());
-  const sources = downloadLogSources.get(itemId);
-  if (sources.has(sourceId)) return;
-  sources.add(sourceId);
-  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunks ${downloadLogSourceLabel(sourceId)} start`, {
-    chunks: totalChunks || 0,
-  });
-}
-
-function logDownloadChunk(itemId, chunkIndex, totalChunks, sourceId, transport = '') {
-  if (!itemId || !sourceId || !Number.isFinite(chunkIndex)) return;
-  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${downloadLogSourceLabel(sourceId)}`);
-}
-
-function logDownloadDone(itemId, sourceIds = [], transport = '') {
-  const names = [...new Set(sourceIds.filter(Boolean).map(downloadLogSourceLabel))];
-  console.log(`${transferLogPrefix('DN', transport)} ${downloadLogFileLabel(itemId)} chunks ${names.join(' + ') || 'Unknown source'} done`);
-  downloadLogSources.delete(itemId);
-}
-
-function logUploadStart(itemId, targetId, totalChunks, transport = '') {
-  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} start`, {
-    chunks: totalChunks || 0,
-  });
-}
-
-function logUploadChunk(itemId, chunkIndex, totalChunks, targetId, transport = '') {
-  if (!itemId || !Number.isFinite(chunkIndex)) return;
-  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunk ${chunkIndex + 1}/${totalChunks || '?'} ${uploadLogTargetLabel(targetId)}`);
-}
-
-function logUploadDone(itemId, targetId, transport = '') {
-  console.log(`${transferLogPrefix('UP', transport)} ${downloadLogFileLabel(itemId)} chunks ${uploadLogTargetLabel(targetId)} done`);
-}
-
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32Bytes(bytes) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function isValidChunkIndex(index, totalChunks) {
-  return Number.isInteger(index) && index >= 0 && index < totalChunks;
-}
-
-function isValidChunkSet(chunkIndex, totalChunks) {
-  return Number.isInteger(totalChunks)
-    && totalChunks > 0
-    && totalChunks <= MAX_TRANSFER_CHUNKS
-    && isValidChunkIndex(chunkIndex, totalChunks);
-}
-
-function normalizeChunkIndexes(indexes, totalChunks) {
-  if (!Array.isArray(indexes) || !Number.isFinite(totalChunks)) return null;
-  const unique = [...new Set(indexes.map(Number).filter(index => isValidChunkIndex(index, totalChunks)))];
-  unique.sort((a, b) => a - b);
-  return unique;
 }
 
 function detectDeviceType() {
@@ -3371,17 +3233,14 @@ function formatPing(ms) {
   return Number.isFinite(value) && value >= 0 ? `${Math.round(value)} ms` : '...';
 }
 
-function metricsDetail(metrics) {
-  const m = normalizeClientMetrics(metrics);
-  return `${m.deviceType === 'mobile' ? 'Mobile' : 'Desktop'} | Ping ${formatPing(m.pingMs)} | Up ${formatSpeed(m.uploadBps)} | Down ${formatSpeed(m.downloadBps)}`;
-}
-
 async function publishClientCardMetadata(item) {
+  const generation = roomGeneration;
+  const socket = ws;
   const meta = cardMetadataFromItem(item);
   if (!meta || !ws || ws.readyState !== WebSocket.OPEN) return;
   debugLog('announce', { itemId: item.id, type: item.type, filename: item.filename, size: item.size, encrypted: !!item.encrypted });
   const encryptedMeta = await encryptedManifestMeta(item);
-  if (!encryptedMeta) return;
+  if (!encryptedMeta || socket !== ws || generation !== roomGeneration || items.get(item.id) !== item || deletedItemIds.has(item.id)) return;
   const revision = nextManifestRevision(item.id);
   sendPriorityJson({
     type: 'manifest_upsert',
@@ -3420,14 +3279,6 @@ function rememberPeerCardMetadata(peerId, metadata) {
   peerCardMetadata.get(peerId).set(metadata.id, metadata);
 }
 
-function forgetPeerCardMetadata(peerId, itemId) {
-  if (!peerId || !itemId) return;
-  const cards = peerCardMetadata.get(peerId);
-  if (!cards) return;
-  cards.delete(itemId);
-  if (!cards.size) peerCardMetadata.delete(peerId);
-}
-
 function rebuildPeerCardMetadataFromManifest() {
   peerCardMetadata.clear();
   for (const record of roomManifest.values()) {
@@ -3442,8 +3293,8 @@ function rebuildPeerCardMetadataFromManifest() {
 function rememberManifestMeta(ownerId, meta, revision = 0, holders = null) {
   if (!ownerId || !meta?.id) return;
   const existing = roomManifest.get(meta.id);
-  if (existing && (existing.revision || 0) > revision) return;
-  const holderIds = [...new Set((holders?.length ? holders : [ownerId]).filter(Boolean))];
+  if (deletedItemIds.has(meta.id) || (manifestRevisions.get(meta.id) || 0) > revision) return;
+  const holderIds = [...new Set((Array.isArray(holders) ? holders : [ownerId]).filter(Boolean))];
   roomManifest.set(meta.id, { ownerId, holders: holderIds, revision, meta });
   manifestRevisions.set(meta.id, Math.max(manifestRevisions.get(meta.id) || 0, revision || 0));
   rebuildPeerCardMetadataFromManifest();
@@ -3460,15 +3311,18 @@ function removeManifestMeta(itemId, revision = 0) {
 
 async function applyManifestRecord(record) {
   if (!record?.itemId) return;
+  const generation = roomGeneration;
   const revision = Number(record.revision) || 0;
   if (record.deleted) {
+    if (revision < (manifestRevisions.get(record.itemId) || 0)) return;
+    disposeSharedItem(record.itemId, { deleted: true });
     removeManifestMeta(record.itemId, revision);
     return;
   }
   if (!record.encryptedMeta || !encryptionKey) return;
   try {
     const meta = JSON.parse(await decryptMessage(record.encryptedMeta, encryptionKey));
-    if (meta?.id !== record.itemId) return;
+    if (generation !== roomGeneration || deletedItemIds.has(record.itemId) || meta?.id !== record.itemId) return;
     rememberManifestMeta(record.ownerId, meta, revision, record.holders);
   } catch {
     // A manifest from a different passkey stays invisible.
@@ -3478,83 +3332,7 @@ async function applyManifestRecord(record) {
 async function applyManifestSnapshot(records = []) {
   for (const record of records || []) await applyManifestRecord(record);
   if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
-  armRecoveryTimersForIncompleteReceives();
-}
-
-function applyPeerMetadataUpdate(msg) {
-  if (!msg?.senderId || msg.senderId === clientId) return;
-  if (msg.action === 'delete') {
-    forgetPeerCardMetadata(msg.senderId, msg.itemId);
-  } else if (msg.action === 'clear') {
-    peerCardMetadata.delete(msg.senderId);
-  } else if (msg.item) {
-    rememberPeerCardMetadata(msg.senderId, msg.item);
-  }
-  if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
-}
-
-function seedPeerMetadataFromSources(sources = []) {
-  for (const source of sources) {
-    if (!source?.clientId) continue;
-    const cards = new Map();
-    (source.items || []).forEach(item => {
-      const meta = cardMetadataFromItem(item);
-      if (!meta?.filename && !meta?.mimeType && meta?.type === 'unknown') return;
-      if (meta) cards.set(meta.id, meta);
-    });
-    if (cards.size) peerCardMetadata.set(source.clientId, cards);
-  }
-}
-
-function hasConnectedCompleteSource(itemId) {
-  if (!itemId) return false;
-  for (const [peerId, cards] of peerCardMetadata) {
-    if (connectedPeers.get(peerId)?.compatibility === 'compatible' && cards?.has(itemId)) return true;
-  }
-  return false;
-}
-
-function isIncompleteIncomingCard(itemId) {
-  const item = items.get(itemId);
-  return !!itemId && (
-    binaryTransfers.has(itemId) ||
-    expectsIncomingChunks(item)
-  );
-}
-
-function cancelInterruptedIncomingCard(itemId) {
-  if (!isIncompleteIncomingCard(itemId)) return false;
-  items.delete(itemId);
-  cardEncryptionKeys.delete(itemId);
-  binaryTransfers.delete(itemId);
-  chunkScheduler.cancelItem(itemId);
-  clearOutboundRetriesForItem(itemId);
-  outboundTransfers.delete(itemId);
-  clearAutomaticDownloadRetry(itemId);
-  downloadSourceRetryAttempts.delete(itemId);
-  pendingDownloadSourceIds.delete(itemId);
-  pendingDownloadTriedSources.delete(itemId);
-  pendingChunkRequestBatches.delete(itemId);
-  downloadLogSources.delete(itemId);
-  clearTransferStatusesForItem(itemId);
-  removeCardAnimated(itemId, updateEmpty);
-  updateSendWakeLock();
-  return true;
-}
-
-function removeOrphanedIncomingCards() {
-  const candidateIds = new Set([
-    ...binaryTransfers.keys(),
-    ...[...items.values()].filter(item => expectsIncomingChunks(item)).map(item => item.id),
-  ]);
-  let removed = 0;
-  for (const itemId of candidateIds) {
-    if (!hasConnectedCompleteSource(itemId) && cancelInterruptedIncomingCard(itemId)) removed++;
-  }
-  if (removed) {
-    showToast(removed === 1 ? 'Transfer interrupted.' : 'Transfers interrupted.');
-    schedulePeersModalRefresh();
-  }
+  refreshTransferSources();
 }
 
 function peerCardTitle(meta) {
@@ -3708,6 +3486,7 @@ function transferStatusRowsForPeer(peerId) {
   const rows = [];
   const imap = buildPeerIdentityMap();
   for (const [itemId, transfer] of binaryTransfers) {
+    if (transfer.state === 'complete') continue;
     if (peerId !== clientId) continue;
     rows.push({
       itemId,
@@ -4014,215 +3793,48 @@ function closePeersModal() {
   modal.setAttribute('aria-hidden', 'true');
 }
 
-function autoSelectSyncSource(sources) {
-  const source = [...(sources || [])]
-    .filter(candidate => candidate?.clientId)
-    .sort((a, b) => {
-      const aCount = a.itemCount || a.items?.length || 0;
-      const bCount = b.itemCount || b.items?.length || 0;
-      return bCount - aCount;
-    })[0];
-  if (source) requestSyncFrom(source.clientId);
-}
-
-function runPendingInitialSyncIfReady() {
-  if (!pendingInitialSyncSources?.length || !dataWs || dataWs.readyState !== WebSocket.OPEN) return;
-  const sources = pendingInitialSyncSources;
-  pendingInitialSyncSources = null;
-  autoSelectSyncSource(sources);
-}
-
-function syncMissingFromSources(sources = []) {
-  const missingSources = sources
-    .map(source => ({
-      ...source,
-      missingCount: (source.items || []).filter(item => item?.id && !items.has(item.id)).length,
-    }))
-    .filter(source => source.clientId && source.missingCount > 0)
-    .sort((a, b) => b.missingCount - a.missingCount);
-
-  if (!missingSources.length) {
-    debugLog('foreground-check-current', { sources: sources.length, localItems: items.size });
-    return false;
-  }
-
-  debugLog('foreground-check-missing', {
-    sourceClientId: missingSources[0].clientId,
-    missingCount: missingSources[0].missingCount,
-  });
-  requestSyncFrom(missingSources[0].clientId);
-  return true;
-}
-
 function checkForegroundFreshness() {
   if (!token || !ws || ws.readyState !== WebSocket.OPEN || document.hidden) return;
-  const now = Date.now();
-  if (now - lastForegroundCheckAt < 2000) return;
-  lastForegroundCheckAt = now;
-  debugLog('foreground-check-start', { localItems: items.size, peers: connectedPeers.size });
+  if (Date.now() - lastForegroundCheckAt < 2000) return;
+  lastForegroundCheckAt = Date.now();
+  sendPriorityJson({ type: 'metadata_snapshot_request' });
+  refreshTransferSources();
 }
 
-function requestSyncFrom(sourceClientId, itemId = null, missingChunks = null, { silent = false } = {}) {
-  if (!sourceClientId) return;
-  const requestedChunks = missingChunks?.length ? missingChunks.slice(0, CHUNK_REQUEST_MAX_CHUNKS) : null;
-  if (itemId && requestedChunks?.length) {
-    pendingChunkRequestBatches.set(itemId, {
-      sourceClientId,
-      chunks: new Set(requestedChunks),
-    });
-  }
-  debugLog('retrieve-request', {
-    sourceClientId,
-    itemId,
-    missingChunks: requestedChunks?.length,
-    remainingMissingChunks: missingChunks?.length ? Math.max(0, missingChunks.length - requestedChunks.length) : 0,
-  });
-  wsSend({
-    type: 'relay',
-    targetId: sourceClientId,
-    payload: {
-      type: 'sync_request',
-      requesterId: clientId,
-      itemId: itemId || undefined,
-      missingChunks: requestedChunks?.length ? requestedChunks : undefined,
-    },
-  }, null, true);
-  if (!silent) showToast(itemId ? 'Retrying download...' : 'Requesting files...');
-}
-
-function continueChunkRequestBatch(itemId, chunkIndex, senderId = null) {
-  const batch = pendingChunkRequestBatches.get(itemId);
-  if (!batch || (senderId && batch.sourceClientId && batch.sourceClientId !== senderId)) return;
-  batch.chunks.delete(Number(chunkIndex));
-  if (batch.chunks.size) return;
-  pendingChunkRequestBatches.delete(itemId);
-  const transfer = binaryTransfers.get(itemId);
-  const encryptedChunks = items.get(encryptedPlaceholderIdForItem(itemId))?.encryptedBinaryChunks;
-  const transferDone = transfer && transfer.received >= transfer.totalChunks;
-  if (transferDone) return;
-  const missingChunks = transfer
-    ? missingTransferChunks(transfer)
-    : missingStoredEncryptedChunks(encryptedChunks);
-  if (missingChunks?.length) {
-    requestSyncFrom(senderId || batch.sourceClientId, itemId, missingChunks, { silent: true });
-  }
-}
-
-function missingTransferChunks(transfer) {
-  if (!transfer?.chunks?.length) return null;
-  const missing = [];
-  for (let i = 0; i < transfer.chunks.length; i++) {
-    if (transfer.chunks[i] === null) missing.push(i);
-  }
-  return missing;
-}
-
-function missingStoredEncryptedChunks(chunks) {
-  if (!chunks?.length) return null;
-  const missing = [];
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i] === null) missing.push(i);
-  }
-  return missing;
-}
-
-function findDownloadRetryCandidates(itemId, currentSenderId = null) {
-  return [...peerCardMetadata.entries()]
-    .filter(([peerId, cards]) => (
-      peerId &&
-      peerId !== clientId &&
-      peerId !== currentSenderId &&
-      connectedPeers.has(peerId) &&
-      cards?.has(itemId)
-    ))
-    .map(([peerId]) => peerId);
-}
-
-function retryDownloadFromDifferentClient(itemId, { silent = false } = {}) {
-  const currentTransfer = binaryTransfers.get(itemId);
-  const currentSenderId = currentTransfer?.senderId || pendingDownloadSourceIds.get(itemId) || null;
-  const missingChunks = missingTransferChunks(currentTransfer);
-  const triedSources = !currentTransfer ? (pendingDownloadTriedSources.get(itemId) || new Set()) : null;
-  const candidates = findDownloadRetryCandidates(itemId, currentSenderId)
-    .filter(peerId => !triedSources?.has(peerId));
-  if (!candidates.length) {
-    if (silent) return;
-    showToast('No other client has this file right now.');
-    return;
-  }
-
-  const sourceClientId = candidates[0];
-  if (currentTransfer) {
-    currentTransfer.senderId = sourceClientId;
-    currentTransfer.retrySourceId = sourceClientId;
-    updateTransferProgress(itemId, currentTransfer.received / currentTransfer.totalChunks, currentTransfer);
-  } else {
-    pendingDownloadSourceIds.set(itemId, sourceClientId);
-    if (!pendingDownloadTriedSources.has(itemId)) pendingDownloadTriedSources.set(itemId, new Set());
-    pendingDownloadTriedSources.get(itemId).add(sourceClientId);
-  }
-  requestSyncFrom(sourceClientId, itemId, missingChunks, { silent });
-}
-
-function clearAutomaticDownloadRetry(itemId) {
-  const timer = downloadSourceRetryTimers.get(itemId);
-  if (timer) clearTimeout(timer);
-  downloadSourceRetryTimers.delete(itemId);
-}
-
-function scheduleAutomaticDownloadRetry(itemId, transfer) {
-  clearAutomaticDownloadRetry(itemId);
-  if (!itemId || !transfer || transfer.totalChunks && transfer.received >= transfer.totalChunks) return;
-  const timer = setTimeout(() => {
-    downloadSourceRetryTimers.delete(itemId);
-    const currentTransfer = binaryTransfers.get(itemId);
-    const currentItem = items.get(itemId);
-    if ((!currentTransfer && !expectsIncomingChunks(currentItem)) || currentTransfer?.totalChunks && currentTransfer.received >= currentTransfer.totalChunks) return;
-    const previousSenderId = currentTransfer?.senderId || transfer.senderId || null;
-    retryDownloadFromDifferentClient(itemId, { silent: true });
-    const nextTransfer = binaryTransfers.get(itemId);
-    if (nextTransfer?.senderId && nextTransfer.senderId !== previousSenderId) {
-      downloadSourceRetryAttempts.set(itemId, (downloadSourceRetryAttempts.get(itemId) || 0) + 1);
-      debugLog('retry-download-source', { itemId, from: previousSenderId, to: nextTransfer.senderId, attempts: downloadSourceRetryAttempts.get(itemId) });
-    }
-    const remainingTransfer = binaryTransfers.get(itemId);
-    if (remainingTransfer || expectsIncomingChunks(items.get(itemId))) {
-      scheduleAutomaticDownloadRetry(itemId, remainingTransfer || {
-        senderId: nextTransfer?.senderId || previousSenderId || null,
-        received: 0,
-        totalChunks: 0,
-      });
-    }
-  }, DOWNLOAD_SOURCE_RETRY_DELAY_MS);
-  downloadSourceRetryTimers.set(itemId, timer);
-}
-
-function armRecoveryTimersForIncompleteReceives() {
-  for (const [itemId, transfer] of binaryTransfers) scheduleAutomaticDownloadRetry(itemId, transfer);
-  for (const item of items.values()) {
-    if (!expectsIncomingChunks(item) || downloadSourceRetryTimers.has(item.id)) continue;
-    scheduleAutomaticDownloadRetry(item.id, {
-      senderId: null,
-      received: 0,
-      totalChunks: 0,
-    });
-  }
+function requestSyncFrom(sourceClientId, itemId = null) {
+  if (!sourceClientId || (itemId && pendingTextSync.has(itemId))) return;
+  if (itemId) pendingTextSync.add(itemId);
+  wsSend({ type: 'relay', targetId: sourceClientId,
+    payload: { type: 'sync_request', requesterId: clientId, itemId: itemId || undefined } }, null, true);
 }
 
 function expectsIncomingChunks(item) {
-  return item && item.type !== 'text' && item.type !== 'encrypted' && !item.rawBuffer && !item.dataUrl;
+  return item && ['file', 'image'].includes(item.type) && !item.rawBuffer;
 }
 
-function showPendingReceiveProgress(itemId, senderId) {
-  if (itemId && senderId && !pendingDownloadSourceIds.has(itemId)) pendingDownloadSourceIds.set(itemId, senderId);
-  if (!itemId || document.getElementById('card-' + itemId)?.querySelector('.inbound-progress')) return;
-  updateTransferProgress(itemId, 0, {
-    senderId,
-    received: 0,
-    totalChunks: 0,
-    currentChunk: 0,
-    startTime: Date.now(),
-  });
+function refreshTransferSources() {
+  const connected = !!token && ws?.readyState === WebSocket.OPEN;
+  // Pending compatibility proofs are not evidence that all sources disappeared.
+  transferCoordinator.connectionChanged(connected, false);
+  const sourcesFor = record => {
+    const holders = record?.holders || [];
+    const compatible = holders.filter(id => id !== clientId && connectedPeers.get(id)?.compatibility === 'compatible');
+    return compatible.sort((a, b) => (a === record.ownerId ? -1 : b === record.ownerId ? 1 : a.localeCompare(b)));
+  };
+  for (const record of roomManifest.values()) {
+    const meta = record.meta;
+    if (!meta || deletedItemIds.has(meta.id)) continue;
+    const sources = sourcesFor(record);
+    if (meta.type === 'text') {
+      if (!items.has(meta.id) && sources.length) requestSyncFrom(sources[0], meta.id);
+    } else {
+      if (sources.length || binaryTransfers.has(meta.id)) transferCoordinator.ensureAvailable(meta, sources);
+      transferCoordinator.setSources(meta.id, sources);
+    }
+  }
+  transferCoordinator.authoritative = connected && roomSnapshotReady
+    && ![...connectedPeers.values()].some(peer => peer.compatibility === 'pending');
+  for (const record of [...binaryTransfers.values()]) transferCoordinator.setSources(record.itemId, sourcesFor(roomManifest.get(record.itemId)));
 }
 
 function closeAllModals() {
@@ -4237,22 +3849,14 @@ function closeAllModals() {
 }
 
 function clearAllItems() {
-  const hadItems = items.size > 0;
+  cardInputGeneration++;
   const hadChat = chatMessages.length > 0;
-  if (hadItems) {
-    for (const id of [...items.keys()]) {
-      wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, cardEncryptionKeys.get(id));
-    }
+  for (const id of new Set([...items.keys(), ...roomManifest.keys(), ...binaryTransfers.keys()])) {
+    disposeSharedItem(id, { deleted: true, broadcast: true });
   }
-  items.clear();
-  cardEncryptionKeys.clear();
-  binaryTransfers.clear();
-  clearAllOutboundRetries();
-  outboundTransfers.clear();
+  pendingTextSync.clear();
   remoteTransferStatuses.clear();
   transferStatusPublishTimes.clear();
-  pendingChunkRequestBatches.clear();
-  releaseSendWakeLock();
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   document.getElementById('cards').innerHTML = '';
@@ -4356,59 +3960,20 @@ async function decryptMessage(encryptedData, key) {
 }
 
 async function applyEncryptedMessage(encryptedData, key, senderId = null) {
+  const generation = roomGeneration;
   const decrypted = await decryptMessage(encryptedData, key);
   const innerMsg = JSON.parse(decrypted);
-  if (innerMsg.type === 'relay') handlePayload(innerMsg.payload, true, key, senderId);
-}
-
-async function applyEncryptedMessages(encryptedMessages, key) {
-  const ordered = [...encryptedMessages].sort((a, b) => {
-    const aKind = a.meta?.payloadType;
-    const bKind = b.meta?.payloadType;
-    if (aKind === 'item_added' && bKind !== 'item_added') return -1;
-    if (bKind === 'item_added' && aKind !== 'item_added') return 1;
-    return a.seq - b.seq;
-  });
-
-  for (const message of ordered) {
-    await applyEncryptedMessage(message.data, key);
-  }
-}
-
-function rememberKeyForEncryptedMessages(encryptedMessages, key) {
-  for (const message of encryptedMessages) {
-    const itemId = message.meta?.itemId;
-    if (itemId) cardEncryptionKeys.set(itemId, key);
-  }
-}
-
-async function unlockEncryptedCard(item, key) {
-  await applyEncryptedMessages(item.encryptedMessages, key);
-  rememberKeyForEncryptedMessages(item.encryptedMessages, key);
-  await decryptStoredEncryptedBinaryChunks(item, key);
-  items.delete(item.id);
-  removeCardAnimated(item.id, updateEmpty);
-}
-
-async function tryDecryptEncryptedCards(passphrase, key) {
-  let unlocked = 0;
-  const encryptedCards = [...items.values()].filter(item => item.type === 'encrypted');
-  for (const item of encryptedCards) {
-    try {
-      await unlockEncryptedCard(item, key);
-      unlocked++;
-    } catch {
-      // Keep cards that do not match this passphrase locked.
-    }
-  }
-  return unlocked;
+  if (generation !== roomGeneration || !innerMsg || typeof innerMsg !== 'object' || Array.isArray(innerMsg)) return;
+  if (innerMsg.type === 'relay') await handlePayload(innerMsg.payload, true, key, senderId);
 }
 
 async function applyEncryptedWithRememberedKey(msg) {
+  const generation = roomGeneration;
   const itemId = msg.meta?.itemId;
   const key = itemId ? cardEncryptionKeys.get(itemId) : null;
   if (!key) return false;
   await applyEncryptedMessage(msg.data, key, msg.senderId);
+  if (generation !== roomGeneration) return true;
   if (msg.senderId && connectedPeers.has(msg.senderId)) setPeerCompatibility(msg.senderId, 'compatible');
   return true;
 }
@@ -4452,94 +4017,10 @@ function encryptedPlaceholderId(meta) {
   return meta?.itemId ? `encrypted-${meta.itemId}` : randomUUID();
 }
 
-function encryptedPlaceholderIdForItem(itemId) {
-  return `encrypted-${itemId}`;
-}
-
-function encryptedChunkStatus(item) {
-  return item.totalEncryptedChunks
-    ? `Receiving ${item.receivedEncryptedChunks || 0}/${item.totalEncryptedChunks}`
-    : 'Receiving';
-}
-
-function updateEncryptedPlaceholderCard(item) {
-  const card = document.getElementById('card-' + item.id);
-  if (!card) return;
-
-  const status = card.querySelector('.encrypted-status');
-  if (status) status.textContent = encryptedChunkStatus(item);
-
-  const progressWrap = card.querySelector('.encrypted-progress-wrap');
-  const progressFill = card.querySelector('.encrypted-progress');
-  if (!progressWrap || !progressFill) return;
-
-  if (item.totalEncryptedChunks) {
-    const pct = Math.round(((item.receivedEncryptedChunks || 0) / item.totalEncryptedChunks) * 100);
-    progressWrap.style.display = '';
-    progressFill.style.width = pct + '%';
-  } else {
-    progressWrap.style.display = 'none';
-    progressFill.style.width = '0%';
-  }
-}
-
-function ensureEncryptedBinaryPlaceholder(itemId, totalChunks) {
-  const groupId = encryptedPlaceholderIdForItem(itemId);
-  let item = items.get(groupId);
-  if (!item) {
-    item = {
-      id: groupId,
-      type: 'encrypted',
-      encryptedMeta: { payloadType: 'encrypted_binary_chunk', itemId, totalChunks },
-      encryptedMessages: [],
-      encryptedChunkIndexes: [],
-      encryptedBinaryChunks: new Array(totalChunks).fill(null),
-      receivedEncryptedChunks: 0,
-      totalEncryptedChunks: totalChunks,
-      encrypted: true,
-      addedAt: Date.now()
-    };
-    items.set(item.id, item);
-    updateEmpty();
-  } else {
-    item.encryptedBinaryChunks ||= new Array(totalChunks).fill(null);
-    item.totalEncryptedChunks = totalChunks || item.totalEncryptedChunks;
-  }
-  return item;
-}
-
-function storeEncryptedBinaryChunk(header, payload) {
-  if (!isValidChunkSet(header?.ci, header?.tc)) return 0;
-  const item = ensureEncryptedBinaryPlaceholder(header.i, header.tc);
-  item.encryptedBinaryChunks ||= new Array(header.tc).fill(null);
-  if (item.encryptedBinaryChunks[header.ci] === null) {
-    item.encryptedBinaryChunks[header.ci] = payload.slice(0);
-    item.encryptedChunkIndexes ||= [];
-    if (!item.encryptedChunkIndexes.includes(header.ci)) item.encryptedChunkIndexes.push(header.ci);
-  }
-  item.receivedEncryptedChunks = item.encryptedChunkIndexes.length;
-  item.totalEncryptedChunks = header.tc;
-  updateEncryptedPlaceholderCard(item);
-  return item.receivedEncryptedChunks;
-}
-
-async function decryptStoredEncryptedBinaryChunks(item, key) {
-  const chunks = item.encryptedBinaryChunks;
-  if (!chunks?.length || chunks.some(chunk => chunk === null)) return;
-  const itemId = item.encryptedMeta?.itemId || item.id.replace(/^encrypted-/, '');
-  cardEncryptionKeys.set(itemId, key);
-  for (let i = 0; i < chunks.length; i++) {
-    const payload = chunks[i];
-    const plain = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: new Uint8Array(payload, 0, 12) },
-      key,
-      payload.slice(12)
-    );
-    handleBinaryFileChunk(itemId, i, chunks.length, plain);
-  }
-}
-
 function addEncryptedPlaceholder(encryptedData, meta = {}) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)
+    || (meta.itemId && (!ClipShareTransfers.validId(meta.itemId) || deletedItemIds.has(meta.itemId)))
+    || ['file_request', 'file_metadata', 'file_unavailable', 'chunk_ack', 'transfer_complete', 'transfer_cancel'].includes(meta.payloadType)) return;
   const groupId = encryptedPlaceholderId(meta);
   const message = { data: encryptedData, meta, seq: encryptedMessageSeq++ };
   const existing = items.get(groupId);
@@ -4552,7 +4033,6 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
       if (timeEl) timeEl.dataset.addedAt = meta.addedAt;
       refreshCardTimes();
     }
-    updateEncryptedPlaceholderCard(existing);
     return;
   }
 
@@ -4561,8 +4041,6 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
     type: 'encrypted',
     encryptedMeta: meta,
     encryptedMessages: [message],
-    encryptedChunkIndexes: [],
-    receivedEncryptedChunks: 0,
     encrypted: true,
     addedAt: meta.addedAt || Date.now()
   };
@@ -4572,47 +4050,57 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
 
 function connectDataWS() {
   if (!token || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (dataWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(dataWs.readyState)) return;
+  if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
+  const generation = roomGeneration;
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}&channel=data`;
-  if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
-  dataWs = new WebSocket(url);
-  dataWs.binaryType = 'arraybuffer';
-  dataWs.onopen = () => {
+  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}&channel=data&protocolVersion=2`;
+  const socket = new WebSocket(url);
+  dataWs = socket;
+  socket.binaryType = 'arraybuffer';
+  const live = () => generation === roomGeneration && dataWs === socket;
+  socket.onopen = () => {
+    if (!live()) return;
     dataWsRetryDelay = 1000;
     debugLog('data-socket-open');
-    runPendingInitialSyncIfReady();
-    retryPendingChunksAfterDataReconnect();
+    refreshTransferSources();
   };
-  dataWs.onmessage = async e => {
-    try {
-      if (e.data instanceof ArrayBuffer) handleBinaryMessage(e.data, 'ws');
-    } catch { }
+  socket.onmessage = event => {
+    if (live() && event.data instanceof ArrayBuffer) {
+      handleBinaryMessage(event.data, 'ws').catch(error => debugLog('binary-receive-error', { error: error.message }));
+    }
   };
-  dataWs.onclose = () => {
+  socket.onclose = () => {
+    if (!live()) return;
     debugLog('data-socket-closed');
-    if (!token || !ws || ws.readyState !== WebSocket.OPEN) return;
-    dataWsRetryTimer = setTimeout(connectDataWS, dataWsRetryDelay);
+    if (!token || ws?.readyState !== WebSocket.OPEN) return;
+    dataWsRetryTimer = setTimeout(() => { if (live()) connectDataWS(); }, dataWsRetryDelay);
     dataWsRetryDelay = Math.min(dataWsRetryDelay * 2, 30000);
   };
-  dataWs.onerror = () => debugLog('data-socket-error');
+  socket.onerror = () => { if (live()) debugLog('data-socket-error'); };
 }
 
 async function connectWS() {
   if (!token) return;
+  if (ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(ws.readyState)) return;
+  if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+  const generation = roomGeneration;
+  const roomToken = token;
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  let url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}&channel=control`;
+  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(roomToken)}?clientId=${clientId}&channel=control&protocolVersion=2`;
   const passphrase = currentPassphrase || localStorage.getItem('clipshare_passphrase');
-  encryptionKey = null;
-  encryptionEnabled = false;
-  if (passphrase) {
-    currentPassphrase = passphrase;
-    encryptionKey = await deriveKey(currentPassphrase, token);
-    encryptionEnabled = true;
-  }
+  const key = passphrase ? await deriveKey(passphrase, roomToken) : null;
+  if (generation !== roomGeneration || token !== roomToken) return;
+  encryptionKey = key;
+  encryptionEnabled = !!key;
+  if (passphrase) currentPassphrase = passphrase;
   updateEncryptionControl();
-  ws = new WebSocket(url);
-
-  ws.onopen = () => {
+  const socket = new WebSocket(url);
+  ws = socket;
+  const live = () => generation === roomGeneration && ws === socket;
+  let messages = Promise.resolve();
+  socket.onopen = () => {
+    if (!live()) return;
     wsRetryDelay = 1000;
     setDot('connected');
     loadWebRtcConfig().catch(() => {});
@@ -4620,25 +4108,28 @@ async function connectWS() {
     publishPairingMode();
     publishClientMetrics();
     startMetricsPing();
-    publishLocalManifest();
     connectDataWS();
   };
-  ws.onmessage = async e => {
-    try {
-      const msg = JSON.parse(e.data);
-      await handleServerMessage(msg);
-    } catch { }
+  socket.onmessage = event => {
+    messages = messages.then(async () => {
+      if (!live()) return;
+      try { await handleServerMessage(JSON.parse(event.data), generation); }
+      catch (error) { debugLog('control-receive-error', { error: error?.message || String(error) }); }
+    });
   };
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (!live()) return;
+    roomSnapshotReady = false;
+    transferCoordinator.connectionChanged(false);
     setDot('disconnected');
     closeAllWebRtcPeers();
     stopMetricsPing();
     if (dataWs) { dataWs.onclose = null; dataWs.close(); dataWs = null; }
     if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
-    wsRetryTimer = setTimeout(connectWS, wsRetryDelay);
+    wsRetryTimer = setTimeout(() => { if (live()) connectWS(); }, wsRetryDelay);
     wsRetryDelay = Math.min(wsRetryDelay * 2, 30000);
   };
-  ws.onerror = () => setDot('error');
+  socket.onerror = () => { if (live()) setDot('error'); };
 }
 
 function setDot(state) {
@@ -4657,8 +4148,9 @@ function setPeerCompatibility(peerId, status) {
   if (!peerId || peerId === clientId) return;
   const peer = connectedPeers.get(peerId);
   if (!peer) return;
+  if (peer.compatibility === status) return;
   peer.compatibility = status;
-  if (status === 'compatible') ensureWebRtcPeer(peerId).catch(error => setWebRtcStartFailed(peerId, error));
+  if (status === 'compatible') ensureWebRtcPeer(peerId).catch(() => {});
   else closeWebRtcPeer(peerId);
   const timer = peerCompatibilityTimers.get(peerId);
   if (timer) {
@@ -4666,6 +4158,7 @@ function setPeerCompatibility(peerId, status) {
     peerCompatibilityTimers.delete(peerId);
   }
   if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
+  refreshTransferSources();
   updatePeerCount();
 }
 
@@ -4689,39 +4182,49 @@ async function publishKeyProof() {
 }
 
 async function applyKeyProof(msg) {
+  const generation = roomGeneration;
   const senderId = msg?.senderId;
   if (!senderId || senderId === clientId || !connectedPeers.has(senderId) || !encryptionKey) return;
+  const peer = connectedPeers.get(senderId);
   try {
     const proof = JSON.parse(await decryptMessage(msg.proof, encryptionKey));
+    if (generation !== roomGeneration || connectedPeers.get(senderId) !== peer) return;
     if (proof?.kind === 'clipshare-key-proof' && proof.clientId === senderId) {
       setPeerCompatibility(senderId, 'compatible');
       return;
     }
   } catch { }
-  setPeerCompatibility(senderId, 'incompatible');
+  if (generation === roomGeneration && connectedPeers.get(senderId) === peer) setPeerCompatibility(senderId, 'incompatible');
 }
 
-async function wsSend(msg, keyOverride = null, priority = false) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+async function wsSend(msg, keyOverride = null, priority = false, live = () => true) {
+  const socket = ws;
+  const generation = roomGeneration;
+  if (!socket || socket.readyState !== WebSocket.OPEN || !live()) return false;
   const key = keyOverride || encryptionKey;
   if (!key) return false;
-  const jsonStr = JSON.stringify(msg);
-  const encrypted = await encryptMessage(jsonStr, key);
+  const encrypted = await encryptMessage(JSON.stringify(msg), key);
+  if (generation !== roomGeneration || socket !== ws || socket.readyState !== WebSocket.OPEN || !live()) return false;
   const envelope = { type: 'encrypted', data: encrypted, meta: encryptedMetaForMessage(msg) };
   if (msg.targetId) envelope.targetId = msg.targetId;
-  if (priority) return sendPriorityJson(envelope);
-  ws.send(JSON.stringify(envelope));
-  return true;
+  try { socket.send(JSON.stringify(envelope)); return true; } catch { return false; }
 }
 
 // ── Message handling ─────────────────────────────────────────────────
-async function handleServerMessage(msg) {
+async function handleServerMessage(msg, generation = roomGeneration) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg) || generation !== roomGeneration) return;
+  if (msg.type === 'refresh_required') {
+    showToast('ClipShare was updated. Refresh this page to continue.');
+    if (ws) ws.onclose = null;
+    setDot('error');
+    return;
+  }
   if (msg.type === 'welcome') {
+    roomSnapshotReady = false;
     clientCount = msg.peerCount + 1;
     connectedPeers.clear();
     peerCardMetadata.clear();
     roomManifest.clear();
-    manifestRevisions.clear();
     peerCounter = 0;
     selfPeerInfo = { label: String(msg.selfPeerNumber || 1), ip: msg.clientIp || '' };
     Object.assign(selfClientMetrics, normalizeClientMetrics({ ...selfClientMetrics, ...(msg.metrics || {}) }));
@@ -4741,10 +4244,11 @@ async function handleServerMessage(msg) {
     await applyManifestSnapshot(msg.manifest || []);
     updatePeerCount();
     encryptionEnabled = !!encryptionKey;
-    if ((msg.sources || []).length && !items.size) {
-      pendingInitialSyncSources = msg.sources || [];
-      runPendingInitialSyncIfReady();
-    }
+    if (generation !== roomGeneration) return;
+    roomSnapshotReady = true;
+    publishLocalManifest();
+    pendingTextSync.clear();
+    refreshTransferSources();
   } else if (msg.type === 'peer_joined') {
     clientCount++;
     peerCounter = Math.max(peerCounter + 1, Number(msg.peerNumber) || 0);
@@ -4758,7 +4262,7 @@ async function handleServerMessage(msg) {
     updatePeerCount();
     publishKeyProof();
     sendSyncState(msg.clientId);
-    armRecoveryTimersForIncompleteReceives();
+    refreshTransferSources();
   } else if (msg.type === 'peer_left') {
     clientCount = Math.max(1, clientCount - 1);
     closeWebRtcPeer(msg.clientId);
@@ -4768,14 +4272,8 @@ async function handleServerMessage(msg) {
     peerCompatibilityTimers.delete(msg.clientId);
     peerCardMetadata.delete(msg.clientId);
     clearRemoteTransferStatusesForPeer(msg.clientId);
-    for (const [itemId, peerMap] of outboundTransfers) {
-      if (peerMap.has(msg.clientId)) {
-        peerMap.delete(msg.clientId);
-        if (peerMap.size === 0) outboundTransfers.delete(itemId);
-        refreshOutboundUI(itemId);
-      }
-    }
-    removeOrphanedIncomingCards();
+    transferCoordinator.peerDisconnected(msg.clientId);
+    refreshTransferSources();
     updatePeerCount();
     if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
   } else if (msg.type === 'metrics_pong') {
@@ -4793,26 +4291,13 @@ async function handleServerMessage(msg) {
       connectedPeers.get(msg.clientId).metrics = metrics;
     }
     if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
-  } else if (msg.type === 'metadata_updated') {
-    debugLog(msg.senderId === clientId ? 'announce-stored' : 'metadata-updated', {
-      senderId: msg.senderId,
-      itemId: msg.itemId,
-      action: msg.action,
-      stored: msg.stored,
-    });
-    armRecoveryTimersForIncompleteReceives();
   } else if (msg.type === 'metadata_snapshot') {
-    debugLog('foreground-check-snapshot', { sources: msg.sources?.length || 0 });
-    if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
-    syncMissingFromSources(msg.sources || []);
-    armRecoveryTimersForIncompleteReceives();
+    await applyManifestSnapshot(msg.manifest || []);
+    refreshTransferSources();
   } else if (msg.type === 'manifest_updated') {
     await applyManifestRecord(msg.record);
-    if (msg.record?.ownerId && msg.record.ownerId !== clientId && !msg.record.deleted && !items.has(msg.record.itemId)) {
-      requestSyncFrom(msg.record.ownerId, msg.record.itemId, null, { silent: true });
-    }
-    if (document.getElementById('peers-modal').classList.contains('open')) openPeersModal();
-    armRecoveryTimersForIncompleteReceives();
+    refreshTransferSources();
+    schedulePeersModalRefresh();
   } else if (msg.type === 'key_proof') {
     await applyKeyProof(msg);
   } else if (msg.type === 'pairing_hosts') {
@@ -4851,24 +4336,25 @@ async function handleServerMessage(msg) {
       await rotatePairingPin();
     }
   } else if (msg.type === 'encrypted') {
-    if (msg.meta?.payloadType === 'item_deleted') {
-      forgetPeerCardMetadata(msg.senderId, msg.meta.itemId);
-    }
     if (encryptionKey) {
       try {
         await applyEncryptedMessage(msg.data, encryptionKey, msg.senderId);
+        if (generation !== roomGeneration) return;
         if (msg.senderId && connectedPeers.has(msg.senderId)) setPeerCompatibility(msg.senderId, 'compatible');
-        if (msg.meta?.itemId) cardEncryptionKeys.set(msg.meta.itemId, encryptionKey);
+        if (items.has(msg.meta?.itemId) && !deletedItemIds.has(msg.meta.itemId)) cardEncryptionKeys.set(msg.meta.itemId, encryptionKey);
       } catch {
+        if (generation !== roomGeneration) return;
         try {
           if (await applyEncryptedWithRememberedKey(msg)) return;
         } catch { }
+        if (generation !== roomGeneration) return;
         addEncryptedPlaceholder(msg.data, msg.meta);
       }
     } else {
       try {
         if (await applyEncryptedWithRememberedKey(msg)) return;
       } catch { }
+      if (generation !== roomGeneration) return;
       addEncryptedPlaceholder(msg.data, msg.meta);
     }
   }
@@ -4879,129 +4365,67 @@ function markEncrypted(item) {
 }
 
 function handlePayload(payload, receivedEncrypted = false, payloadKey = null, senderId = null) {
-  if (!payload) return;
-  if (!receivedEncrypted) return;
-
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !receivedEncrypted) return;
+  if (['file_request', 'file_metadata', 'file_unavailable', 'chunk_ack', 'transfer_complete', 'transfer_cancel'].includes(payload.type)) {
+    return transferCoordinator.handleControl(payload, senderId);
+  }
   if (payload.type === 'sync_state') {
-    debugLog('retrieve-sync-state', { senderId, items: payload.items?.length || 0, chatMessages: payload.chatMessages?.length || 0, encrypted: receivedEncrypted });
     (payload.chatMessages || []).forEach(message => appendChatMessage(message));
-    (payload.items || []).forEach(item => {
-      if (!items.has(item.id)) {
-        if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
-        const normalized = markEncrypted(item);
-        items.set(item.id, normalized);
-        if (canPublishCardHolder(normalized)) publishClientCardMetadata(normalized);
-      }
-    });
-    renderAll();
-    (payload.items || []).forEach(item => {
-      const normalized = markEncrypted(item);
-      if (expectsIncomingChunks(normalized)) showPendingReceiveProgress(normalized.id, senderId);
-    });
-
+    (payload.items || []).forEach(item => handlePayload({ type: 'item_added', item }, true, payloadKey, senderId));
   } else if (payload.type === 'sync_request') {
-    debugLog('retrieve-request-received', { requesterId: payload.requesterId, itemId: payload.itemId, missingChunks: payload.missingChunks?.length });
-    sendSyncState(payload.requesterId, payload.itemId || null, payload.missingChunks || null);
-
+    if (senderId) sendSyncState(senderId, payload.itemId || null);
   } else if (payload.type === 'transfer_status') {
-    applyRemoteTransferStatus(payload);
-
+    if (payload.sourceId === senderId || payload.targetId === senderId) applyRemoteTransferStatus(payload);
   } else if (payload.type === 'item_added') {
     const item = markEncrypted(payload.item);
-    if (item && !items.has(item.id)) {
-      debugLog('retrieve-card-metadata', { senderId, itemId: item?.id, type: item?.type, filename: item?.filename, size: item?.size, encrypted: !!item?.encrypted });
+    if (!item || !ClipShareTransfers.validId(item.id) || deletedItemIds.has(item.id)) return;
+    pendingTextSync.delete(item.id);
+    if (item.type !== 'text') return;
+    if (!items.has(item.id)) {
       if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
       items.set(item.id, item);
       prependCard(item);
       updateEmpty();
-      if (canPublishCardHolder(item)) publishClientCardMetadata(item);
-      if (expectsIncomingChunks(item)) showPendingReceiveProgress(item.id, senderId);
+      publishClientCardMetadata(item);
     }
-
   } else if (payload.type === 'item_deleted') {
-    forgetPeerCardMetadata(senderId, payload.itemId);
-    const hadItem = items.delete(payload.itemId);
-    if (hadItem) removeManifestMeta(payload.itemId, Date.now());
-    cardEncryptionKeys.delete(payload.itemId);
-    binaryTransfers.delete(payload.itemId);
-    clearOutboundRetriesForItem(payload.itemId);
-    chunkScheduler.cancelItem(payload.itemId);
-    outboundTransfers.delete(payload.itemId);
-    clearAutomaticDownloadRetry(payload.itemId);
-    downloadSourceRetryAttempts.delete(payload.itemId);
-    pendingDownloadSourceIds.delete(payload.itemId);
-    pendingDownloadTriedSources.delete(payload.itemId);
-    pendingChunkRequestBatches.delete(payload.itemId);
-    downloadLogSources.delete(payload.itemId);
-    clearTransferStatusesForItem(payload.itemId);
-    updateSendWakeLock();
-    removeCardAnimated(payload.itemId, updateEmpty);
-
+    if (ClipShareTransfers.validId(payload.itemId)) disposeSharedItem(payload.itemId, { deleted: true });
   } else if (payload.type === 'item_updated') {
-    if (payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
+    if (deletedItemIds.has(payload.itemId)) return;
     const item = items.get(payload.itemId);
-    if (!item || item.type !== 'text') return;
+    if (!item || item.type !== 'text' || typeof payload.content !== 'string') return;
+    if (payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
     item.content = payload.content;
     const el = cardElement(payload.itemId)?.querySelector('.text-content');
     if (el && document.activeElement !== el) el.innerHTML = linkify(payload.content);
-
-  } else if (payload.type === 'chunk_ack') {
-    handleChunkAck(payload.itemId, payload.totalChunks, payload.peerId, payload.receivedChunks, payload.chunkIndex);
-  } else if (payload.type === 'webrtc_offer') {
-    handleWebRtcOffer(payload, senderId);
-  } else if (payload.type === 'webrtc_answer') {
-    handleWebRtcAnswer(payload, senderId);
-  } else if (payload.type === 'webrtc_ice') {
-    handleWebRtcIce(payload, senderId);
-  } else if (payload.type === 'chat_line') {
-    appendChatMessage(payload.message);
-  } else if (payload.type === 'chat_reaction') {
-    toggleChatReaction(payload.messageId, payload.token, { broadcast: false, reactorId: payload.reactorId });
-  } else if (payload.type === 'chat_cleared') {
-    clearChat();
-  }
+  } else if (payload.type === 'webrtc_offer') return handleWebRtcOffer(payload, senderId);
+  else if (payload.type === 'webrtc_answer') return handleWebRtcAnswer(payload, senderId);
+  else if (payload.type === 'webrtc_ice') return handleWebRtcIce(payload, senderId);
+  else if (payload.type === 'chat_line') appendChatMessage(payload.message);
+  else if (payload.type === 'chat_reaction') toggleChatReaction(payload.messageId, payload.token, { broadcast: false, reactorId: senderId });
+  else if (payload.type === 'chat_cleared') clearChat();
 }
 
 // ── Sync ─────────────────────────────────────────────────────────────
-function sendSyncState(targetClientId, requestedItemId = null, requestedChunks = null) {
-  const sendableItems = [...items.values()].filter(i =>
-    (!requestedItemId || i.id === requestedItemId) &&
-    (i.type === 'text' || i.rawBuffer)
-  );
-  const syncItems = sendableItems
-    .filter(item => !cardEncryptionKeys.get(item.id))
-    .map(item => {
-      const { dataUrl, rawBuffer, ...meta } = item;
-      return item.type === 'text' ? item : meta;
-    });
-  debugLog('retrieve-send-state', { targetClientId, requestedItemId, requestedChunks: requestedChunks?.length, items: sendableItems.length, chatMessages: chatMessages.length });
-  if (syncItems.length || (!requestedItemId && chatMessages.length)) {
-    wsSend({
-      type: 'relay',
-      targetId: targetClientId,
-      payload: { type: 'sync_state', items: syncItems, chatMessages: requestedItemId ? [] : chatMessages },
-    });
+function sendSyncState(targetClientId, requestedItemId = null) {
+  if (!targetClientId) return;
+  for (const item of items.values()) {
+    if (item.type !== 'text' || (requestedItemId && item.id !== requestedItemId) || deletedItemIds.has(item.id)) continue;
+    wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'item_added', item } }, cardEncryptionKeys.get(item.id), true);
   }
-  sendableItems.forEach(item => {
-    const cardKey = cardEncryptionKeys.get(item.id) || encryptionKey;
-    if (!cardKey) return;
-    debugLog('starting', { itemId: item.id, targetClientId, type: item.type, filename: item.filename, size: item.size, encrypted: !!cardKey, source: 'sync' });
-    if (item.type === 'text') {
-      wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'item_added', item } }, cardKey, true);
-      return;
-    }
-    // Send item metadata (no binary payload)
-    const { dataUrl, rawBuffer, ...meta } = item;
-    wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'item_added', item: meta } }, cardKey, true);
-
-    sendFileChunksBinaryEncrypted(item, cardKey, targetClientId, requestedChunks);
-  });
+  if (!requestedItemId && chatMessages.length) {
+    wsSend({ type: 'relay', targetId: targetClientId, payload: { type: 'sync_state', items: [], chatMessages } });
+  }
 }
 
 // ── Adding items ─────────────────────────────────────────────────────
 async function paste() {
+  const generation = roomGeneration;
+  const inputGeneration = cardInputGeneration;
+  const live = () => generation === roomGeneration && inputGeneration === cardInputGeneration;
   try {
     const clipItems = await navigator.clipboard.read();
+    if (!live()) return;
     for (const ci of clipItems) {
       const imageType = ci.types.find(t => t.startsWith('image/'));
       if (imageType) {
@@ -5011,19 +4435,20 @@ async function paste() {
         item.rawBuffer = await blob.arrayBuffer();
         item.dataUrl = URL.createObjectURL(blob);
         await prepareImageThumbnail(item, blob);
+        if (!live()) { URL.revokeObjectURL(item.dataUrl); return; }
         addAndBroadcast(item);
         return;
       }
       if (ci.types.includes('text/plain')) {
         const blob = await ci.getType('text/plain');
         const content = await blob.text();
-        if (content) { addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() }); return; }
+        if (live() && content) { addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() }); return; }
       }
     }
   } catch {
     try {
       const content = await navigator.clipboard.readText();
-      if (content) addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() });
+      if (live() && content) addAndBroadcast({ id: randomUUID(), type: 'text', content, addedAt: Date.now() });
     } catch (err) {
       showToast('Could not read clipboard: ' + (err.message || err));
     }
@@ -5033,6 +4458,8 @@ async function paste() {
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 
 async function handleFiles(files, { mentionInChat = false } = {}) {
+  const generation = roomGeneration;
+  const inputGeneration = cardInputGeneration;
   for (const file of files) {
     if (file.size > MAX_FILE_BYTES) {
       showToast(`"${file.name}" exceeds the 128 MB limit`);
@@ -5043,8 +4470,10 @@ async function handleFiles(files, { mentionInChat = false } = {}) {
     const itemType = mimeType.startsWith('image/') ? 'image' : 'file';
     const item = { id: randomUUID(), type: itemType, filename: file.name, mimeType, size: file.size, addedAt: Date.now() };
     item.rawBuffer = await file.arrayBuffer();
+    if (generation !== roomGeneration || inputGeneration !== cardInputGeneration) return;
     item.dataUrl = URL.createObjectURL(file);
     await prepareImageThumbnail(item, file, { force: mentionInChat });
+    if (generation !== roomGeneration || inputGeneration !== cardInputGeneration) { URL.revokeObjectURL(item.dataUrl); return; }
     addAndBroadcast(item);
     if (mentionInChat) appendChatMessage(chatMessageFromCard(item), { broadcast: true });
   }
@@ -5066,6 +4495,11 @@ function addAndBroadcast(item) {
   }
   item.encrypted = true;
   const itemKey = encryptionKey;
+  if (item.type !== 'text') {
+    const geometry = ClipShareTransfers.geometry(item);
+    if (!geometry) return;
+    item.chunkSize = geometry.chunkSize; item.totalChunks = geometry.totalChunks;
+  }
   cardEncryptionKeys.set(item.id, itemKey);
   items.set(item.id, item);
   rememberManifestMeta(clientId, cardMetadataFromItem(item), nextManifestRevision(item.id));
@@ -5076,496 +4510,74 @@ function addAndBroadcast(item) {
 
   if (item.type === 'text') {
     wsSend({ type: 'relay', payload: { type: 'item_added', item } }, itemKey, true);
-  } else {
-    // Strip local-only fields before broadcasting item metadata
-    const { dataUrl, rawBuffer, ...meta } = item;
-    wsSend({ type: 'relay', payload: { type: 'item_added', item: meta } }, itemKey, true);
-    sendFileChunksBinaryEncrypted(item, itemKey);
   }
+
 }
 
-// ── Chunked file sending ────────────────────────────────────────────
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function sendChunkWhenDataSocketReady(item, sendOnce) {
-  while (items.has(item.id)) {
-    if (await sendOnce()) return true;
-    await sleep(250);
+// ── Transfer adapters and observers ──────────────────────────────────
+function sendTransferFrame(peerId, frame, live) {
+  if (!live()) return { status: 'failed' };
+  const channel = webRtcPeers.get(peerId)?.channel;
+  if (channel?.readyState === 'open') {
+    if (channel.bufferedAmount > BINARY_CHUNK_SIZE * 2) return { status: 'blocked' };
+    try { channel.send(frame.buffer); return { status: 'sent', transport: 'webrtc' }; }
+    catch (error) { debugLog('webrtc-fallback', { peerId, error: error?.message || String(error) }); }
   }
-  return false;
-}
-
-async function drainWS() {
-  // Pace sending to match actual network throughput so the sender's
-  // progress bar stays in sync with the receiver's.
-  const highWater = BINARY_CHUNK_SIZE * 2;
-  const start = Date.now();
-  while (dataWs && dataWs.readyState === WebSocket.OPEN && dataWs.bufferedAmount > highWater) {
-    await sleep(8);
-    if (Date.now() - start > 10000) break;
-  }
-}
-
-async function waitForDataWS() {
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) return true;
   if (!dataWs || dataWs.readyState === WebSocket.CLOSED) connectDataWS();
-  const start = Date.now();
-  while (dataWs && dataWs.readyState === WebSocket.CONNECTING) {
-    await sleep(20);
-    if (Date.now() - start > 5000) break;
-  }
-  return !!dataWs && dataWs.readyState === WebSocket.OPEN;
+  if (!dataWs || dataWs.readyState !== WebSocket.OPEN || dataWs.bufferedAmount > BINARY_CHUNK_SIZE * 2) return { status: 'blocked' };
+  if (!live()) return { status: 'failed' };
+  try { dataWs.send(frame.buffer); return { status: 'sent', transport: 'ws' }; }
+  catch { return { status: 'failed' }; }
 }
 
-function trackOutboundPeer(itemId, trackKey, resendMissing = null) {
-  if (!outboundTransfers.has(itemId)) outboundTransfers.set(itemId, new Map());
-  const peerMap = outboundTransfers.get(itemId);
-  const existing = peerMap.get(trackKey) || {};
-  peerMap.set(trackKey, {
-    sent: existing.sent || 0,
-    total: existing.total || 0,
-    startTime: existing.startTime || Date.now(),
-    ackedChunks: existing.ackedChunks || new Set(),
-    retryAttempts: existing.retryAttempts || 0,
-    retryTimer: existing.retryTimer || null,
-    initialDone: existing.initialDone || false,
-    complete: existing.complete || false,
-    currentChunk: existing.currentChunk || 0,
-    resendMissing: resendMissing || existing.resendMissing || null,
-  });
-  refreshOutboundUI(itemId);
-  updateSendWakeLock();
-  return peerMap.get(trackKey);
+function handleBinaryMessage(buffer, transport = 'ws', peerId = null) {
+  return transferCoordinator.acceptFrame(buffer, transport, peerId);
 }
 
-function seedContinuationProgress(itemId, peerId, totalChunks, missingChunks) {
-  const missing = normalizeChunkIndexes(missingChunks, totalChunks);
-  if (!missing || !missing.length) return;
-  const p = outboundTransfers.get(itemId)?.get(peerId);
-  if (!p) return;
-  const missingSet = new Set(missing);
-  p.total = totalChunks;
-  p.ackedChunks ||= new Set();
-  for (let i = 0; i < totalChunks; i++) {
-    if (!missingSet.has(i)) p.ackedChunks.add(i);
-  }
-  p.sent = p.ackedChunks.size;
-  updateOutboundRow(itemId, peerId, p.sent, p.total);
-}
-
-function makeOutboundProgress(itemId, trackKey, resendMissing = null) {
-  trackOutboundPeer(itemId, trackKey, resendMissing);
-  return (sent, total, currentChunk = null) => {
-    const peerMap = outboundTransfers.get(itemId);
-    const p = peerMap?.get(trackKey);
-    if (p) {
-      p.total = total;
-      p.sent = p.resendMissing ? p.ackedChunks.size : sent;
-      if (Number.isFinite(currentChunk)) p.currentChunk = Number(currentChunk) + 1;
-    }
-    updateOutboundRow(itemId, trackKey, p?.sent ?? sent, total);
-  publishTransferStatus({
-    itemId,
-    sourceId: clientId,
-    targetId: trackKey,
-    current: p?.currentChunk || currentChunk || sent,
-    done: p?.sent ?? sent,
-    total,
-    transport: p?.transport || '',
-  });
-    if (p) finishOutboundPeerIfComplete(itemId, trackKey, p);
-  };
-}
-
-function trackOutboundPeers(itemId, peerIds, resendMissingForPeer) {
-  if (!outboundTransfers.has(itemId)) outboundTransfers.set(itemId, new Map());
-  for (const pid of peerIds) {
-    trackOutboundPeer(itemId, pid, indexes => resendMissingForPeer(pid, indexes));
-  }
-  refreshOutboundUI(itemId);
-}
-
-function missingAckedChunks(progress) {
-  const total = progress?.total || 0;
-  const acked = progress?.ackedChunks;
-  if (!total || !acked) return [];
-  const missing = [];
-  for (let i = 0; i < total; i++) {
-    if (!acked.has(i)) missing.push(i);
-  }
-  return missing;
-}
-
-function clearChunkRetry(progress) {
-  if (progress?.retryTimer) {
-    clearTimeout(progress.retryTimer);
-    progress.retryTimer = null;
-  }
-}
-
-function clearOutboundRetriesForItem(itemId) {
-  const peerMap = outboundTransfers.get(itemId);
-  if (!peerMap) return;
-  for (const progress of peerMap.values()) clearChunkRetry(progress);
-}
-
-function clearAllOutboundRetries() {
-  for (const peerMap of outboundTransfers.values()) {
-    for (const progress of peerMap.values()) clearChunkRetry(progress);
-  }
-}
-
-function retryPendingChunksAfterDataReconnect() {
-  for (const [itemId, peerMap] of outboundTransfers) {
-    for (const [peerId, progress] of peerMap) {
-      if (!progress?.initialDone || !progress.resendMissing || progress.sent >= progress.total) continue;
-      clearChunkRetry(progress);
-      progress.retryAttempts = 0;
-      const missing = missingAckedChunks(progress);
-      if (!missing.length) continue;
-      debugLog('retry-chunks-data-socket-open', { itemId, peerId, missing: missing.length });
-      chunkScheduler.enqueue(itemId, -(progress.total || 0), () => retryChunkGenerator(itemId, peerId, missing, progress.resendMissing));
-    }
-  }
-}
-
-function finishOutboundPeerIfComplete(itemId, peerId, progress) {
-  if (!progress.total || progress.sent < progress.total) return;
-  if (progress.complete) return;
-  progress.complete = true;
-  const item = items.get(itemId);
-  if (item?.size && progress.startTime) recordTransferMetric('upload', item.size, progress.startTime);
-  publishTransferStatus({
-    itemId,
-    sourceId: clientId,
-    targetId: peerId,
-    current: progress.total,
-    done: progress.total,
-    total: progress.total,
-    transport: progress.transport || '',
-    status: 'done',
-    force: true,
-  });
-  clearChunkRetry(progress);
-  setTimeout(() => {
-    const pm = outboundTransfers.get(itemId);
-    if (pm) { pm.delete(peerId); if (!pm.size) outboundTransfers.delete(itemId); }
-    refreshOutboundUI(itemId);
-    schedulePeersModalRefresh();
-    updateSendWakeLock();
-  }, 1500);
-}
-
-function scheduleChunkRetry(itemId, peerId, progress) {
-  if (!progress?.initialDone || !progress.resendMissing) return;
-  if (progress.sent >= progress.total) return;
-  if (progress.retryTimer) return;
-  if (progress.retryAttempts >= CHUNK_RETRY_MAX_ATTEMPTS) return;
-  progress.retryTimer = setTimeout(() => {
-    progress.retryTimer = null;
-    const current = outboundTransfers.get(itemId)?.get(peerId);
-    if (!current || current.sent >= current.total) return;
-    const missing = missingAckedChunks(current);
-    if (!missing.length) return;
-    current.retryAttempts++;
-    debugLog('retry-chunks', { itemId, peerId, attempt: current.retryAttempts, missing: missing.length });
-    chunkScheduler.enqueue(itemId, -(current.total || 0), () => retryChunkGenerator(itemId, peerId, missing, current.resendMissing));
-  }, CHUNK_RETRY_DELAY_MS);
-}
-
-async function* retryChunkGenerator(itemId, peerId, chunkIndexes, resendMissing) {
-  await resendMissing(chunkIndexes);
-  const progress = outboundTransfers.get(itemId)?.get(peerId);
-  if (progress) scheduleChunkRetry(itemId, peerId, progress);
-}
-
-function markOutboundInitialDone(itemId, peerIds) {
-  const pm = outboundTransfers.get(itemId);
-  if (!pm) return;
-  for (const peerId of peerIds) {
-    const p = pm.get(peerId);
-    if (!p) continue;
-    p.initialDone = true;
-    scheduleChunkRetry(itemId, peerId, p);
-  }
-}
-
-// ── Chunked file sending (encrypted binary path) ─────────────────────
-
-async function sendEncryptedBinaryChunk(item, key, targetId, chunkIndex, totalChunks) {
-  if (!items.has(item.id) || !item.rawBuffer) return false;
-  const start = chunkIndex * BINARY_CHUNK_SIZE;
-  const chunkBytes = new Uint8Array(item.rawBuffer, start, Math.min(BINARY_CHUNK_SIZE, item.rawBuffer.byteLength - start));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, chunkBytes));
-  const payload = new Uint8Array(12 + ciphertext.length);
-  payload.set(iv, 0);
-  payload.set(ciphertext, 12);
-
-  const header = { t: 'efc', i: item.id, ci: chunkIndex, tc: totalChunks, sid: clientId, crc32: crc32Bytes(payload) };
-  if (targetId) header.tid = targetId;
-  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-  const frame = new Uint8Array(4 + headerBytes.length + payload.length);
-  new DataView(frame.buffer).setUint32(0, headerBytes.length, false);
-  frame.set(headerBytes, 4);
-  frame.set(payload, 4 + headerBytes.length);
-
-  if (targetId && webRtcChannelOpen(targetId) && await sendWebRtcBinaryFrame(targetId, frame)) {
-    return 'webrtc';
-  }
-
-  if (!await waitForDataWS()) return false;
-  await drainWS();
-  if (dataWs && dataWs.readyState === WebSocket.OPEN) {
-    dataWs.send(frame.buffer);
-    return 'ws';
-  }
-  return false;
-}
-
-async function resendEncryptedBinaryChunks(item, key, targetId, chunkIndexes) {
-  if (!item.rawBuffer) return;
-  const totalChunks = Math.ceil(item.rawBuffer.byteLength / BINARY_CHUNK_SIZE) || 1;
-  for (const i of chunkIndexes) {
-    if (i < 0 || i >= totalChunks) continue;
-    await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
-  }
-}
-
-async function* fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress, requestedChunks = null) {
-  if (!item.rawBuffer) return;
-  const buf = item.rawBuffer;
-  const totalChunks = Math.ceil(buf.byteLength / BINARY_CHUNK_SIZE) || 1;
-  const chunkIndexes = normalizeChunkIndexes(requestedChunks, totalChunks) || Array.from({ length: totalChunks }, (_, i) => i);
-  if (targetId) seedContinuationProgress(item.id, targetId, totalChunks, requestedChunks);
-  onProgress(0, totalChunks); // initialise outbound row; bar advances via ACKs
-  logUploadStart(item.id, targetId, totalChunks, targetId && webRtcChannelOpen(targetId) ? 'webrtc' : '');
-
-  for (const i of chunkIndexes) {
-    if (!items.has(item.id)) return;
-    let sent = false;
-    let chunkTransport = '';
-    if (targetId) {
-      sent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, targetId, i, totalChunks));
-      const progress = outboundTransfers.get(item.id)?.get(targetId);
-      if (sent === 'webrtc' && progress) progress.transport = 'webrtc';
-      if (sent === 'webrtc') chunkTransport = 'webrtc';
-    } else {
-      const peers = [...connectedPeers.keys()];
-      if (!peers.length) sent = true;
-      else {
-        sent = true;
-        for (const peerId of peers) {
-          const peerSent = await sendChunkWhenDataSocketReady(item, () => sendEncryptedBinaryChunk(item, key, peerId, i, totalChunks));
-          const progress = outboundTransfers.get(item.id)?.get(peerId);
-          if (peerSent === 'webrtc' && progress) progress.transport = 'webrtc';
-          if (peerSent === 'webrtc') chunkTransport = 'webrtc';
-          if (!peerSent) sent = false;
-        }
-      }
-    }
-    if (!sent) return;
-    logUploadChunk(item.id, i, totalChunks, targetId, chunkTransport);
-    yield;
-  }
-  if (targetId) markOutboundInitialDone(item.id, [targetId]);
-  else markOutboundInitialDone(item.id, [...connectedPeers.keys()]);
-  const doneTransport = targetId
-    ? outboundTransfers.get(item.id)?.get(targetId)?.transport
-    : [...(outboundTransfers.get(item.id)?.values() || [])].some(progress => progress.transport === 'webrtc') ? 'webrtc' : '';
-  logUploadDone(item.id, targetId, doneTransport);
-}
-
-function sendFileChunksBinaryEncrypted(item, key, targetId, requestedChunks = null) {
-  if (targetId) {
-    const resendMissing = indexes => resendEncryptedBinaryChunks(item, key, targetId, indexes);
-    const onProgress = makeOutboundProgress(item.id, targetId, resendMissing);
-    chunkScheduler.enqueue(item.id, -(item.size || 0),
-      () => fileChunkGeneratorBinaryEncrypted(item, key, targetId, onProgress, requestedChunks));
-    return;
-  }
-
-  const peerIds = [...connectedPeers.keys()];
-  if (!peerIds.length) {
-    chunkScheduler.enqueue(item.id, item.size || 0,
-      () => fileChunkGeneratorBinaryEncrypted(item, key, null, () => {}));
-    return;
-  }
-
-  trackOutboundPeers(item.id, peerIds, (pid, indexes) => resendEncryptedBinaryChunks(item, key, pid, indexes));
-
-  const onProgress = (sent, total) => {
-    const pm = outboundTransfers.get(item.id);
-    for (const pid of peerIds) {
-      const p = pm?.get(pid);
-      if (p) {
-        p.total = total;
-        p.sent = p.resendMissing ? p.ackedChunks.size : sent;
-        p.currentChunk = sent;
-      }
-      updateOutboundRow(item.id, pid, p?.sent ?? sent, total);
-      publishTransferStatus({
-        itemId: item.id,
-        sourceId: clientId,
-        targetId: pid,
-        current: p?.currentChunk || sent,
-        done: p?.sent ?? sent,
-        total,
-        transport: p?.transport || '',
-      });
-    }
-  };
-
-  chunkScheduler.enqueue(item.id, item.size || 0,
-    () => fileChunkGeneratorBinaryEncrypted(item, key, null, onProgress));
-}
-
-// ── Chunked file receiving (binary path) ────────────────────────────
-
-function handleBinaryMessage(buffer, transport = 'ws') {
-  if (buffer.byteLength < 4) return;
-  const view = new DataView(buffer);
-  const headerLen = view.getUint32(0, false);
-  if (buffer.byteLength < 4 + headerLen) return;
-  let header;
-  try {
-    header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, headerLen)));
-  } catch { return; }
-  if (header.t === 'efc') {
-    if (!isValidChunkSet(header.ci, header.tc)) {
-      debugLog('chunk-invalid', { itemId: header.i, chunkIndex: header.ci, totalChunks: header.tc, path: 'encrypted-binary' });
-      return;
-    }
-    const key = cardEncryptionKeys.get(header.i) || encryptionKey;
-    const payload = buffer.slice(4 + headerLen);
-    const sid = header.sid;
-    if (Number.isFinite(header.crc32) && crc32Bytes(new Uint8Array(payload)) !== (header.crc32 >>> 0)) {
-      debugLog('chunk-crc-failed', { itemId: header.i, chunkIndex: header.ci, path: 'encrypted-binary' });
-      return;
-    }
-    if (!key) {
-      const receivedChunks = storeEncryptedBinaryChunk(header, payload);
-      continueChunkRequestBatch(header.i, header.ci, sid);
-      sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
-      return;
-    }
-    crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(payload, 0, 12) }, key, payload.slice(12))
-      .then(plain => {
-        const receivedChunks = handleBinaryFileChunk(header.i, header.ci, header.tc, plain, sid, transport);
-        sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
-      })
-      .catch(() => {
-        const receivedChunks = storeEncryptedBinaryChunk(header, payload);
-        continueChunkRequestBatch(header.i, header.ci, sid);
-        sendChunkAck(header.i, header.tc, sid, receivedChunks, header.ci);
-      });
-    return;
-  }
-}
-
-function sendChunkAck(itemId, totalChunks, senderId, receivedChunks, chunkIndex) {
-  if (!senderId || !ws || ws.readyState !== WebSocket.OPEN) return;
-  wsSend({
-    type: 'relay',
-    targetId: senderId,
-    payload: { type: 'chunk_ack', itemId, totalChunks, receivedChunks, chunkIndex, peerId: clientId },
-  }, null, true);
-}
-
-function handleChunkAck(itemId, totalChunks, peerId, receivedChunks, chunkIndex) {
-  const pm = outboundTransfers.get(itemId);
-  const p = pm?.get(peerId);
-  if (!p) return;
-  const normalizedTotal = Number(totalChunks);
-  if (!p.total && Number.isInteger(normalizedTotal) && normalizedTotal > 0 && normalizedTotal <= MAX_TRANSFER_CHUNKS) {
-    p.total = normalizedTotal;
-  }
-  if (!p.total) return;
-  if (Number.isFinite(chunkIndex)) {
-    const index = Number(chunkIndex);
-    if (!isValidChunkIndex(index, p.total)) return;
-    p.ackedChunks ||= new Set();
-    p.ackedChunks.add(index);
-    p.currentChunk = index + 1;
-    p.sent = p.ackedChunks.size;
-  } else if (Number.isFinite(receivedChunks)) {
-    p.sent = Math.min(Math.max(receivedChunks, p.sent || 0), p.total);
-  } else {
-    return;
-  }
-  if (p.sent < p.total) scheduleChunkRetry(itemId, peerId, p);
-  updateOutboundRow(itemId, peerId, p.sent, p.total);
-  finishOutboundPeerIfComplete(itemId, peerId, p);
-}
-
-function handleBinaryFileChunk(itemId, chunkIndex, totalChunks, chunkBuffer, senderId, transport = '') {
-  if (!isValidChunkSet(chunkIndex, totalChunks)) {
-    debugLog('chunk-invalid', { itemId, chunkIndex, totalChunks, path: 'binary-receive' });
-    return 0;
-  }
-  if (!binaryTransfers.has(itemId) && items.get(itemId)?.rawBuffer) return totalChunks;
-  if (!binaryTransfers.has(itemId)) {
-    binaryTransfers.set(itemId, { chunks: new Array(totalChunks).fill(null), chunkSources: new Array(totalChunks).fill(''), received: 0, totalChunks, senderId, currentChunk: 0, startTime: Date.now() });
-    pendingDownloadTriedSources.delete(itemId);
-  }
-  const t = binaryTransfers.get(itemId);
-  if (senderId) t.senderId = senderId;
-  if (transport === 'webrtc') t.transport = 'webrtc';
-  t.currentChunk = chunkIndex + 1;
-  if (t.chunks[chunkIndex] === null) {
-    logDownloadSourceStart(itemId, senderId || t.senderId, totalChunks, transport);
-    logDownloadChunk(itemId, chunkIndex, totalChunks, senderId || t.senderId, transport);
-    t.chunks[chunkIndex] = chunkBuffer;
-    t.chunkSources[chunkIndex] = senderId || t.senderId || '';
-    t.received++;
-  }
-  continueChunkRequestBatch(itemId, chunkIndex, senderId || t.senderId);
-  updateTransferProgress(itemId, t.received / t.totalChunks, t);
-  if (t.received === t.totalChunks) {
-    logDownloadDone(itemId, t.chunkSources, t.transport || '');
-    if (t.senderId) {
-      publishTransferStatus({
-        itemId,
-        sourceId: t.senderId,
-        targetId: clientId,
-        current: t.totalChunks,
-        done: t.totalChunks,
-        total: t.totalChunks,
-        chunkRuns: transferChunkRunsFromSources(t.chunkSources, t.totalChunks),
-        transport: t.transport || '',
-        status: 'done',
-        force: true,
-      });
-    }
-    binaryTransfers.delete(itemId);
-    schedulePeersModalRefresh();
-    clearAutomaticDownloadRetry(itemId);
-    downloadSourceRetryAttempts.delete(itemId);
-    pendingDownloadSourceIds.delete(itemId);
-    pendingDownloadTriedSources.delete(itemId);
-    pendingChunkRequestBatches.delete(itemId);
-    finalizeTransferBinary(itemId, t.chunks, t.startTime);
-  }
-  return t.received;
-}
-
-async function finalizeTransferBinary(itemId, chunks, startTime = Date.now()) {
-  const item = items.get(itemId);
-  if (!item) return;
-  const totalBytes = chunks.reduce((s, c) => s + c.byteLength, 0);
-  recordTransferMetric('download', totalBytes, startTime);
-  const assembled = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) { assembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
-  const blob = new Blob([assembled], { type: item.mimeType || 'application/octet-stream' });
-  item.rawBuffer = assembled.buffer;
+async function commitTransferredFile(meta, buffer, live) {
+  if (!live() || deletedItemIds.has(meta.id)) return false;
+  const item = items.get(meta.id);
+  if (!item) return false;
+  const blob = new Blob([buffer], { type: meta.mimeType || 'application/octet-stream' });
+  const preview = { ...item };
+  await prepareImageThumbnail(preview, blob);
+  if (!live() || deletedItemIds.has(meta.id) || items.get(meta.id) !== item) return false;
+  item.rawBuffer = buffer;
   item.dataUrl = URL.createObjectURL(blob);
-  await prepareImageThumbnail(item, blob);
-  publishClientCardMetadata(item);
-  finalizeCardInPlace(item);
+  item.thumbnailDataUrl = preview.thumbnailDataUrl;
+  return true;
+}
+
+function onIncomingTransfer(record) {
+  if (deletedItemIds.has(record.itemId)) return;
+  let item = items.get(record.itemId);
+  if (!item) {
+    item = markEncrypted({ ...record.meta });
+    items.set(item.id, item);
+    cardEncryptionKeys.set(item.id, encryptionKey);
+    prependCard(item);
+    updateEmpty();
+  }
+  updateTransferProgress(item.id, record.received / record.totalChunks, record);
+  if (record.state === 'complete') {
+    recordTransferMetric('download', item.size, record.startTime);
+    publishClientCardMetadata(item);
+    finalizeCardInPlace(item);
+  }
+}
+
+function onOutgoingTransfer(itemId, peerId, record) {
+  refreshOutboundUI(itemId);
+  if (record) {
+    publishTransferStatus({ itemId, sourceId: clientId, targetId: peerId,
+      current: record.currentChunk, done: record.sent, total: record.total,
+      transport: record.transport, status: record.complete ? 'done' : 'active', force: record.complete });
+    if (record.complete) {
+      const item = items.get(itemId);
+      if (item) recordTransferMetric('upload', item.size, record.startTime);
+    }
+  }
+  schedulePeersModalRefresh();
 }
 
 function updateTransferProgress(itemId, fraction, transfer) {
@@ -5574,7 +4586,7 @@ function updateTransferProgress(itemId, fraction, transfer) {
     schedulePeersModalRefresh();
     return;
   }
-  const pct = transferPercent(fraction);
+  const pct = transfer?.state === 'complete' ? 100 : Math.min(99, transferPercent(fraction));
 
   let section = card.querySelector('.inbound-progress');
   if (!section) {
@@ -5612,12 +4624,6 @@ function updateTransferProgress(itemId, fraction, transfer) {
       force: pct >= 100,
     });
   }
-  if (pct >= 100) {
-    clearAutomaticDownloadRetry(itemId);
-    downloadSourceRetryAttempts.delete(itemId);
-  } else if (transfer) {
-    scheduleAutomaticDownloadRetry(itemId, transfer);
-  }
   schedulePeersModalRefresh();
   refreshIcons();
 }
@@ -5647,7 +4653,7 @@ function refreshOutboundUI(itemId) {
   section.className = 'outbound-progress';
   let html = '<div class="outbound-progress-title">Sending…</div>';
   for (const [key, p] of peerMap) {
-    const pct = transferPercentFromCounts(p.sent, p.total);
+    const pct = p.complete ? 100 : Math.min(99, transferPercentFromCounts(p.sent, p.total));
     html += `<div class="outbound-peer-row">
       <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml([key], 'transfer-peer-icons-inline')}</div>
       <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="${escAttr(`ob-fill-${itemId}-${key}`)}" style="width:${pct}%"></div></div>
@@ -5663,16 +4669,6 @@ function refreshOutboundUI(itemId) {
     requestAnimationFrame(() => requestAnimationFrame(() => section.classList.add('op-visible')));
   }
   refreshIcons();
-}
-
-function updateOutboundRow(itemId, key, sent, total) {
-  const pct = transferPercentFromCounts(sent, total);
-  const fill = document.getElementById(`ob-fill-${itemId}-${key}`);
-  if (fill) fill.style.width = pct + '%';
-  const eta = document.getElementById(`ob-eta-${itemId}-${key}`);
-  if (!eta) { schedulePeersModalRefresh(); return; }
-  eta.textContent = `${pct}%`;
-  schedulePeersModalRefresh();
 }
 
 // ── Text editing ─────────────────────────────────────────────────────
@@ -5741,42 +4737,33 @@ function removeCardAnimated(id, done) {
   el.addEventListener('animationend', () => { el.remove(); done?.(); }, { once: true });
 }
 
-function deleteItem(id) {
+function disposeSharedItem(id, { deleted = false, broadcast = false } = {}) {
   const item = items.get(id);
-  items.delete(id);
-  const cardKey = cardEncryptionKeys.get(id);
-  cardEncryptionKeys.delete(id);
-  binaryTransfers.delete(id);
-  chunkScheduler.cancelItem(id);
-  clearOutboundRetriesForItem(id);
-  outboundTransfers.delete(id);
-  clearAutomaticDownloadRetry(id);
-  downloadSourceRetryAttempts.delete(id);
-  pendingDownloadSourceIds.delete(id);
-  pendingDownloadTriedSources.delete(id);
-  pendingChunkRequestBatches.delete(id);
-  downloadLogSources.delete(id);
-  clearTransferStatusesForItem(id);
-  updateSendWakeLock();
-  removeManifestMeta(id, nextManifestRevision(id));
-  publishClientCardRemoval(id, 'local-delete');
-  if (item?.type !== 'encrypted' || cardKey) {
-    wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, cardKey);
+  const key = cardEncryptionKeys.get(id) || encryptionKey;
+  if (deleted) {
+    deletedItemIds.add(id);
+    removeManifestMeta(id, nextManifestRevision(id));
+    if (broadcast) {
+      publishClientCardRemoval(id, 'local-delete');
+      wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, key);
+    }
   }
+  transferCoordinator.cancelFile(id, deleted);
+  if (item?.dataUrl?.startsWith('blob:')) URL.revokeObjectURL(item.dataUrl);
+  items.delete(id);
+  cardEncryptionKeys.delete(id);
+  pendingTextSync.delete(id);
+  clearTimeout(editTimers.get(id));
+  editTimers.delete(id);
+  clearTransferStatusesForItem(id);
   removeCardAnimated(id, updateEmpty);
+  updateSendWakeLock();
 }
 
+function deleteItem(id) { disposeSharedItem(id, { deleted: true, broadcast: true }); }
+
 // ── Rendering ────────────────────────────────────────────────────────
-function renderAll() {
-  const container = document.getElementById('cards');
-  container.innerHTML = '';
-  [...items.values()]
-    .filter(item => item.type !== 'encrypted')
-    .sort((a, b) => b.addedAt - a.addedAt)
-    .forEach(item => container.appendChild(buildCard(item)));
-  updateEmpty();
-  refreshIcons();
-}
+
 
 function prependCard(item) {
   if (item.type === 'encrypted') {

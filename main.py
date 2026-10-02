@@ -4,10 +4,13 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import re
 import struct
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -19,6 +22,29 @@ app = FastAPI()
 
 STATIC_DIR = Path(__file__).parent / "static"
 BINARY_SEND_TIMEOUT_SECONDS = 15
+TRANSFER_PROTOCOL_VERSION = 2
+BINARY_CHUNK_SIZE = 65536
+MAX_TRANSFER_CHUNKS = 2048
+BINARY_HEADER_LIMIT = 4096
+ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
+
+
+def valid_id(value):
+    return isinstance(value, str) and ID_PATTERN.fullmatch(value) is not None
+
+
+def valid_binary_header(header):
+    return (
+        isinstance(header, dict)
+        and header.get("v") == TRANSFER_PROTOCOL_VERSION
+        and header.get("t") == "efc"
+        and all(valid_id(header.get(key)) for key in ("i", "x", "q", "sid", "rid"))
+        and type(header.get("tc")) is int
+        and 1 <= header["tc"] <= MAX_TRANSFER_CHUNKS
+        and type(header.get("ci")) is int
+        and 0 <= header["ci"] < header["tc"]
+        and header.get("tid") == header.get("rid")
+    )
 PAIRING_REQUEST_MIN_INTERVAL_MS = 5_000
 PAIRING_MAX_UNUSED_PINS = 5
 PAIRING_PIN_TIMEOUT_MS = 60_000
@@ -27,6 +53,7 @@ INDEX_ASSET_PATHS = (
     "/static/icon-maskable.svg",
     "/static/style.css",
     "/static/app.js",
+    "/static/transfer-core.js",
 )
 MANIFEST_PATH = "/static/manifest.webmanifest"
 WEBRTC_ICE_SERVERS_ENV = "WEBRTC_ICE_SERVERS_JSON"
@@ -48,9 +75,7 @@ logger = logging.getLogger("uvicorn.error")
 class ConnectionManager:
     def __init__(self):
         # {token: {clientId: {"control": WebSocket, "data": WebSocket, "peer_number": int}}}
-        self.connections: Dict[str, Dict[str, Dict[str, WebSocket]]] = {}
-        # {token: {clientId: {itemId: metadata}}}
-        self.metadata: Dict[str, Dict[str, Dict[str, dict]]] = {}
+        self.connections: Dict[str, Dict[str, dict]] = {}
         # {token: {itemId: encrypted manifest record}}; volatile, rebuilt by connected clients after restart
         self.manifest: Dict[str, Dict[str, dict]] = {}
         # {token: {clientId: metrics}} volatile client network/device metrics for the active room
@@ -63,6 +88,37 @@ class ConnectionManager:
         self.pairing_request_times: Dict[str, Dict[str, int]] = {}
         # {token: int} monotonically increasing counter so numbers never reuse after a peer leaves
         self.peer_counters: Dict[str, int] = {}
+        # Independent, bounded writers prevent one slow recipient from blocking the sender's data reader.
+        self.binary_writers = {}
+        self.control_send_locks = weakref.WeakKeyDictionary()
+
+    def _cancel_binary_writer(self, ws):
+        state = self.binary_writers.pop(ws, None)
+        if state:
+            state["task"].cancel()
+
+    def _queue_binary(self, ws, data):
+        state = self.binary_writers.get(ws)
+        if state is None:
+            state = {"queue": asyncio.Queue(maxsize=32)}
+            self.binary_writers[ws] = state
+            state["task"] = asyncio.create_task(self._drain_binary(ws, state))
+        try:
+            state["queue"].put_nowait(data)
+            return True
+        except asyncio.QueueFull:
+            # No ACK will be produced; the receiver requests the missing chunks.
+            return False
+
+    async def _drain_binary(self, ws, state):
+        try:
+            while not state["queue"].empty():
+                data = state["queue"].get_nowait()
+                if not await self._send_bytes(ws, data):
+                    break
+        finally:
+            if self.binary_writers.get(ws) is state:
+                self.binary_writers.pop(ws, None)
 
     def _peer_ip(self, ws: WebSocket):
         return ws.client.host if ws.client else None
@@ -120,10 +176,10 @@ class ConnectionManager:
             clean["deviceType"] = device_type
         for key in ("pingMs", "uploadBps", "downloadBps"):
             value = metrics.get(key)
-            if isinstance(value, (int, float)) and value >= 0:
-                clean[key] = min(float(value), 10_000_000_000)
+            if type(value) in (int, float) and value >= 0 and (type(value) is int or math.isfinite(value)):
+                clean[key] = float(min(value, 10_000_000_000))
         updated_at = metrics.get("updatedAt")
-        if isinstance(updated_at, (int, float)) and updated_at >= 0:
+        if type(updated_at) in (int, float) and 0 <= updated_at <= 9007199254740991:
             clean["updatedAt"] = int(updated_at)
         return clean
 
@@ -147,7 +203,6 @@ class ConnectionManager:
     async def connect(self, token: str, client_id: str, ws: WebSocket, channel: str = "control") -> bool:
         await ws.accept()
         peers = self.connections.setdefault(token, {})
-        token_metadata = self.metadata.setdefault(token, {})
         self.manifest.setdefault(token, {})
         token_metrics = self.client_metrics.setdefault(token, {})
         channel = "data" if channel == "data" else "control"
@@ -159,6 +214,7 @@ class ConnectionManager:
                 return False
             old_ws = existing.get("data")
             existing["data"] = ws
+            self._cancel_binary_writer(old_ws)
             try:
                 if old_ws:
                     await old_ws.close()
@@ -197,7 +253,6 @@ class ConnectionManager:
             "peer_number": n,
             "metrics": token_metrics.get(client_id, {}),
         }
-        token_metadata.setdefault(client_id, {})
         token_metrics.setdefault(client_id, peers[client_id]["metrics"])
         await self._send(ws, {"type": "welcome", "clientId": client_id,
                                "peerCount": peer_count, "encrypted": True,
@@ -226,18 +281,13 @@ class ConnectionManager:
             return
         if channel == "data":
             entry.pop("data", None)
+            self._cancel_binary_writer(ws)
             return
         data_ws = entry.get("data")
-        if data_ws:
-            try:
-                await data_ws.close()
-            except Exception:
-                pass
+        self._cancel_binary_writer(data_ws)
         peers.pop(client_id, None)
-        token_metadata = self.metadata.get(token, {})
         token_metrics = self.client_metrics.get(token, {})
         token_pairing_requests = self.pairing_request_times.get(token, {})
-        token_metadata.pop(client_id, None)
         disconnected_pairing_host = self.pairing_hosts.get(token, {}).pop(client_id, None)
         self.pairing_pin_limits.get(token, {}).pop(client_id, None)
         if disconnected_pairing_host:
@@ -246,9 +296,9 @@ class ConnectionManager:
                 token, client_id, self._peer_number(token, client_id),
             )
         token_pairing_requests.pop(client_id, None)
+        token_metrics.pop(client_id, None)
         if not peers:
             self.connections.pop(token, None)
-            self.metadata.pop(token, None)
             self.manifest.pop(token, None)
             self.client_metrics.pop(token, None)
             self.peer_counters.pop(token, None)
@@ -256,11 +306,24 @@ class ConnectionManager:
             self.pairing_pin_limits.pop(token, None)
             self.pairing_request_times.pop(token, None)
         else:
-            await self._remove_manifest_holder(token, client_id)
-            token_metrics.pop(client_id, None)
-            await self._broadcast(token, {"type": "peer_left", "clientId": client_id})
+            updates = self._remove_manifest_holder(token, client_id)
+            events = [{"type": "manifest_updated", "record": record, "senderId": client_id} for record in updates]
+            events.append({"type": "peer_left", "clientId": client_id})
             if disconnected_pairing_host:
-                await self._publish_pairing_hosts(token)
+                events.append({"type": "pairing_hosts", "hosts": self._active_pairing_hosts(token)})
+            # Queue all departure events before yielding. Per-socket locks preserve their order
+            # relative to a subsequent reconnect's peer_joined broadcast.
+            await asyncio.gather(*[
+                self._send(entry["control"], event)
+                for entry in list(peers.values()) if entry.get("control") for event in events
+            ])
+
+        # Room state is detached before awaiting close, so a reconnect cannot be removed here.
+        if data_ws:
+            try:
+                await data_ws.close()
+            except Exception:
+                pass
 
     def _sync_sources(self, token: str, exclude: str):
         grouped: Dict[str, list] = {}
@@ -271,7 +334,7 @@ class ConnectionManager:
             item_id = record.get("itemId")
             if not item_id:
                 continue
-            for holder_id in record.get("holders") or [record.get("ownerId")]:
+            for holder_id in record.get("holders") or []:
                 if not holder_id or holder_id == exclude or holder_id not in connected:
                     continue
                 grouped.setdefault(holder_id, []).append({"id": item_id})
@@ -288,17 +351,17 @@ class ConnectionManager:
 
     def _clean_manifest_record(self, msg: dict, owner_id: str):
         item_id = msg.get("itemId")
-        if not item_id:
+        if not valid_id(item_id):
             return None
         revision = msg.get("revision")
-        if not isinstance(revision, (int, float)):
-            revision = 0
+        if type(revision) is not int or revision < 0 or revision > 9007199254740991:
+            return None
         record = {
             "itemId": str(item_id),
             "ownerId": owner_id,
             "holders": [owner_id],
             "revision": int(revision),
-            "updatedAt": int(msg.get("updatedAt") or 0),
+            "updatedAt": msg.get("updatedAt") if type(msg.get("updatedAt")) is int else 0,
             "deleted": bool(msg.get("deleted")),
         }
         encrypted_meta = msg.get("encryptedMeta")
@@ -330,10 +393,10 @@ class ConnectionManager:
             "senderId": sender_id,
         })
 
-    async def _remove_manifest_holder(self, token: str, client_id: str):
+    def _remove_manifest_holder(self, token: str, client_id: str):
         records = self.manifest.get(token)
         if not records:
-            return
+            return []
         now = int(time.time() * 1000)
         updates = []
         for item_id, existing in list(records.items()):
@@ -354,15 +417,11 @@ class ConnectionManager:
                     updated["ownerId"] = updated["holders"][0]
             else:
                 updated["holders"] = []
-                updated["deleted"] = True
+                # Availability loss is reversible; only explicit deletion is a tombstone.
+                updated["deleted"] = False
             records[item_id] = updated
             updates.append(updated)
-        for record in updates:
-            await self._broadcast(token, {
-                "type": "manifest_updated",
-                "record": record,
-                "senderId": client_id,
-            })
+        return updates
 
     async def _publish_pairing_hosts(self, token: str):
         await self._broadcast(token, {
@@ -374,7 +433,7 @@ class ConnectionManager:
         if msg.get("pairingVersion") != "speke-v1":
             return
         pin_id = msg.get("pinId")
-        if not pin_id:
+        if not valid_id(pin_id):
             return
         now = int(time.time() * 1000)
         current_host_id = self._current_pairing_host_id(token)
@@ -427,7 +486,7 @@ class ConnectionManager:
         existing = self.pairing_hosts.get(token, {}).get(sender_id)
         is_new_host = not old_pin_id
         expires_at = msg.get("expiresAt")
-        if not isinstance(expires_at, (int, float)):
+        if type(expires_at) not in (int, float) or (type(expires_at) is float and not math.isfinite(expires_at)):
             expires_at = now + PAIRING_PIN_TIMEOUT_MS
         expires_at = int(min(max(expires_at, now + 1000), now + PAIRING_PIN_TIMEOUT_MS + 10_000))
         if is_new_host:
@@ -472,52 +531,6 @@ class ConnectionManager:
         token_limits[sender_id] = now
         return 0
 
-    def _item_metadata(self, item: dict, encrypted: bool = False):
-        if not isinstance(item, dict):
-            return None
-        item_id = item.get("id")
-        if not item_id:
-            return None
-        allowed = ("id", "type", "filename", "mimeType", "size", "addedAt", "encrypted", "thumbnailDataUrl")
-        meta = {key: item[key] for key in allowed if key in item}
-        meta["id"] = item_id
-        if encrypted:
-            meta["encrypted"] = True
-        return meta
-
-    def _record_payload_metadata(self, token: str, client_id: str, payload: dict, encrypted: bool = False):
-        if not isinstance(payload, dict):
-            return
-        client_items = self.metadata.setdefault(token, {}).setdefault(client_id, {})
-        payload_type = payload.get("type")
-        if payload_type == "item_added":
-            meta = self._item_metadata(payload.get("item"), encrypted)
-            if meta:
-                client_items[meta["id"]] = meta
-        elif payload_type == "item_deleted":
-            client_items.pop(payload.get("itemId"), None)
-        elif payload_type == "item_updated":
-            item_id = payload.get("itemId")
-            if item_id in client_items:
-                client_items[item_id]["updatedAt"] = payload.get("updatedAt")
-        elif payload_type == "clear_all":
-            client_items.clear()
-
-    def _record_encrypted_metadata(self, token: str, client_id: str, msg: dict):
-        meta = msg.get("meta")
-        if not isinstance(meta, dict):
-            return
-        client_items = self.metadata.setdefault(token, {}).setdefault(client_id, {})
-        if meta.get("payloadType") == "item_added" and meta.get("itemId"):
-            client_items[meta["itemId"]] = {
-                "id": meta["itemId"],
-                "type": meta.get("itemType", "encrypted"),
-                "addedAt": meta.get("addedAt"),
-                "encrypted": True,
-            }
-        elif meta.get("payloadType") == "item_deleted":
-            client_items.pop(meta.get("itemId"), None)
-
     def _channel_ws(self, token: str, client_id: str, channel: str):
         entry = self.connections.get(token, {}).get(client_id, {})
         return entry.get(channel)
@@ -531,8 +544,14 @@ class ConnectionManager:
     async def relay(self, token: str, sender_id: str, raw: str, channel: str = "control"):
         try:
             msg = json.loads(raw)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return
+
+        if not isinstance(msg, dict):
+            return
+        for key in ('targetId', 'requestId'):
+            if key in msg and not valid_id(msg[key]):
+                return
 
         if msg.get("type") == "metrics_ping":
             sender_ws = self.connections.get(token, {}).get(sender_id, {}).get("control")
@@ -550,6 +569,7 @@ class ConnectionManager:
                 await self._send(sender_ws, {
                     "type": "metadata_snapshot",
                     "sources": self._sync_sources(token, sender_id),
+                    "manifest": self._manifest_records(token),
                 })
             return
 
@@ -578,12 +598,14 @@ class ConnectionManager:
             request_id = msg.get("requestId")
             pake_start = msg.get("pakeStart")
             target_ids = msg.get("hostIds")
-            if not request_id or not isinstance(pake_start, dict):
+            if not valid_id(request_id) or not isinstance(pake_start, dict):
                 return
             active_hosts = self._active_pairing_hosts(token, sender_id)
             allowed_hosts = {host["clientId"] for host in active_hosts}
             if isinstance(target_ids, list) and target_ids:
-                host_ids = [str(host_id) for host_id in target_ids if str(host_id) in allowed_hosts]
+                if not all(valid_id(host_id) for host_id in target_ids):
+                    return
+                host_ids = [host_id for host_id in target_ids if host_id in allowed_hosts]
             else:
                 host_ids = list(allowed_hosts)
             if not host_ids:
@@ -672,7 +694,6 @@ class ConnectionManager:
             return
 
         if msg.get("type") == "encrypted":
-            self._record_encrypted_metadata(token, sender_id, msg)
             target_id = msg.get("targetId")
             forwarded = dict(msg)
             forwarded["senderId"] = sender_id
@@ -687,38 +708,34 @@ class ConnectionManager:
         return
 
     async def relay_binary(self, token: str, sender_id: str, data: bytes):
-        # Binary frame format:
-        #   [4B Uint32 BE: header_len] [header_len bytes: JSON header] [remaining: chunk data]
-        # Header fields: t (type), i (itemId), ci (chunkIndex), tc (totalChunks), tid (targetId, optional)
         if len(data) < 4:
             return
         header_len = struct.unpack('>I', data[:4])[0]
-        if len(data) < 4 + header_len:
+        payload_size = len(data) - 4 - header_len
+        if not 1 <= header_len <= BINARY_HEADER_LIMIT or not 28 <= payload_size <= BINARY_CHUNK_SIZE + 28:
             return
         try:
             header = json.loads(data[4:4 + header_len].decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             return
-        if header.get("t") != "efc":
+        if not valid_binary_header(header):
             return
-
-        target_id = header.pop('tid', None)
-
-        # Rebuild frame without targetId so relay frame is smaller
-        new_header_bytes = json.dumps(header, separators=(',', ':')).encode('utf-8')
-        relay_frame = struct.pack('>I', len(new_header_bytes)) + new_header_bytes + data[4 + header_len:]
-
-        if target_id:
-            entry = self.connections.get(token, {}).get(target_id, {})
-            peer_ws = entry.get("data")
-            if peer_ws:
-                await self._send_bytes(peer_ws, relay_frame)
-        else:
-            await self._broadcast_bytes(token, relay_frame, exclude=sender_id)
+        # Never trust a frame's asserted identity. The receiver authenticates this field too.
+        header['sid'] = sender_id
+        target_id = header.pop('tid')
+        entry = self.connections.get(token, {}).get(target_id, {})
+        peer_ws = entry.get("data")
+        if not peer_ws:
+            return
+        encoded = json.dumps(header, separators=(',', ':')).encode('utf-8')
+        frame = struct.pack('>I', len(encoded)) + encoded + data[4 + header_len:]
+        self._queue_binary(peer_ws, frame)
 
     async def _send(self, ws: WebSocket, msg: dict):
         try:
-            await ws.send_json(msg)
+            lock = self.control_send_locks.setdefault(ws, asyncio.Lock())
+            async with lock:
+                await asyncio.wait_for(ws.send_json(msg), timeout=BINARY_SEND_TIMEOUT_SECONDS)
         except Exception:
             pass
 
@@ -739,11 +756,6 @@ class ConnectionManager:
             *[self._send(entry["control"], msg) for cid, entry in peers.items() if cid != exclude and entry.get("control")]
         )
 
-    async def _broadcast_bytes(self, token: str, data: bytes, exclude: Optional[str] = None):
-        peers = self.connections.get(token, {})
-        await asyncio.gather(
-            *[self._send_bytes(entry["data"], data) for cid, entry in peers.items() if cid != exclude and entry.get("data")]
-        )
 
 
 manager = ConnectionManager()
@@ -872,8 +884,18 @@ async def websocket_endpoint(
     token: str,
     clientId: Optional[str] = None,
     channel: str = "control",
+    protocolVersion: Optional[str] = None,
 ):
+    if protocolVersion != str(TRANSFER_PROTOCOL_VERSION):
+        await ws.accept()
+        await ws.send_json({"type": "refresh_required", "protocolVersion": TRANSFER_PROTOCOL_VERSION})
+        await ws.close(code=1008, reason="Refresh ClipShare to use transfer protocol 2")
+        return
     client_id = clientId or str(uuid.uuid4())
+    if not valid_id(client_id):
+        await ws.accept()
+        await ws.close(code=1008, reason="Invalid client identity")
+        return
     channel = "data" if channel == "data" else "control"
     connected = await manager.connect(token, client_id, ws, channel)
     if not connected:
@@ -882,6 +904,8 @@ async def websocket_endpoint(
         while True:
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
+                break
+            if manager.connections.get(token, {}).get(client_id, {}).get(channel) is not ws:
                 break
             text = msg.get('text')
             data = msg.get('bytes')

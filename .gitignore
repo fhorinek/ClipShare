@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .turn.env
 logs/
+node_modules/
