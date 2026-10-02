@@ -10,8 +10,9 @@
   <meta name="apple-mobile-web-app-title" content="ClipShare">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <title>ClipShare</title>
-  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/static/icon-maskable.svg">
+  <link rel="icon" href="/static/favicon.ico" sizes="16x16 32x32">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml" sizes="any">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180">
   <link rel="manifest" href="/static/manifest.webmanifest">
   <script src="/vendor/lucide.min.js"></script>
   <link href="/vendor/materialdesignicons.min.css" rel="stylesheet">
@@ -23,7 +24,7 @@
 
   <!-- Token entry screen -->
   <div id="token-screen">
-    <h1>Clip<span>Share</span></h1>
+    <h1><img class="brand-lockup" src="/static/logo.svg" width="260" height="58" alt="ClipShare"></h1>
     <p>Share clipboard items across devices in real-time.</p>
     <div class="token-box">
       <div class="token-field">
@@ -71,7 +72,10 @@
   <!-- Main app -->
   <div id="app">
     <header>
-      <button class="logo logo-button" id="header-logo" type="button" title="Double-click to export diagnostics">Clip<span>Share</span></button>
+      <button class="logo logo-button" id="header-logo" type="button" aria-label="ClipShare" title="Double-click to export diagnostics">
+        <img class="brand-lockup" src="/static/logo.svg" width="158" height="35" alt="" aria-hidden="true">
+        <img class="brand-symbol" src="/static/logo-mark.svg" width="38" height="28" alt="" aria-hidden="true">
+      </button>
       <div class="token-group">
         <div class="token-chip" id="header-token" title="Share token"></div>
         <div class="ws-dot" id="ws-dot" title="Disconnected"></div>

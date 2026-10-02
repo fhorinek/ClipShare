@@ -15,6 +15,20 @@
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const chunkCount = size => Math.max(1, Math.ceil(size / CHUNK_SIZE));
   const validIndex = (index, total) => Number.isInteger(index) && index >= 0 && index < total;
+  const validChangeTime = value => Number.isSafeInteger(value) && value >= 0;
+
+  function contentVersion(item) {
+    return {
+      lastChangedAt: validChangeTime(item?.lastChangedAt) ? item.lastChangedAt : validChangeTime(item?.addedAt) ? item.addedAt : 0,
+      lastChangedBy: validId(item?.lastChangedBy) ? item.lastChangedBy : '',
+    };
+  }
+
+  function compareContentVersions(a, b) {
+    const left = contentVersion(a), right = contentVersion(b);
+    if (left.lastChangedAt !== right.lastChangedAt) return left.lastChangedAt < right.lastChangedAt ? -1 : 1;
+    return left.lastChangedBy === right.lastChangedBy ? 0 : left.lastChangedBy < right.lastChangedBy ? -1 : 1;
+  }
 
   function geometry(meta) {
     if (!object(meta) || !validId(meta.id) || !['file', 'image'].includes(meta.type)
@@ -22,10 +36,12 @@
         || (meta.filename !== undefined && (typeof meta.filename !== 'string' || meta.filename.length > 4096))
         || (meta.mimeType !== undefined && (typeof meta.mimeType !== 'string' || meta.mimeType.length > 255))
         || (meta.thumbnailDataUrl !== undefined && (typeof meta.thumbnailDataUrl !== 'string' || meta.thumbnailDataUrl.length > 4 * 1024 * 1024))
+        || (meta.lastChangedAt !== undefined && !validChangeTime(meta.lastChangedAt))
+        || (meta.lastChangedBy !== undefined && meta.lastChangedBy !== '' && !validId(meta.lastChangedBy))
         || (meta.chunkSize !== undefined && meta.chunkSize !== CHUNK_SIZE)
         || (meta.totalChunks !== undefined && meta.totalChunks !== chunkCount(meta.size))) return null;
     const clean = { chunkSize: CHUNK_SIZE, totalChunks: chunkCount(meta.size) };
-    for (const key of ['id', 'type', 'size', 'filename', 'mimeType', 'addedAt', 'encrypted', 'thumbnailDataUrl']) {
+    for (const key of ['id', 'type', 'size', 'filename', 'mimeType', 'addedAt', 'lastChangedAt', 'lastChangedBy', 'encrypted', 'thumbnailDataUrl']) {
       if (meta[key] !== undefined) clean[key] = meta[key];
     }
     return clean;
@@ -196,7 +212,7 @@
 
     sameFile(a, b) {
       return ['id', 'size', 'type', 'chunkSize', 'totalChunks', 'filename', 'mimeType']
-        .every(key => (a[key] ?? '') === (b[key] ?? ''));
+        .every(key => (a[key] ?? '') === (b[key] ?? '')) && compareContentVersions(a, b) === 0;
     }
 
     cleanSources(candidates) {
@@ -326,7 +342,7 @@
         if (record) this.rejectSource(record, 'unresponsive');
       } else if (payload.type === 'chunk_ack') {
         const record = this.outgoing.get(payload.itemId)?.get(peerId);
-        if (!record || !this.outgoingLive(record) || record.transferId !== payload.transferId
+        if (!record || !this.outgoingLive(record) || record.complete || record.transferId !== payload.transferId
             || record.request?.id !== payload.requestId || !record.request.indexes.has(payload.chunkIndex)) return;
         record.ackedChunks.add(payload.chunkIndex);
         record.sent = record.ackedChunks.size;
@@ -335,7 +351,7 @@
         this.emitOutgoing(record);
       } else if (payload.type === 'transfer_complete') {
         const record = this.outgoing.get(payload.itemId)?.get(peerId);
-        if (!record || !this.outgoingLive(record) || record.transferId !== payload.transferId) return;
+        if (!record || !this.outgoingLive(record) || record.complete || record.transferId !== payload.transferId) return;
         record.complete = true;
         record.state = 'complete';
         this.failedSources.delete(record.itemId);
@@ -575,5 +591,5 @@
   }
 
   return { PROTOCOL_VERSION, CHUNK_SIZE, MAX_FILE_BYTES, MAX_CHUNKS, BATCH_SIZE,
-    validId, geometry, expectedChunkBytes, assemble, validHeader, frameAAD, encodeFrame, decodeFrame, ChunkScheduler, TransferCoordinator };
+    validId, validChangeTime, contentVersion, compareContentVersions, geometry, expectedChunkBytes, assemble, validHeader, frameAAD, encodeFrame, decodeFrame, ChunkScheduler, TransferCoordinator };
 });

@@ -61,6 +61,12 @@ Deletion, clearing, interruption and leaving share one disposal path. Guards che
 room epoch, record identity and request identity after asynchronous work. Explicit
 deletion retains a tombstone; losing the last holder only removes availability.
 An existing complete holder can advertise the file again after reconnecting.
+Explicit deletion tombstones remain in browser memory for the current room and
+are replayed before local holder announcements on reconnect. Welcome and foreground
+manifest snapshots include server tombstones, so a device removes files deleted
+while it was asleep before advertising its surviving cards. Deletion takes priority
+over holder revisions and device clocks; a delayed holder announcement cannot
+restore a deleted card. Leaving the room clears the browser's retained tombstones.
 Exhausted sources remain excluded after the failed card is removed, so repeated
 discovery cannot restart the same failed download. A connection or holder
 availability change allows that source to be tried again.
@@ -68,6 +74,28 @@ availability change allows that source to be tried again.
 UI progress never determines completion: incomplete files display at most 99%.
 Sender completion requires the receiver's explicit completion message. Completion
 cleanup timers only remove the exact record they were created for.
+
+## Content changes and reconnect reconciliation
+
+`lastChangedAt` records the content change time in milliseconds since the Unix epoch.
+`lastChangedBy` identifies the writer and breaks ties when two edits have the same
+timestamp. Local edits advance past the item's previously observed change time, even
+if the device clock moves backwards. Creation, actual text edits and deletion create
+new stamps; transferring bytes, generating previews, reconnecting and announcing a
+holder preserve the original stamp. Deletion replay preserves its deletion timestamp.
+
+These fields travel in encrypted item metadata and text messages and accompany
+manifest records. The manifest's `revision` and `updatedAt` track announcements and
+availability separately. Higher announcement revisions cannot replace newer content
+with an older copy. A newer content version initially lists only its announcing holder;
+other devices advertise that version after receiving it.
+
+On reconnect, clients compare text content versions and request a snapshot when their
+copy is older. Newer local edits are announced so peers can request them. Delayed older
+text snapshots and updates are ignored. Text and chat retain their separate encrypted
+snapshot flow. Binary files retain immutable IDs and content versions; replacing a
+file requires sharing a new card. Timestamps use device clocks and a deterministic
+tie-breaker, so simultaneous unobserved edits converge without preserving both edits.
 
 ## Wire protocol
 
@@ -108,7 +136,7 @@ with `npm install` and `npx playwright install chromium` (or set
 
 - `npm test` — production transfer core, deterministic clocks, deferred operations and encrypted in-memory peers (Node 22 or newer).
 - `.venv/bin/python -m unittest discover -s tests -v` — real connection manager, protocol endpoints, reconnect races, holder availability and slow-recipient isolation.
-- `npm run test:browser` — temporary local server and isolated real browser clients; direct WebRTC, relay, fallback, reconnect, delayed metadata, thumbnail cancellation, source loss, PIN pairing, text/chat, clearing partial downloads and object URLs, refreshed retrieval and a 128 MiB byte/digest check.
+- `npm run test:browser` — temporary local server and isolated real browser clients; direct WebRTC, relay, fallback, reconnect, offline deletions and missed deletion snapshots, delayed metadata, thumbnail cancellation, source handoff/loss, PIN pairing, text/chat, clearing partial downloads and object URLs, refreshed retrieval and a 128 MiB byte/digest check.
 
 The browser runner uses temporary fixtures and downloads and closes its server and
 contexts afterwards. It does not connect to a deployed room. Existing diagnostics

@@ -125,6 +125,80 @@ async function downloaded(page, name, expected) {
   assert.equal(await b.evaluate(() => transferEvents.some(event => event.filename === 'direct.bin' && event.transport === 'webrtc')), true);
   console.log('PASS: three clients transfer and download identical bytes over WebRTC');
 
+  async function suspendControl(page) {
+    await page.evaluate(async () => {
+      const socket = ws;
+      await new Promise(resolve => { socket.addEventListener('close', resolve, { once: true }); socket.close(); });
+      clearTimeout(wsRetryTimer);
+      wsRetryTimer = null;
+    });
+  }
+  const originalChange = await a.evaluate(() => ClipShareTransfers.contentVersion([...items.values()].find(item => item.filename === 'direct.bin')));
+  await suspendControl(b);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  for (const page of [a, b, c]) {
+    assert.deepEqual(await page.evaluate(() => ClipShareTransfers.contentVersion([...items.values()].find(item => item.filename === 'direct.bin'))), originalChange);
+    assert.deepEqual(await page.evaluate(() => ClipShareTransfers.contentVersion([...roomManifest.values()].find(record => record.meta.filename === 'direct.bin').meta)), originalChange);
+  }
+  console.log('PASS: transfer and reconnect preserve the original content timestamp');
+  const offlineDeleted = await b.evaluate(() => [...items.values()].find(item => item.filename === 'direct.bin').id);
+  await suspendControl(b);
+  await b.evaluate(id => deleteItem(id), offlineDeleted);
+  const deletionChange = await b.evaluate(id => deletedItemChanges.get(id), offlineDeleted);
+  assert.equal(deletionChange.lastChangedAt > originalChange.lastChangedAt, true);
+  assert.equal(await a.evaluate(id => !!items.get(id)?.rawBuffer, offlineDeleted), true);
+  await a.evaluate(id => manifestRevisions.set(id, Date.now() + 86400000), offlineDeleted);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  await Promise.all([a, b, c].map(page => page.waitForFunction(id => !items.has(id) && !roomManifest.has(id), offlineDeleted)));
+  for (const page of [a, b, c]) assert.deepEqual(await page.evaluate(id => deletedItemChanges.get(id), offlineDeleted), deletionChange);
+  console.log('PASS: deletion while disconnected is replayed to every holder on reconnect');
+
+  await a.locator('#file-input').setInputFiles({ name: 'sleep-delete.bin', mimeType: 'application/octet-stream', buffer: bytes });
+  await Promise.all([received(b, 'sleep-delete.bin'), received(c, 'sleep-delete.bin')]);
+  const missedDeletion = await a.evaluate(() => [...items.values()].find(item => item.filename === 'sleep-delete.bin').id);
+  await suspendControl(b);
+  await a.evaluate(id => deleteItem(id), missedDeletion);
+  await c.waitForFunction(id => !items.has(id), missedDeletion);
+  assert.equal(await b.evaluate(id => !!items.get(id)?.rawBuffer, missedDeletion), true);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  await b.waitForFunction(id => !items.has(id) && !roomManifest.has(id) && deletedItemIds.has(id), missedDeletion);
+  await Promise.all([a, b, c].map(page => page.waitForFunction(id => !items.has(id) && !roomManifest.has(id), missedDeletion)));
+  console.log('PASS: reconnect snapshots remove files deleted by another device during sleep');
+
+  await a.locator('#file-input').setInputFiles({ name: 'dropped-delete.bin', mimeType: 'application/octet-stream', buffer: Buffer.from([1, 2, 3]) });
+  await Promise.all([received(b, 'dropped-delete.bin'), received(c, 'dropped-delete.bin')]);
+  const droppedDeletion = await b.evaluate(() => {
+    const id = [...items.values()].find(item => item.filename === 'dropped-delete.bin').id;
+    const socket = ws, send = socket.send;
+    socket.send = () => { throw new Error('Socket stopped writing during wake'); };
+    window.restoreSocketSend = () => { socket.send = send; };
+    deleteItem(id);
+    return id;
+  });
+  assert.equal(await b.evaluate(id => !items.has(id) && deletedItemIds.has(id), droppedDeletion), true);
+  assert.equal(await a.evaluate(id => !!items.get(id)?.rawBuffer, droppedDeletion), true);
+  await suspendControl(b);
+  await b.evaluate(() => { restoreSocketSend(); delete window.restoreSocketSend; return connectWS(); });
+  await ready([a, b, c], 2);
+  await Promise.all([a, b, c].map(page => page.waitForFunction(id => !items.has(id) && !roomManifest.has(id), droppedDeletion)));
+  console.log('PASS: a failed socket write cannot lose a local deletion');
+
+  await a.locator('#file-input').setInputFiles([
+    { name: 'offline-clear.bin', mimeType: 'application/octet-stream', buffer: Buffer.from([4, 5, 6]) },
+    { name: 'offline-clear-empty.bin', mimeType: 'application/octet-stream', buffer: Buffer.alloc(0) },
+  ]);
+  await Promise.all([b, c].flatMap(page => [received(page, 'offline-clear.bin'), received(page, 'offline-clear-empty.bin')]));
+  await suspendControl(b);
+  await b.evaluate(() => clearAllItems());
+  assert.equal(await a.evaluate(() => items.size), 2);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  await Promise.all([a, b, c].map(page => page.waitForFunction(() => items.size === 0 && roomManifest.size === 0)));
+  console.log('PASS: clearing cards while disconnected removes every holder copy on reconnect');
+
   await a.evaluate(() => {
     const original = transferCoordinator.options.sendFrame;
     let sends = 0;
@@ -183,6 +257,36 @@ async function downloaded(page, name, expected) {
   await c.waitForFunction(() => chatMessages.some(message => message.text === 'Chat regression'));
   assert.equal((await a.evaluate(() => buildDiagnosticSnapshot())).transfers.coordinator.protocolVersion, 2);
   console.log('PASS: text, chat, and diagnostics');
+
+  const textBeforeChanges = await a.evaluate(() => ({ ...[...items.values()].find(item => item.content === 'Shared text regression') }));
+  const textId = textBeforeChanges.id;
+  await suspendControl(b);
+  await a.locator('#card-' + textId + ' .text-content').fill('Desktop edit during sleep');
+  await a.locator('#header-logo').click();
+  await c.waitForFunction(id => items.get(id)?.content === 'Desktop edit during sleep', textId);
+  await b.locator('#card-' + textId + ' .text-content').fill('Newer edit made offline');
+  await b.locator('#header-logo').click();
+  const offlineTextChange = await b.evaluate(id => ClipShareTransfers.contentVersion(items.get(id)), textId);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  await Promise.all([a, b, c].map(page => page.waitForFunction(id => items.get(id)?.content === 'Newer edit made offline', textId)));
+  for (const page of [a, b, c]) assert.deepEqual(await page.evaluate(id => ClipShareTransfers.contentVersion(items.get(id)), textId), offlineTextChange);
+  await a.evaluate(old => {
+    handlePayload({ type: 'item_added', item: old }, true);
+    handlePayload({ type: 'item_updated', itemId: old.id, content: old.content,
+      lastChangedAt: old.lastChangedAt, lastChangedBy: old.lastChangedBy }, true);
+  }, textBeforeChanges);
+  assert.equal(await a.evaluate(id => items.get(id).content, textId), 'Newer edit made offline');
+  await suspendControl(b);
+  await a.locator('#card-' + textId + ' .text-content').fill('Newer remote edit');
+  await a.locator('#header-logo').click();
+  await c.waitForFunction(id => items.get(id)?.content === 'Newer remote edit', textId);
+  const remoteTextChange = await a.evaluate(id => ClipShareTransfers.contentVersion(items.get(id)), textId);
+  await b.evaluate(() => connectWS());
+  await ready([a, b, c], 2);
+  await b.waitForFunction(id => items.get(id)?.content === 'Newer remote edit', textId);
+  assert.deepEqual(await b.evaluate(id => ClipShareTransfers.contentVersion(items.get(id)), textId), remoteTextChange);
+  console.log('PASS: content timestamps reconcile offline/remote text edits and reject stale content');
 
   const png = Buffer.from((await a.evaluate(() => {
     const canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
@@ -260,10 +364,73 @@ async function downloaded(page, name, expected) {
   for (const page of [b, c]) assert.equal(await page.evaluate(() =>
     binaryTransfers.size === 0 && outboundTransfers.size === 0 && !transferCoordinator.scheduler.hasPending()
     && cardEncryptionKeys.size === 0 && editTimers.size === 0
+    && remoteTransferStatuses.size === 0 && transferStatusPublishTimers.size === 0 && completedTransferStatuses.size === 0
     && urlsBeforeClear.every(url => revokedUrls.includes(url))), true);
   console.log('PASS: clearing removes cards, manifest entries, and transfer work');
 
   for (const page of [a, b, c]) await page.close();
+
+  const handoffUrl = `${origin}/handoff-transfer-test#${'d'.repeat(64)}`;
+  const original = await client(handoffUrl), holder = await client(handoffUrl), receiver = await client(handoffUrl);
+  await ready([original, holder, receiver], 2);
+  const receiverId = await receiver.evaluate(() => clientId);
+  const holderId = await holder.evaluate(() => clientId);
+  const originalId = await original.evaluate(() => clientId);
+  for (const [page, limit] of [[original, 8], [holder, 16]]) await page.evaluate(({ receiverId, limit }) => {
+    window.holdHandoff = true;
+    const send = transferCoordinator.options.sendFrame;
+    transferCoordinator.options.sendFrame = (peerId, frame, live) => {
+      const header = ClipShareTransfers.decodeFrame(frame.buffer).header;
+      if (holdHandoff && peerId === receiverId && items.get(header.i)?.filename === 'handoff.bin' && header.ci >= limit) {
+        return { status: 'blocked' };
+      }
+      return send(peerId, frame, live);
+    };
+  }, { receiverId, limit });
+  await receiver.evaluate(() => {
+    const commit = transferCoordinator.options.commitFile;
+    transferCoordinator.options.commitFile = async (...args) => {
+      if (args[0].filename === 'handoff.bin') await new Promise(resolve => { window.finishHandoff = resolve; });
+      return commit(...args);
+    };
+  });
+  await original.locator('#file-input').setInputFiles({ name: 'handoff.bin', mimeType: 'application/octet-stream', buffer: bytes });
+  await received(holder, 'handoff.bin');
+  await receiver.waitForFunction(() => [...binaryTransfers.values()].some(record => record.meta.filename === 'handoff.bin' && record.received === 8));
+  await original.evaluate(() => leaveSpace());
+  await receiver.waitForFunction(id => [...binaryTransfers.values()].some(record => record.meta.filename === 'handoff.bin'
+    && record.senderId === id && record.received === 16), holderId);
+  const handoff = await receiver.evaluate(() => {
+    const record = [...binaryTransfers.values()].find(record => record.meta.filename === 'handoff.bin');
+    return { itemId: record.itemId, transferId: record.transferId, total: record.totalChunks };
+  });
+  await holder.waitForFunction(({ itemId, receiverId, total }) => document.getElementById(`ob-eta-${itemId}-${receiverId}`)?.textContent
+    === `${Math.round(16 / total * 100)}%`, { ...handoff, receiverId });
+  const progress = await holder.evaluate(({ receiverId, itemId }) => transferStatusRowsForPeer(receiverId).find(row => row.itemId === itemId), { receiverId, ...handoff });
+  assert.equal(progress.done, 16);
+  assert.deepEqual(new Set(progress.sourceIds), new Set([originalId, holderId]));
+  assert.equal(progress.chunkRuns.filter(run => run.sourceId).reduce((sum, run) => sum + run.count, 0), 16);
+  await holder.evaluate(() => { window.holdHandoff = false; });
+  await receiver.waitForFunction(() => typeof finishHandoff === 'function');
+  await holder.waitForFunction(({ itemId, receiverId }) => document.getElementById(`ob-eta-${itemId}-${receiverId}`)?.textContent === '99%', { ...handoff, receiverId });
+  await receiver.evaluate(() => finishHandoff());
+  await downloaded(receiver, 'handoff.bin', bytes);
+  await holder.waitForFunction(({ itemId, receiverId }) => outboundTransfers.get(itemId)?.get(receiverId)?.complete, { ...handoff, receiverId });
+  await holder.waitForFunction(({ itemId, receiverId }) => !outboundTransfers.get(itemId)?.has(receiverId)
+    && !transferStatusRowsForPeer(receiverId).some(row => row.itemId === itemId), { ...handoff, receiverId });
+  await holder.waitForFunction(({ itemId }) => !document.getElementById('card-' + itemId)?.querySelector('.outbound-progress'), handoff);
+  const staleIgnored = await holder.evaluate(({ itemId, transferId, total, receiverId, originalId }) => {
+    const stale = { itemId, transferId, sourceId: originalId, targetId: receiverId, totalChunks: total,
+      receivedChunks: 8, currentChunk: 8, status: 'active', updatedAt: Date.now() + 10000 };
+    applyRemoteTransferStatus(stale, originalId);
+    applyRemoteTransferStatus(stale, receiverId);
+    applyRemoteTransferStatus({ ...stale, sourceId: clientId }, receiverId);
+    return !transferStatusRowsForPeer(receiverId).some(row => row.itemId === itemId);
+  }, { ...handoff, receiverId, originalId });
+  assert.equal(staleIgnored, true);
+  console.log('PASS: replacement sender shows whole-download progress, waits for assembly, and clears completed handoffs');
+  for (const page of [original, holder, receiver]) await page.close();
+
   const relayUrl = `${origin}/relay-transfer-test#${'b'.repeat(64)}`;
   const r1 = await client(relayUrl, true), r2 = await client(relayUrl, true), r3 = await client(relayUrl, true);
   await ready([r1, r2, r3], 2);

@@ -101,13 +101,17 @@ body {
 }
 
 #token-screen h1 {
-  font-size: 2rem;
-  font-weight: 500;
+  line-height: 0;
   margin-bottom: 8px;
 }
 
-#token-screen h1 span {
-  color: var(--accent);
+.brand-lockup {
+  display: block;
+  height: auto;
+}
+
+#token-screen .brand-lockup {
+  width: min(260px, 78vw);
 }
 
 #token-screen p {
@@ -430,8 +434,17 @@ header {
 }
 
 .logo {
-  font-size: 1.2rem;
-  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.logo .brand-lockup {
+  width: 158px;
+}
+
+.logo .brand-symbol {
+  display: none;
+  width: 38px;
+  height: auto;
 }
 
 .logo-button {
@@ -448,10 +461,6 @@ header {
   outline: 2px solid var(--accent);
   outline-offset: 4px;
   border-radius: 4px;
-}
-
-.logo span {
-  color: var(--accent);
 }
 
 .token-group {
@@ -2114,8 +2123,12 @@ input.token-modal-value:focus {
     gap: 8px;
   }
 
-  .logo {
-    font-size: 1rem;
+  .logo .brand-lockup {
+    display: none;
+  }
+
+  .logo .brand-symbol {
+    display: block;
   }
 
   .token-chip {
@@ -2312,7 +2325,4 @@ input.token-modal-value:focus {
     padding: 20px;
   }
 
-  #token-screen h1 {
-    font-size: 1.5rem;
-  }
 }

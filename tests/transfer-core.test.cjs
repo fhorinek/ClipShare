@@ -53,6 +53,10 @@ test('geometry validates the boundary, empty file, and fixed chunk layout', () =
   assert.equal(geometry({ ...meta(1), chunkSize: 1024 }), null);
   assert.equal(geometry({ ...meta(1), mimeType: {} }), null);
   assert.equal(geometry({ ...meta(1), filename: [] }), null);
+  for (const time of [-1, 1.5, Infinity, '100', Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(geometry({ ...meta(1), lastChangedAt: time }), null);
+  }
+  assert.equal(geometry({ ...meta(1), lastChangedBy: {} }), null);
   assert.equal(geometry({ ...meta(1), rawBuffer: {}, dataUrl: 'local' }).rawBuffer, undefined);
 });
 
@@ -151,6 +155,22 @@ test('duplicate discovery downloads once and completes only after validated asse
   assert.equal(net.messages.filter(m => m.payload.type === 'file_request').length, 1);
   await settle(() => source.coordinator.outgoing.get('file-1')?.get('target')?.complete);
   assert.equal(source.coordinator.outgoing.get('file-1').get('target').transport, 'webrtc');
+});
+
+test('file content timestamps survive transfer and holder discovery unchanged', async () => {
+  const net = await network(), source = net.add('source'), target = net.add('target');
+  const metadata = { ...meta(1), lastChangedAt: 123456789, lastChangedBy: 'original-writer' };
+  source.items.set(metadata.id, { ...metadata, rawBuffer: new Uint8Array([42]).buffer });
+  target.coordinator.ensureAvailable(metadata, ['source']);
+  await settle(() => target.items.has(metadata.id));
+  assert.deepEqual(core.contentVersion(target.items.get(metadata.id)), core.contentVersion(metadata));
+  target.coordinator.ensureAvailable(metadata, ['source']);
+  assert.deepEqual(core.contentVersion(source.items.get(metadata.id)), core.contentVersion(metadata));
+  const third = net.add('third');
+  third.coordinator.ensureAvailable(metadata, ['target']);
+  await settle(() => third.items.has(metadata.id));
+  assert.deepEqual(core.contentVersion(third.items.get(metadata.id)), core.contentVersion(metadata));
+  assert.deepEqual([...new Uint8Array(third.items.get(metadata.id).rawBuffer)], [42]);
 });
 
 test('chunks preceding metadata are retained and not prematurely completed', async () => {
@@ -317,6 +337,26 @@ test('late duplicate metadata cannot restart an already completed assembly', asy
   target.coordinator.handleControl(metadata, 'source');
   assert.equal(target.coordinator.incoming.get('file-1').state, 'complete');
   assert.deepEqual(target.failures, []);
+});
+
+test('late ACKs and duplicate completion cannot extend a completed outgoing transfer', async () => {
+  const net = await network();
+  const updates = [];
+  const source = net.add('source', { onOutgoing: (itemId, peerId, record) => updates.push(record?.state || 'removed') });
+  const target = net.add('target');
+  source.items.set('file-1', { ...meta(1), rawBuffer: new Uint8Array([1]).buffer });
+  target.coordinator.ensureAvailable(meta(1), ['source']);
+  await settle(() => source.coordinator.outgoing.get('file-1')?.get('target')?.complete);
+  const record = source.coordinator.outgoing.get('file-1').get('target');
+  const timer = record.timer;
+  const completedUpdates = updates.filter(state => state === 'complete').length;
+  net.clock.tick(500);
+  source.coordinator.handleControl(net.messages.find(message => message.payload.type === 'chunk_ack').payload, 'target');
+  source.coordinator.handleControl(net.messages.find(message => message.payload.type === 'transfer_complete').payload, 'target');
+  assert.equal(record.timer, timer);
+  assert.equal(updates.filter(state => state === 'complete').length, completedUpdates);
+  net.clock.tick(1000);
+  assert.equal(source.coordinator.outgoing.size, 0);
 });
 
 test('a blocked recipient does not prevent another recipient from completing', async () => {

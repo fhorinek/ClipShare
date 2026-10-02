@@ -119,6 +119,102 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         await manager._store_manifest_record('room', 'holder', {'itemId': 'file', 'revision': 11, 'deleted': False})
         self.assertTrue(manager.manifest['room']['file']['deleted'])
 
+    async def test_offline_deletion_wins_over_a_newer_holder_revision(self):
+        manager = ConnectionManager()
+        desktop = Socket()
+        manager.connections['room'] = {'desktop': {'control': desktop}}
+        await manager._store_manifest_record('room', 'desktop', {
+            'itemId': 'file', 'revision': 100, 'encryptedMeta': {'iv': [], 'ciphertext': []},
+        })
+        await manager._store_manifest_record('room', 'phone', {
+            'itemId': 'file', 'revision': 10, 'deleted': True,
+        })
+        record = manager.manifest['room']['file']
+        self.assertTrue(record['deleted'])
+        self.assertGreaterEqual(record['revision'], 100)
+        self.assertEqual(record['holders'], [])
+        self.assertTrue(desktop.messages[-1]['record']['deleted'])
+        await manager._store_manifest_record('room', 'desktop', {
+            'itemId': 'file', 'revision': 1000, 'encryptedMeta': {'iv': [], 'ciphertext': []},
+        })
+        self.assertTrue(manager.manifest['room']['file']['deleted'])
+
+    async def test_reconnect_and_foreground_snapshots_include_deletions(self):
+        manager = ConnectionManager()
+        manager.connections['room'] = {'desktop': {'control': Socket()}}
+        await manager._store_manifest_record('room', 'desktop', {'itemId': 'file', 'revision': 10, 'deleted': True})
+        phone = Socket()
+        await manager.connect('room', 'phone', phone)
+        welcome = phone.messages[0]
+        self.assertEqual(welcome['type'], 'welcome')
+        self.assertTrue(welcome['manifest'][0]['deleted'])
+        self.assertEqual(welcome['sources'], [])
+        await manager.relay('room', 'phone', json.dumps({'type': 'metadata_snapshot_request'}))
+        self.assertEqual(phone.messages[-1]['type'], 'metadata_snapshot')
+        self.assertTrue(phone.messages[-1]['manifest'][0]['deleted'])
+
+    async def test_content_timestamp_is_separate_from_holder_revisions(self):
+        manager = ConnectionManager()
+        manager.connections['room'] = {'desktop': {'control': Socket()}, 'phone': {'control': Socket()}}
+        old_meta = {'iv': [], 'ciphertext': ['old']}
+        new_meta = {'iv': [], 'ciphertext': ['new']}
+        await manager._store_manifest_record('room', 'desktop', {
+            'itemId': 'text', 'revision': 100, 'lastChangedAt': 10, 'lastChangedBy': 'desktop', 'encryptedMeta': old_meta,
+        })
+        await manager._store_manifest_record('room', 'phone', {
+            'itemId': 'text', 'revision': 1, 'lastChangedAt': 20, 'lastChangedBy': 'phone', 'encryptedMeta': new_meta,
+        })
+        record = manager.manifest['room']['text']
+        self.assertEqual(record['lastChangedAt'], 20)
+        self.assertEqual(record['encryptedMeta'], new_meta)
+        self.assertEqual(record['holders'], ['phone'])
+        await manager._store_manifest_record('room', 'desktop', {
+            'itemId': 'text', 'revision': 1000, 'lastChangedAt': 10, 'lastChangedBy': 'desktop', 'encryptedMeta': old_meta,
+        })
+        self.assertEqual(manager.manifest['room']['text']['encryptedMeta'], new_meta)
+        await manager._store_manifest_record('room', 'desktop', {
+            'itemId': 'text', 'revision': 2, 'lastChangedAt': 20, 'lastChangedBy': 'phone', 'encryptedMeta': new_meta,
+        })
+        self.assertEqual(manager.manifest['room']['text']['holders'], ['desktop', 'phone'])
+        await manager.disconnect('room', 'phone', manager.connections['room']['phone']['control'])
+        self.assertEqual(manager.manifest['room']['text']['lastChangedAt'], 20)
+        await manager.connect('room', 'phone', Socket())
+        await manager._store_manifest_record('room', 'phone', {
+            'itemId': 'text', 'revision': 3, 'lastChangedAt': 20, 'lastChangedBy': 'phone', 'encryptedMeta': new_meta,
+        })
+        self.assertEqual(manager.manifest['room']['text']['lastChangedAt'], 20)
+        self.assertEqual(manager.manifest['room']['text']['holders'], ['desktop', 'phone'])
+
+    async def test_equal_timestamps_have_a_stable_writer_tiebreaker(self):
+        for writers in [('a-desktop', 'z-phone'), ('z-phone', 'a-desktop')]:
+            manager = ConnectionManager()
+            for writer in writers:
+                await manager._store_manifest_record('room', writer, {
+                    'itemId': 'text', 'revision': 100, 'lastChangedAt': 20, 'lastChangedBy': writer,
+                    'encryptedMeta': {'iv': [], 'ciphertext': [writer]},
+                })
+            self.assertEqual(manager.manifest['room']['text']['lastChangedBy'], 'z-phone')
+
+    async def test_deletion_replay_retains_its_original_change_timestamp(self):
+        manager = ConnectionManager()
+        await manager.relay('room', 'phone', json.dumps({
+            'type': 'manifest_delete', 'itemId': 'file', 'revision': 1, 'lastChangedAt': 20, 'lastChangedBy': 'phone',
+        }))
+        await manager.relay('room', 'desktop', json.dumps({
+            'type': 'manifest_delete', 'itemId': 'file', 'revision': 100, 'lastChangedAt': 10, 'lastChangedBy': 'desktop',
+        }))
+        record = manager.manifest['room']['file']
+        self.assertEqual((record['lastChangedAt'], record['lastChangedBy']), (20, 'phone'))
+        self.assertEqual(record['revision'], 100)
+
+    async def test_invalid_change_timestamps_are_rejected(self):
+        manager = ConnectionManager()
+        for value in [-1, True, 1.5, '20', 9007199254740992]:
+            await manager._store_manifest_record('room', 'phone', {
+                'itemId': 'file', 'revision': 1, 'lastChangedAt': value,
+            })
+        self.assertEqual(manager.manifest, {})
+
     async def test_bad_control_and_frame_shapes_are_ignored(self):
         manager = ConnectionManager()
         receiver = Socket()

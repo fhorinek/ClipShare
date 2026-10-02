@@ -2,6 +2,7 @@
   "name": "clipshare",
   "private": true,
   "scripts": {
+    "build:branding": "node scripts/build-branding.cjs",
     "test": "node --test --test-isolation=none tests/transfer-core.test.cjs",
     "test:browser": "node tests/transfer-browser.cjs"
   },

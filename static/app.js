@@ -1,5 +1,5 @@
 // ── Utilities ────────────────────────────────────────────────────────
-const CLIENT_DIAGNOSTIC_BUILD = 'transfer-coordinator-v2';
+const CLIENT_DIAGNOSTIC_BUILD = 'transfer-coordinator-v2-content-timestamps';
 
 function randomUUID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -778,6 +778,7 @@ function itemDiagnosticMeta(item) {
     mimeType: item.mimeType || '',
     size: item.size || 0,
     addedAt: item.addedAt || 0,
+    ...ClipShareTransfers.contentVersion(item),
     encrypted: !!item.encrypted,
     hasRawBuffer: !!item.rawBuffer,
     hasDataUrl: !!item.dataUrl,
@@ -906,6 +907,7 @@ async function buildDiagnosticSnapshot() {
       meta: itemDiagnosticMeta(record.meta),
     })),
     manifestRevisions: mapObject(manifestRevisions),
+    deletionChanges: mapObject(deletedItemChanges),
     transfers: {
       incoming: mapObject(binaryTransfers, transferDiagnosticRecord),
       outbound: mapObject(outboundTransfers, peerMap => mapObject(peerMap, outboundDiagnosticRecord)),
@@ -959,6 +961,7 @@ let token = null;
 let roomGeneration = 0;
 let cardInputGeneration = 0;
 const deletedItemIds = new Set();
+const deletedItemChanges = new Map();
 let ws = null;
 let dataWs = null;
 let wsRetryDelay = 1000;
@@ -1761,6 +1764,8 @@ let peerCounter = 0;
 
 const remoteTransferStatuses = new Map(); // transferKey -> transfer status from other clients
 const transferStatusPublishTimes = new Map();
+const transferStatusPublishTimers = new Map();
+const completedTransferStatuses = new Set();
 
 let sendWakeLock = null;
 let sendWakeLockRequest = null;
@@ -3017,6 +3022,7 @@ function setToken(t) {
   if (!token) return;
   roomGeneration++;
   deletedItemIds.clear();
+  deletedItemChanges.clear();
   transferCoordinator.disposeRoom();
   roomSnapshotReady = false;
   pendingTextSync.clear();
@@ -3040,6 +3046,7 @@ function leaveSpace() {
   pendingTextSync.clear();
   roomSnapshotReady = false;
   deletedItemIds.clear();
+  deletedItemChanges.clear();
   stopPairingMode({ all: true });
   resetPairingJoin();
   closeAllWebRtcPeers();
@@ -3067,8 +3074,7 @@ function leaveSpace() {
   encryptionEnabled = false;
   roomManifest.clear();
   manifestRevisions.clear();
-  remoteTransferStatuses.clear();
-  transferStatusPublishTimes.clear();
+  clearAllTransferStatuses();
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   clientCount = 0;
@@ -3145,9 +3151,16 @@ function cardMetadataFromItem(item) {
     chunkSize: item.chunkSize,
     totalChunks: item.totalChunks,
     addedAt: item.addedAt,
+    ...ClipShareTransfers.contentVersion(item),
     encrypted: !!item.encrypted,
     thumbnailDataUrl: item.thumbnailDataUrl,
   };
+}
+
+function nextItemChange(item) {
+  const current = ClipShareTransfers.contentVersion(item);
+  const observed = ClipShareTransfers.contentVersion(roomManifest.get(item?.id)?.meta);
+  return { lastChangedAt: Math.max(Date.now(), current.lastChangedAt + 1, observed.lastChangedAt + 1), lastChangedBy: clientId };
 }
 
 function nextManifestRevision(itemId) {
@@ -3240,12 +3253,14 @@ async function publishClientCardMetadata(item) {
   if (!meta || !ws || ws.readyState !== WebSocket.OPEN) return;
   debugLog('announce', { itemId: item.id, type: item.type, filename: item.filename, size: item.size, encrypted: !!item.encrypted });
   const encryptedMeta = await encryptedManifestMeta(item);
-  if (!encryptedMeta || socket !== ws || generation !== roomGeneration || items.get(item.id) !== item || deletedItemIds.has(item.id)) return;
+  if (!encryptedMeta || socket !== ws || generation !== roomGeneration || items.get(item.id) !== item || deletedItemIds.has(item.id)
+      || ClipShareTransfers.compareContentVersions(item, meta) !== 0) return;
   const revision = nextManifestRevision(item.id);
   sendPriorityJson({
     type: 'manifest_upsert',
     itemId: item.id,
     revision,
+    ...ClipShareTransfers.contentVersion(meta),
     updatedAt: Date.now(),
     encryptedMeta,
   });
@@ -3257,6 +3272,7 @@ function publishClientCardRemoval(itemId, reason = 'delete') {
   sendPriorityJson({
     type: 'manifest_delete',
     itemId,
+    ...ClipShareTransfers.contentVersion(deletedItemChanges.get(itemId)),
     revision: nextManifestRevision(itemId),
     updatedAt: Date.now(),
   });
@@ -3267,6 +3283,9 @@ function canPublishCardHolder(item) {
 }
 
 function publishLocalManifest() {
+  // Retained tombstones are also the deletion outbox. Replay them before holder
+  // announcements, including deletes made while the control socket was unavailable.
+  for (const itemId of deletedItemIds) publishClientCardRemoval(itemId, 'reconnect-delete');
   for (const item of items.values()) {
     if (!canPublishCardHolder(item)) continue;
     publishClientCardMetadata(item);
@@ -3293,7 +3312,9 @@ function rebuildPeerCardMetadataFromManifest() {
 function rememberManifestMeta(ownerId, meta, revision = 0, holders = null) {
   if (!ownerId || !meta?.id) return;
   const existing = roomManifest.get(meta.id);
-  if (deletedItemIds.has(meta.id) || (manifestRevisions.get(meta.id) || 0) > revision) return;
+  const contentOrder = ClipShareTransfers.compareContentVersions(meta, existing?.meta);
+  if (deletedItemIds.has(meta.id) || (existing && contentOrder < 0)
+      || (contentOrder === 0 && (manifestRevisions.get(meta.id) || 0) > revision)) return;
   const holderIds = [...new Set((Array.isArray(holders) ? holders : [ownerId]).filter(Boolean))];
   roomManifest.set(meta.id, { ownerId, holders: holderIds, revision, meta });
   manifestRevisions.set(meta.id, Math.max(manifestRevisions.get(meta.id) || 0, revision || 0));
@@ -3310,12 +3331,12 @@ function removeManifestMeta(itemId, revision = 0) {
 }
 
 async function applyManifestRecord(record) {
-  if (!record?.itemId) return;
+  if (!ClipShareTransfers.validId(record?.itemId)) return;
   const generation = roomGeneration;
   const revision = Number(record.revision) || 0;
   if (record.deleted) {
-    if (revision < (manifestRevisions.get(record.itemId) || 0)) return;
-    disposeSharedItem(record.itemId, { deleted: true });
+    // A final deletion wins over stale or newer holder metadata on every device.
+    disposeSharedItem(record.itemId, { deleted: true, change: ClipShareTransfers.contentVersion(record) });
     removeManifestMeta(record.itemId, revision);
     return;
   }
@@ -3323,6 +3344,7 @@ async function applyManifestRecord(record) {
   try {
     const meta = JSON.parse(await decryptMessage(record.encryptedMeta, encryptionKey));
     if (generation !== roomGeneration || deletedItemIds.has(record.itemId) || meta?.id !== record.itemId) return;
+    if (record.lastChangedAt && ClipShareTransfers.compareContentVersions(record, meta) !== 0) return;
     rememberManifestMeta(record.ownerId, meta, revision, record.holders);
   } catch {
     // A manifest from a different passkey stays invisible.
@@ -3363,82 +3385,151 @@ function transferItemTitle(itemId) {
 }
 
 function transferStatusKey(status) {
-  return `${status.itemId || ''}:${status.sourceId || ''}:${status.targetId || ''}`;
+  // A receiver keeps the same transfer ID when another holder takes over.
+  return `${status.itemId}:${status.targetId}:${status.transferId}`;
+}
+
+function removeRemoteTransferStatus(key, status = remoteTransferStatuses.get(key)) {
+  if (!status || remoteTransferStatuses.get(key) !== status) return;
+  clearTimeout(status.cleanupTimer);
+  remoteTransferStatuses.delete(key);
 }
 
 function clearRemoteTransferStatusesForPeer(peerId) {
   for (const [key, status] of remoteTransferStatuses) {
-    if (status.sourceId === peerId || status.targetId === peerId) remoteTransferStatuses.delete(key);
+    if (status.sourceId === peerId || status.targetId === peerId) removeRemoteTransferStatus(key, status);
+  }
+  for (const [key, pending] of transferStatusPublishTimers) {
+    if (pending.payload.sourceId === peerId || pending.payload.targetId === peerId) {
+      clearTimeout(pending.timer);
+      transferStatusPublishTimers.delete(key);
+    }
   }
 }
 
 function clearTransferStatusesForItem(itemId) {
-  for (const key of remoteTransferStatuses.keys()) {
-    if (key.startsWith(`${itemId}:`)) remoteTransferStatuses.delete(key);
-  }
-  for (const key of transferStatusPublishTimes.keys()) {
-    if (key.startsWith(`${itemId}:`)) transferStatusPublishTimes.delete(key);
+  const prefix = `${itemId}:`;
+  for (const key of remoteTransferStatuses.keys()) if (key.startsWith(prefix)) removeRemoteTransferStatus(key);
+  for (const key of completedTransferStatuses) if (key.startsWith(prefix)) completedTransferStatuses.delete(key);
+  for (const key of transferStatusPublishTimes.keys()) if (key.startsWith(prefix)) transferStatusPublishTimes.delete(key);
+  for (const [key, pending] of transferStatusPublishTimers) if (key.startsWith(prefix)) {
+    clearTimeout(pending.timer);
+    transferStatusPublishTimers.delete(key);
   }
 }
 
-function publishTransferStatus({ itemId, sourceId, targetId, current, done, total, chunkRuns = null, transport = '', status = 'active', force = false }) {
-  if (!itemId || !sourceId || !targetId || !ws || ws.readyState !== WebSocket.OPEN) return;
-  const key = `${itemId}:${sourceId}:${targetId}`;
+function clearAllTransferStatuses() {
+  for (const pending of transferStatusPublishTimers.values()) clearTimeout(pending.timer);
+  transferStatusPublishTimers.clear();
+  transferStatusPublishTimes.clear();
+  for (const key of remoteTransferStatuses.keys()) removeRemoteTransferStatus(key);
+  completedTransferStatuses.clear();
+}
+
+function publishTransferStatus({ itemId, transferId, sourceId, targetId, current, done, total, chunkRuns = null, transport = '', status = 'active', force = false }) {
+  if (!itemId || !transferId || !sourceId || !targetId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  const key = `${transferStatusKey({ itemId, targetId, transferId })}:${sourceId}`;
   const now = Date.now();
-  if (!force && now - (transferStatusPublishTimes.get(key) || 0) < 350) return;
-  transferStatusPublishTimes.set(key, now);
-  wsSend({
-    type: 'relay',
-    payload: {
-      type: 'transfer_status',
-      itemId,
-      sourceId,
-      targetId,
-      title: transferItemTitle(itemId),
-      currentChunk: Math.max(0, Number(current) || 0),
-      receivedChunks: Math.max(0, Number(done) || 0),
-      totalChunks: Math.max(0, Number(total) || 0),
-      chunkRuns: normalizeTransferChunkRuns(chunkRuns),
-      transport: transport === 'webrtc' ? 'webrtc' : '',
-      status,
-      updatedAt: now,
-    },
-  }, null, true);
+  const generation = roomGeneration;
+  const payload = {
+    type: 'transfer_status', itemId, transferId, sourceId, targetId,
+    title: transferItemTitle(itemId),
+    currentChunk: Math.max(0, Number(current) || 0),
+    receivedChunks: Math.max(0, Number(done) || 0),
+    totalChunks: Math.max(0, Number(total) || 0),
+    chunkRuns: normalizeTransferChunkRuns(chunkRuns),
+    transport: transport === 'webrtc' ? 'webrtc' : '', status, updatedAt: now,
+  };
+  const send = latest => {
+    const live = () => generation === roomGeneration && !deletedItemIds.has(itemId)
+      && ws?.readyState === WebSocket.OPEN;
+    if (!live()) return;
+    transferStatusPublishTimes.set(key, Date.now());
+    wsSend({ type: 'relay', payload: latest }, null, true, live);
+  };
+  const remaining = 350 - (now - (transferStatusPublishTimes.get(key) || 0));
+  const pending = transferStatusPublishTimers.get(key);
+  if (force || remaining <= 0) {
+    if (pending) clearTimeout(pending.timer);
+    transferStatusPublishTimers.delete(key);
+    send(payload);
+  } else if (pending) {
+    pending.payload = payload;
+  } else {
+    const entry = { payload, timer: null };
+    entry.timer = setTimeout(() => {
+      if (transferStatusPublishTimers.get(key) !== entry) return;
+      transferStatusPublishTimers.delete(key);
+      send(entry.payload);
+    }, remaining);
+    transferStatusPublishTimers.set(key, entry);
+  }
 }
 
-function applyRemoteTransferStatus(status) {
-  if (!status?.itemId || !status.sourceId || !status.targetId) return;
-  if (status.sourceId === clientId || status.targetId === clientId) return;
-  const normalized = {
-    itemId: String(status.itemId),
-    sourceId: String(status.sourceId),
-    targetId: String(status.targetId),
-    title: String(status.title || transferItemTitle(status.itemId)).slice(0, 160),
-    currentChunk: Math.max(0, Number(status.currentChunk) || 0),
-    receivedChunks: Math.max(0, Number(status.receivedChunks) || 0),
-    totalChunks: Math.max(0, Number(status.totalChunks) || 0),
-    chunkRuns: normalizeTransferChunkRuns(status.chunkRuns),
-    transport: status.transport === 'webrtc' ? 'webrtc' : '',
-    status: status.status === 'done' ? 'done' : 'active',
-    updatedAt: Number(status.updatedAt) || Date.now(),
-  };
-  const key = transferStatusKey(normalized);
+function applyRemoteTransferStatus(status, reporterId) {
+  const validId = ClipShareTransfers.validId;
+  if (!status || ![status.itemId, status.transferId, status.sourceId, status.targetId, reporterId].every(validId)
+      || deletedItemIds.has(status.itemId) || !connectedPeers.has(reporterId)
+      || (reporterId !== status.sourceId && reporterId !== status.targetId) || status.targetId === clientId
+      || !connectedPeers.has(status.targetId)) return;
+  const receiverReport = reporterId === status.targetId;
+  if (status.sourceId !== clientId && !connectedPeers.has(status.sourceId) && status.status !== 'done') return;
+  const total = status.totalChunks, received = status.receivedChunks;
+  if (!Number.isInteger(total) || total < 1 || total > ClipShareTransfers.MAX_CHUNKS
+      || !Number.isInteger(received) || received < 0 || received > total
+      || !['active', 'done'].includes(status.status) || (status.status === 'done' && received !== total)) return;
+  const key = transferStatusKey(status);
   const previous = remoteTransferStatuses.get(key);
-  if (previous?.status === 'done' && normalized.status !== 'done' && normalized.updatedAt <= previous.updatedAt) return;
-  if (!normalized.chunkRuns.length && previous?.chunkRuns?.length) normalized.chunkRuns = previous.chunkRuns;
+  if (completedTransferStatuses.has(key)
+      && !(receiverReport && status.status === 'done' && previous && !previous.receiverReport)) return;
+  // Counts from a holder describe only its contribution. The receiver knows the whole file.
+  if (previous?.receiverReport && !receiverReport) return;
+  if (previous && previous.totalChunks !== total) return;
+  if (previous && previous.receiverReport === receiverReport
+      && (received < previous.receivedChunks || (reporterId === previous.reporterId && Number(status.updatedAt) < previous.updatedAt))) return;
+  const chunkRuns = normalizeTransferChunkRuns(status.chunkRuns);
+  if (chunkRuns.length > total || chunkRuns.some(run => !Number.isSafeInteger(run.count)
+      || run.count > total || (run.sourceId && !validId(run.sourceId)))
+      || chunkRuns.reduce((count, run) => count + run.count, 0) > total) return;
+  const normalized = {
+    itemId: status.itemId, transferId: status.transferId, sourceId: status.sourceId, targetId: status.targetId,
+    reporterId, receiverReport,
+    title: String(status.title || transferItemTitle(status.itemId)).slice(0, 160),
+    currentChunk: received, receivedChunks: received, totalChunks: total,
+    chunkRuns,
+    transport: status.transport === 'webrtc' ? 'webrtc' : '',
+    status: status.status, updatedAt: Number.isFinite(Number(status.updatedAt)) ? Number(status.updatedAt) : Date.now(),
+  };
+  removeRemoteTransferStatus(key, previous);
+  remoteTransferStatuses.set(key, normalized);
   if (normalized.status === 'done') {
-    remoteTransferStatuses.set(key, normalized);
-    setTimeout(() => {
-      const current = remoteTransferStatuses.get(key);
-      if (current?.updatedAt === normalized.updatedAt) {
-        remoteTransferStatuses.delete(key);
+    completedTransferStatuses.add(key);
+    const generation = roomGeneration;
+    normalized.cleanupTimer = setTimeout(() => {
+      if (generation === roomGeneration && remoteTransferStatuses.get(key) === normalized) {
+        removeRemoteTransferStatus(key, normalized);
+        refreshOutboundUI(normalized.itemId);
         schedulePeersModalRefresh();
       }
     }, 900);
-  } else {
-    remoteTransferStatuses.set(key, normalized);
   }
+  refreshOutboundUI(normalized.itemId);
   schedulePeersModalRefresh();
+}
+
+function outgoingDisplayProgress(itemId, peerId, record) {
+  const key = transferStatusKey({ itemId, targetId: peerId, transferId: record.transferId });
+  const status = remoteTransferStatuses.get(key);
+  const receiverStatus = status?.receiverReport ? status : null;
+  const complete = record.complete || completedTransferStatuses.has(key);
+  return {
+    complete,
+    done: complete ? record.total : receiverStatus?.receivedChunks ?? record.sent,
+    total: record.total,
+    chunkRuns: receiverStatus?.chunkRuns || (complete ? [] : transferChunkRunsFromAcked(record, clientId)),
+    sourceIds: receiverStatus ? transferSourceIdsFromChunks(receiverStatus.chunkRuns.map(run => run.sourceId), receiverStatus.sourceId) : [clientId],
+    transport: receiverStatus?.transport || record.transport || '',
+  };
 }
 
 function normalizeTransferChunkRuns(runs) {
@@ -3505,32 +3596,36 @@ function transferStatusRowsForPeer(peerId) {
   for (const [itemId, peerMap] of outboundTransfers) {
     const progress = peerMap.get(peerId);
     if (!progress) continue;
+    const display = outgoingDisplayProgress(itemId, peerId, progress);
     rows.push({
       itemId,
       direction: 'UP',
       sourceId: clientId,
-      sourceIds: [clientId],
+      sourceIds: display.sourceIds,
       source: 'You',
       title: transferItemTitle(itemId),
-      current: progress.currentChunk || progress.sent || 0,
-      done: progress.sent || 0,
-      total: progress.total || 0,
-      chunkRuns: transferChunkRunsFromAcked(progress, clientId),
-      transport: progress.transport || '',
+      current: display.done,
+      done: display.done,
+      total: display.total,
+      complete: display.complete,
+      chunkRuns: display.chunkRuns,
+      transport: display.transport,
     });
   }
   for (const status of remoteTransferStatuses.values()) {
     if (status.targetId !== peerId) continue;
+    if (outboundTransfers.get(status.itemId)?.get(peerId)?.transferId === status.transferId) continue;
     rows.push({
       itemId: status.itemId,
-      direction: 'DN',
+      direction: status.sourceId === clientId ? 'UP' : 'DN',
       sourceId: status.sourceId,
-      sourceIds: [status.sourceId],
+      sourceIds: transferSourceIdsFromChunks(status.chunkRuns.map(run => run.sourceId), status.sourceId),
       source: imap.get(status.sourceId)?.fullName || 'Peer',
       title: status.title || transferItemTitle(status.itemId),
       current: status.currentChunk || status.receivedChunks || 0,
       done: status.receivedChunks || 0,
       total: status.totalChunks || 0,
+      complete: status.status === 'done',
       chunkRuns: status.chunkRuns || [],
       transport: status.transport || '',
     });
@@ -3565,7 +3660,7 @@ function mergeTransferStatusRows(rows) {
 function renderTransferStatus(rows) {
   if (!rows.length) return '';
   return `<div class="peer-transfer-list">${rows.map(row => {
-    const pct = row.total ? Math.round((row.done / row.total) * 100) : 0;
+    const pct = row.complete ? 100 : Math.min(99, transferPercentFromCounts(row.done, row.total));
     const chunk = row.total ? `${Math.min(row.current, row.total)}/${row.total}` : '...';
     const chunkBar = renderTransferChunkBar(row);
     const direction = `${row.direction || 'DN'}${row.transport === 'webrtc' ? '+' : ''}`;
@@ -3583,7 +3678,7 @@ function renderTransferChunkBar(row) {
   const total = Math.max(0, Math.floor(Number(row.total) || 0));
   const runs = normalizeTransferChunkRuns(row.chunkRuns);
   if (!total || !runs.length) {
-    const pct = total ? Math.round((row.done / total) * 100) : 0;
+    const pct = row.complete ? 100 : Math.min(99, transferPercentFromCounts(row.done, total));
     return `<div class="peer-transfer-progress"><div class="peer-transfer-fill" style="width:${pct}%"></div></div>`;
   }
   const imap = buildPeerIdentityMap();
@@ -3826,7 +3921,8 @@ function refreshTransferSources() {
     if (!meta || deletedItemIds.has(meta.id)) continue;
     const sources = sourcesFor(record);
     if (meta.type === 'text') {
-      if (!items.has(meta.id) && sources.length) requestSyncFrom(sources[0], meta.id);
+      if ((!items.has(meta.id) || ClipShareTransfers.compareContentVersions(meta, items.get(meta.id)) > 0)
+          && sources.length) requestSyncFrom(sources[0], meta.id);
     } else {
       if (sources.length || binaryTransfers.has(meta.id)) transferCoordinator.ensureAvailable(meta, sources);
       transferCoordinator.setSources(meta.id, sources);
@@ -3855,8 +3951,7 @@ function clearAllItems() {
     disposeSharedItem(id, { deleted: true, broadcast: true });
   }
   pendingTextSync.clear();
-  remoteTransferStatuses.clear();
-  transferStatusPublishTimes.clear();
+  clearAllTransferStatuses();
   editTimers.forEach(clearTimeout);
   editTimers.clear();
   document.getElementById('cards').innerHTML = '';
@@ -4140,8 +4235,8 @@ function setDot(state) {
 
 function sendPriorityJson(msg) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify(msg));
-  return true;
+  try { ws.send(JSON.stringify(msg)); return true; }
+  catch { return false; }
 }
 
 function setPeerCompatibility(peerId, status) {
@@ -4375,12 +4470,17 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
   } else if (payload.type === 'sync_request') {
     if (senderId) sendSyncState(senderId, payload.itemId || null);
   } else if (payload.type === 'transfer_status') {
-    if (payload.sourceId === senderId || payload.targetId === senderId) applyRemoteTransferStatus(payload);
+    if (payload.sourceId === senderId || payload.targetId === senderId) applyRemoteTransferStatus(payload, senderId);
   } else if (payload.type === 'item_added') {
     const item = markEncrypted(payload.item);
     if (!item || !ClipShareTransfers.validId(item.id) || deletedItemIds.has(item.id)) return;
     pendingTextSync.delete(item.id);
     if (item.type !== 'text') return;
+    if (typeof item.content !== 'string') return;
+    const existing = items.get(item.id);
+    if (existing && ClipShareTransfers.compareContentVersions(item, existing) > 0) {
+      applyTextContentChange(existing, item, payloadKey);
+    }
     if (!items.has(item.id)) {
       if (payloadKey) cardEncryptionKeys.set(item.id, payloadKey);
       items.set(item.id, item);
@@ -4389,15 +4489,15 @@ function handlePayload(payload, receivedEncrypted = false, payloadKey = null, se
       publishClientCardMetadata(item);
     }
   } else if (payload.type === 'item_deleted') {
-    if (ClipShareTransfers.validId(payload.itemId)) disposeSharedItem(payload.itemId, { deleted: true });
+    if (ClipShareTransfers.validId(payload.itemId)) disposeSharedItem(payload.itemId, {
+      deleted: true, change: ClipShareTransfers.contentVersion(payload),
+    });
   } else if (payload.type === 'item_updated') {
     if (deletedItemIds.has(payload.itemId)) return;
     const item = items.get(payload.itemId);
     if (!item || item.type !== 'text' || typeof payload.content !== 'string') return;
-    if (payloadKey) cardEncryptionKeys.set(payload.itemId, payloadKey);
-    item.content = payload.content;
-    const el = cardElement(payload.itemId)?.querySelector('.text-content');
-    if (el && document.activeElement !== el) el.innerHTML = linkify(payload.content);
+    if (ClipShareTransfers.compareContentVersions(payload, item) <= 0) return;
+    applyTextContentChange(item, payload, payloadKey);
   } else if (payload.type === 'webrtc_offer') return handleWebRtcOffer(payload, senderId);
   else if (payload.type === 'webrtc_answer') return handleWebRtcAnswer(payload, senderId);
   else if (payload.type === 'webrtc_ice') return handleWebRtcIce(payload, senderId);
@@ -4494,6 +4594,7 @@ function addAndBroadcast(item) {
     return;
   }
   item.encrypted = true;
+  Object.assign(item, nextItemChange(item));
   const itemKey = encryptionKey;
   if (item.type !== 'text') {
     const geometry = ClipShareTransfers.geometry(item);
@@ -4569,7 +4670,7 @@ function onIncomingTransfer(record) {
 function onOutgoingTransfer(itemId, peerId, record) {
   refreshOutboundUI(itemId);
   if (record) {
-    publishTransferStatus({ itemId, sourceId: clientId, targetId: peerId,
+    publishTransferStatus({ itemId, transferId: record.transferId, sourceId: clientId, targetId: peerId,
       current: record.currentChunk, done: record.sent, total: record.total,
       transport: record.transport, status: record.complete ? 'done' : 'active', force: record.complete });
     if (record.complete) {
@@ -4613,6 +4714,7 @@ function updateTransferProgress(itemId, fraction, transfer) {
   if (transfer?.senderId) {
     publishTransferStatus({
       itemId,
+      transferId: transfer.transferId,
       sourceId: transfer.senderId,
       targetId: clientId,
       current: transfer.currentChunk || transfer.received || 0,
@@ -4621,7 +4723,7 @@ function updateTransferProgress(itemId, fraction, transfer) {
       chunkRuns: transferChunkRunsFromSources(transfer.chunkSources, transfer.totalChunks),
       transport: transfer.transport || '',
       status: pct >= 100 ? 'done' : 'active',
-      force: pct >= 100,
+      force: transfer.state === 'assembling' || transfer.state === 'complete',
     });
   }
   schedulePeersModalRefresh();
@@ -4653,7 +4755,8 @@ function refreshOutboundUI(itemId) {
   section.className = 'outbound-progress';
   let html = '<div class="outbound-progress-title">Sending…</div>';
   for (const [key, p] of peerMap) {
-    const pct = p.complete ? 100 : Math.min(99, transferPercentFromCounts(p.sent, p.total));
+    const display = outgoingDisplayProgress(itemId, key, p);
+    const pct = display.complete ? 100 : Math.min(99, transferPercentFromCounts(display.done, display.total));
     html += `<div class="outbound-peer-row">
       <div class="outbound-peer-label transfer-peer-slot">${peerIconStackHtml([key], 'transfer-peer-icons-inline')}</div>
       <div class="outbound-peer-progress"><div class="outbound-peer-fill" id="${escAttr(`ob-fill-${itemId}-${key}`)}" style="width:${pct}%"></div></div>
@@ -4672,6 +4775,14 @@ function refreshOutboundUI(itemId) {
 }
 
 // ── Text editing ─────────────────────────────────────────────────────
+function applyTextContentChange(item, update, key) {
+  Object.assign(item, { content: update.content }, ClipShareTransfers.contentVersion(update));
+  if (key) cardEncryptionKeys.set(item.id, key);
+  const el = cardElement(item.id)?.querySelector('.text-content');
+  if (el && document.activeElement !== el) el.innerHTML = linkify(item.content);
+  publishClientCardMetadata(item);
+}
+
 function onTextFocus(id, el) {
   const item = items.get(id);
   if (!item) return;
@@ -4695,7 +4806,9 @@ function onTextBlur(id, el) {
 function onTextEdit(id, el) {
   const item = items.get(id);
   if (!item) return;
+  if (item.content === el.innerText) return;
   item.content = el.innerText;
+  Object.assign(item, nextItemChange(item));
   clearTimeout(editTimers.get(id));
   editTimers.set(id, setTimeout(() => {
     flushTextUpdate(id);
@@ -4707,7 +4820,10 @@ function flushTextUpdate(id) {
   if (!item || item.type !== 'text') return;
   clearTimeout(editTimers.get(id));
   editTimers.delete(id);
-  wsSend({ type: 'relay', payload: { type: 'item_updated', itemId: id, content: item.content } }, cardEncryptionKeys.get(id));
+  const update = { type: 'item_updated', itemId: id, content: item.content, ...ClipShareTransfers.contentVersion(item) };
+  wsSend({ type: 'relay', payload: update }, cardEncryptionKeys.get(id), false,
+    () => items.get(id) === item && ClipShareTransfers.compareContentVersions(item, update) === 0 && !deletedItemIds.has(id));
+  publishClientCardMetadata(item);
 }
 
 function textContentLinkFromEvent(event, textEl) {
@@ -4737,15 +4853,18 @@ function removeCardAnimated(id, done) {
   el.addEventListener('animationend', () => { el.remove(); done?.(); }, { once: true });
 }
 
-function disposeSharedItem(id, { deleted = false, broadcast = false } = {}) {
+function disposeSharedItem(id, { deleted = false, broadcast = false, change = null } = {}) {
   const item = items.get(id);
   const key = cardEncryptionKeys.get(id) || encryptionKey;
   if (deleted) {
+    const previous = deletedItemChanges.get(id);
+    const deletionChange = change || previous || nextItemChange(item || { ...roomManifest.get(id)?.meta, id });
+    if (!previous || ClipShareTransfers.compareContentVersions(deletionChange, previous) > 0) deletedItemChanges.set(id, deletionChange);
     deletedItemIds.add(id);
     removeManifestMeta(id, nextManifestRevision(id));
     if (broadcast) {
       publishClientCardRemoval(id, 'local-delete');
-      wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id } }, key);
+      wsSend({ type: 'relay', payload: { type: 'item_deleted', itemId: id, ...deletedItemChanges.get(id) } }, key);
     }
   }
   transferCoordinator.cancelFile(id, deleted);

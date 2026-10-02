@@ -49,6 +49,10 @@ PAIRING_REQUEST_MIN_INTERVAL_MS = 5_000
 PAIRING_MAX_UNUSED_PINS = 5
 PAIRING_PIN_TIMEOUT_MS = 60_000
 INDEX_ASSET_PATHS = (
+    "/static/favicon.ico",
+    "/static/apple-touch-icon.png",
+    "/static/logo.svg",
+    "/static/logo-mark.svg",
     "/static/icon.svg",
     "/static/icon-maskable.svg",
     "/static/style.css",
@@ -344,10 +348,8 @@ class ConnectionManager:
         ]
 
     def _manifest_records(self, token: str):
-        return [
-            record for record in self.manifest.get(token, {}).values()
-            if not record.get("deleted")
-        ]
+        # Reconnecting clients may still hold files deleted while they were asleep.
+        return list(self.manifest.get(token, {}).values())
 
     def _clean_manifest_record(self, msg: dict, owner_id: str):
         item_id = msg.get("itemId")
@@ -356,11 +358,19 @@ class ConnectionManager:
         revision = msg.get("revision")
         if type(revision) is not int or revision < 0 or revision > 9007199254740991:
             return None
+        changed_at = msg.get("lastChangedAt", 0)
+        changed_by = msg.get("lastChangedBy", "")
+        if type(changed_at) is not int or not 0 <= changed_at <= 9007199254740991:
+            return None
+        if changed_by != "" and not valid_id(changed_by):
+            return None
         record = {
             "itemId": str(item_id),
             "ownerId": owner_id,
             "holders": [owner_id],
             "revision": int(revision),
+            "lastChangedAt": changed_at,
+            "lastChangedBy": changed_by,
             "updatedAt": msg.get("updatedAt") if type(msg.get("updatedAt")) is int else 0,
             "deleted": bool(msg.get("deleted")),
         }
@@ -377,9 +387,20 @@ class ConnectionManager:
         existing = records.get(record["itemId"])
         if existing and existing.get("deleted") and not record.get("deleted"):
             return
-        if existing and int(existing.get("revision") or 0) > record["revision"]:
-            return
-        if existing and not record.get("deleted"):
+        content_version = lambda value: (value.get("lastChangedAt", 0), value.get("lastChangedBy", ""))
+        if record.get("deleted"):
+            # Explicit deletion is final, even when an offline device has an older
+            # revision or a slower clock than another holder.
+            record["revision"] = max(record["revision"], int((existing or {}).get("revision") or 0))
+            record["holders"] = []
+            if existing and existing.get("deleted") and content_version(existing) > content_version(record):
+                record["lastChangedAt"] = existing["lastChangedAt"]
+                record["lastChangedBy"] = existing["lastChangedBy"]
+        elif existing:
+            if content_version(record) < content_version(existing):
+                return
+            record["revision"] = max(record["revision"], int(existing.get("revision") or 0))
+        if existing and not record.get("deleted") and content_version(record) == content_version(existing):
             holders = set(existing.get("holders") or [])
             holders.add(sender_id)
             record["holders"] = sorted(holders)
@@ -581,6 +602,8 @@ class ConnectionManager:
             await self._store_manifest_record(token, sender_id, {
                 "itemId": msg.get("itemId"),
                 "revision": msg.get("revision"),
+                "lastChangedAt": msg.get("lastChangedAt", 0),
+                "lastChangedBy": msg.get("lastChangedBy", ""),
                 "updatedAt": msg.get("updatedAt"),
                 "deleted": True,
             })

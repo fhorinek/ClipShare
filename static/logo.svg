@@ -1,7 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ClipShare">
-  <style>.file-one{fill:#fff}.file-two{fill:#2584ff}</style>
-  <rect width="512" height="512" fill="#102e62"/>
-  <g transform="translate(97.76 144.2) scale(.86)"><g id="file-exchange">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 168" role="img" aria-label="ClipShare">
+<style>
+    .file-one { fill: #084fa8; }
+    .file-two { fill: #a0d0ff; }
+    @media (prefers-color-scheme: dark) {
+      .file-one { fill: #fff; }
+      .file-two { fill: #2584ff; }
+    }
+  </style>
+  <style>.wordmark{fill:#202124}@media(prefers-color-scheme:dark){.wordmark{fill:#fff}}</style>
+  <g transform="translate(2 6) scale(.58)"><g id="file-exchange">
     <g class="file-one">
       <path d="M24 8H92Q96 8 96 12V46Q96 54 104 54H142Q150 54 150 62V86H134Q126 86 126 94V134H96Q88 134 88 142V180Q88 188 96 188H126V208Q126 222 112 222H24Q10 222 10 208V22Q10 8 24 8Z"/>
       <path d="M108 8Q106 8 106 12V42Q106 46 110 46H142Q148 46 144 42L112 10Q110 8 108 8Z"/>
@@ -15,4 +22,5 @@
       <rect x="166" y="194" width="52" height="34" rx="4"/>
     </g>
   </g></g>
+  <text class="wordmark" x="238" y="118" font-family="Arial, sans-serif" font-size="104" font-weight="700" letter-spacing="-4">Clip<tspan fill="#1a73e8">Share</tspan></text>
 </svg>
