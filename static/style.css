@@ -2326,3 +2326,14 @@ input.token-modal-value:focus {
   }
 
 }
+
+.build-update-notice {
+  position: fixed; top: 12px; left: 12px; right: 12px; z-index: 10000;
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 14px; background: #132b46; color: #fff; border-radius: 12px;
+  box-shadow: 0 4px 20px #0004;
+}
+.build-update-notice button {
+  background: #fff; color: #132b46; border: 0; border-radius: 6px;
+  padding: 8px 14px; cursor: pointer; font-weight: 600;
+}

@@ -3,7 +3,7 @@ import json
 import struct
 import unittest
 
-from main import ConnectionManager, app
+from main import ConnectionManager, app, APP_BUILD_ID, _asset_version
 from fastapi.testclient import TestClient
 
 
@@ -267,12 +267,43 @@ class ProtocolTests(unittest.TestCase):
 
     def test_control_and_data_connections_accept_v2(self):
         with TestClient(app) as client:
-            with client.websocket_connect('/ws/test?clientId=client&protocolVersion=2') as ws:
+            with client.websocket_connect(f'/ws/test?clientId=client&protocolVersion=2&buildId={APP_BUILD_ID}') as ws:
                 self.assertEqual(ws.receive_json()['type'], 'welcome')
-                with client.websocket_connect('/ws/test?clientId=client&channel=data&protocolVersion=2') as data:
+                with client.websocket_connect(f'/ws/test?clientId=client&channel=data&protocolVersion=2&buildId={APP_BUILD_ID}') as data:
                     data.send_bytes(b'bad')
                 ws.send_text(json.dumps({'type': 'metadata_snapshot_request'}))
                 self.assertIn('manifest', ws.receive_json())
+
+    def test_missing_and_stale_builds_require_refresh_on_all_channels(self):
+        with TestClient(app) as client:
+            for channel in ("control", "data"):
+                for build in ("", "&buildId=old"):
+                    with client.websocket_connect(f'/ws/test?protocolVersion=2&channel={channel}{build}') as ws:
+                        self.assertEqual(ws.receive_json(), {"type": "refresh_required", "buildId": APP_BUILD_ID})
+                        self.assertEqual(ws.receive()["code"], 1008)
+
+    def test_build_endpoint_and_page_share_uncached_build_identity(self):
+        with TestClient(app) as client:
+            build = client.get('/build')
+            page = client.get('/')
+            self.assertEqual(build.json(), {"buildId": APP_BUILD_ID})
+            self.assertIn('no-store', build.headers['cache-control'])
+            self.assertIn(f'content="{APP_BUILD_ID}"', page.text)
+            self.assertIn('no-store', page.headers['cache-control'])
+
+    def test_asset_versions_track_bytes_even_when_mtime_is_unchanged(self):
+        import tempfile
+        import os
+        from pathlib import Path
+        with tempfile.NamedTemporaryFile(dir=Path(__file__).parent.parent / 'static') as asset:
+            asset.write(b'first'); asset.flush()
+            path = Path(asset.name)
+            stamp = path.stat().st_mtime_ns
+            url = '/static/' + path.name
+            first = _asset_version(url)
+            path.write_bytes(b'other')
+            os.utime(path, ns=(stamp, stamp))
+            self.assertNotEqual(first, _asset_version(url))
 
     def test_new_asset_is_versioned(self):
         with TestClient(app) as client:

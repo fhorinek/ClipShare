@@ -48,17 +48,6 @@ def valid_binary_header(header):
 PAIRING_REQUEST_MIN_INTERVAL_MS = 5_000
 PAIRING_MAX_UNUSED_PINS = 5
 PAIRING_PIN_TIMEOUT_MS = 60_000
-INDEX_ASSET_PATHS = (
-    "/static/favicon.ico",
-    "/static/apple-touch-icon.png",
-    "/static/logo.svg",
-    "/static/logo-mark.svg",
-    "/static/icon.svg",
-    "/static/icon-maskable.svg",
-    "/static/style.css",
-    "/static/app.js",
-    "/static/transfer-core.js",
-)
 MANIFEST_PATH = "/static/manifest.webmanifest"
 WEBRTC_ICE_SERVERS_ENV = "WEBRTC_ICE_SERVERS_JSON"
 TURN_ENV_PATH = STATIC_DIR.parent / ".turn.env"
@@ -784,19 +773,39 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-def _asset_version(asset_path: str) -> int:
-    path = STATIC_DIR.parent / asset_path.lstrip("/")
+def _asset_version(asset_path: str) -> str:
+    root = STATIC_DIR.parent if asset_path.startswith("/static/") else STATIC_DIR
+    path = root / asset_path.lstrip("/")
     try:
-        return int(path.stat().st_mtime)
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
     except OSError:
-        return 0
+        return "missing"
+
+
+def _build_id() -> str:
+    digest = hashlib.sha256()
+    paths = [Path(__file__), *(path for path in STATIC_DIR.rglob("*") if path.is_file())]
+    for path in sorted(paths):
+        digest.update(str(path.relative_to(STATIC_DIR.parent)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:20]
+
+
+# Deploy assets and server together, then restart every worker.
+APP_BUILD_ID = _build_id()
 
 
 def render_index() -> HTMLResponse:
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    for asset_path in INDEX_ASSET_PATHS:
-        html = html.replace(asset_path, f"{asset_path}?v={_asset_version(asset_path)}")
-    html = html.replace(MANIFEST_PATH, f"/manifest.webmanifest?v={_asset_version(MANIFEST_PATH)}")
+    html = html.replace("__CLIPSHARE_BUILD__", APP_BUILD_ID)
+    html = re.sub(
+        r'(?:/static|/vendor|/fonts)/[^"\s<>]+',
+        lambda match: f"{match[0]}?v={_asset_version(match[0])}",
+        html,
+    )
+    html = html.replace(f"{MANIFEST_PATH}?v=", "/manifest.webmanifest?v=")
     return HTMLResponse(html, headers=NO_CACHE_HEADERS)
 
 
@@ -897,6 +906,11 @@ async def pairing_hosts(token_path: str):
     )
 
 
+@app.get("/build")
+async def build_info():
+    return Response(json.dumps({"buildId": APP_BUILD_ID}), media_type="application/json", headers=NO_CACHE_HEADERS)
+
+
 @app.get("/{token_path:path}")
 async def index_with_token(token_path: str):
     return render_index()
@@ -908,11 +922,17 @@ async def websocket_endpoint(
     clientId: Optional[str] = None,
     channel: str = "control",
     protocolVersion: Optional[str] = None,
+    buildId: Optional[str] = None,
 ):
     if protocolVersion != str(TRANSFER_PROTOCOL_VERSION):
         await ws.accept()
         await ws.send_json({"type": "refresh_required", "protocolVersion": TRANSFER_PROTOCOL_VERSION})
         await ws.close(code=1008, reason="Refresh ClipShare to use transfer protocol 2")
+        return
+    if buildId != APP_BUILD_ID:
+        await ws.accept()
+        await ws.send_json({"type": "refresh_required", "buildId": APP_BUILD_ID})
+        await ws.close(code=1008, reason="Refresh ClipShare to use the latest build")
         return
     client_id = clientId or str(uuid.uuid4())
     if not valid_id(client_id):

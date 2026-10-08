@@ -142,3 +142,21 @@ The browser runner uses temporary fixtures and downloads and closes its server a
 contexts afterwards. It does not connect to a deployed room. Existing diagnostics
 include a coordinator snapshot with states, request IDs, attempts, sources, queues
 and actual transport. Unrelated metrics publishing remains deferred.
+
+
+## Client build updates
+
+Deploy the server and assets together and restart every worker. The server hashes
+its code and bundled assets into one build identity, embedded in the uncached HTML
+and returned by the uncached `/build` endpoint. Asset URLs use content hashes.
+All control, data, and pairing sockets carry the build identity; missing or stale
+identities receive `refresh_required` and are closed before entering a room.
+
+Visible tabs check on startup, foreground, connectivity recovery, reconnect, and
+every 30 seconds. Empty tabs outside rooms refresh automatically. Tabs in a room
+or holding cards, chat, deletion intents, or pairing state show one persistent
+refresh notice. Refreshing discards browser-memory files, so these tabs wait for
+the user to save files and click Refresh. Existing live sockets may finish their
+work until reconnect; this is not an instantaneous forced shutdown of open tabs.
+No service worker or wholesale browser-cache clearing is needed. An older build
+without the update checker learns about the update on its next reconnect.

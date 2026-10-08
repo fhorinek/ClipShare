@@ -474,6 +474,36 @@ async function downloaded(page, name, expected) {
   });
   assert.equal(digest, createHash('sha256').update(large).digest('hex'));
   console.log('PASS: 128 MB boundary file matches downloaded bytes and digest');
+  // A deployment notice must preserve the sole copy until the user chooses refresh.
+  await r2.route('**/build', route => route.fulfill({ json: { buildId: 'next-build' } }));
+  const retained = await r2.evaluate(async () => {
+    const item = [...items.values()].find(item => item.filename === 'relay.bin');
+    const buffer = item.rawBuffer;
+    await checkClientBuild();
+    await checkClientBuild();
+    return { sameBuffer: items.get(item.id).rawBuffer === buffer,
+      notices: document.querySelectorAll('.build-update-notice').length };
+  });
+  assert.deepEqual(retained, { sameBuffer: true, notices: 1 });
+  const staleBuild = await r3.evaluate(() => new Promise(resolve => {
+    const socket = new WebSocket(`${location.origin.replace('http', 'ws')}/ws/stale-test?protocolVersion=2&buildId=old`);
+    socket.onmessage = event => resolve(JSON.parse(event.data));
+  }));
+  assert.equal(staleBuild.type, 'refresh_required');
+  assert.equal(typeof staleBuild.buildId, 'string');
+  const emptyContext = await browser.newContext(); contexts.push(emptyContext);
+  const emptyPage = await emptyContext.newPage();
+  emptyPage.on('pageerror', error => errors.push(error.message));
+  await emptyPage.goto(origin);
+  await emptyPage.waitForFunction(() => !buildCheckPending);
+  await emptyPage.route('**/build', route => route.fulfill({ json: { buildId: 'next-build' } }), { times: 1 });
+  await Promise.all([
+    emptyPage.waitForEvent('load'),
+    emptyPage.evaluate(() => { checkClientBuild(); }),
+  ]);
+  await emptyPage.waitForFunction(() => !buildCheckPending);
+  assert.equal(await emptyPage.locator('.build-update-notice').count(), 0);
+  console.log('PASS: stale builds are rejected; updates preserve shared files and refresh empty tabs');
   assert.deepEqual(errors, []);
 })().catch(async error => {
   console.error(error);

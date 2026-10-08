@@ -1,5 +1,40 @@
 // ── Utilities ────────────────────────────────────────────────────────
-const CLIENT_DIAGNOSTIC_BUILD = 'transfer-coordinator-v2-content-timestamps';
+const CLIENT_BUILD_ID = document.querySelector('meta[name="clipshare-build"]')?.content || '';
+const CLIENT_DIAGNOSTIC_BUILD = CLIENT_BUILD_ID;
+let buildCheckPending = false;
+let updateRequired = false;
+
+function requireClientRefresh() {
+  if (updateRequired) return;
+  updateRequired = true;
+  if (!items.size && !chatMessages.length && !deletedItemIds.size && !token && !pairingHostWs && !pairingJoinWs) {
+    location.reload();
+    return;
+  }
+  const notice = document.createElement('div');
+  notice.className = 'build-update-notice';
+  notice.setAttribute('role', 'alert');
+  const text = document.createElement('span');
+  text.textContent = 'ClipShare has been updated. Save your shared files before refreshing.';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = 'Refresh';
+  button.addEventListener('click', () => location.reload());
+  notice.append(text, button);
+  document.body.append(notice);
+}
+
+async function checkClientBuild() {
+  if (buildCheckPending || updateRequired || document.hidden) return;
+  buildCheckPending = true;
+  try {
+    const response = await fetch('/build', { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    if (!response.ok) return;
+    const info = await response.json();
+    if (typeof info.buildId === 'string' && info.buildId !== CLIENT_BUILD_ID) requireClientRefresh();
+  } catch { /* Reconnect and foreground checks will try again when the server returns. */ }
+  finally { buildCheckPending = false; }
+}
 
 function randomUUID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -2236,6 +2271,9 @@ const chunkScheduler = transferCoordinator.scheduler;
 
 // ── Startup ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  checkClientBuild();
+  setInterval(checkClientBuild, 30000);
+  window.addEventListener('online', checkClientBuild);
   if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
     document.getElementById('https-warning').style.display = 'block';
   }
@@ -2633,7 +2671,7 @@ function startPairingUiTimer() {
 
 function pairingSocketUrl(tokenValue) {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${location.host}/ws/${encodeURIComponent(tokenValue)}?clientId=${clientId}&channel=control&protocolVersion=2`;
+  return `${protocol}://${location.host}/ws/${encodeURIComponent(tokenValue)}?clientId=${clientId}&channel=control&protocolVersion=2&buildId=${encodeURIComponent(CLIENT_BUILD_ID)}`;
 }
 
 function activePairingSocket() {
@@ -2656,6 +2694,7 @@ function closePairingHostSocket() {
 }
 
 function ensurePairingHostSocket(tokenValue) {
+  if (updateRequired) return;
   if (ws?.readyState === WebSocket.OPEN) return;
   if (pairingHostWs && pairingHostWs.readyState <= WebSocket.OPEN) return;
   pairingHostWs = new WebSocket(pairingSocketUrl(tokenValue));
@@ -2823,6 +2862,7 @@ async function requestPairingWithHosts() {
 }
 
 async function handlePairingJoinMessage(msg) {
+  if (msg?.type === 'refresh_required') { requireClientRefresh(); return; }
   if (msg.type === 'welcome' || msg.type === 'pairing_hosts') {
     updatePairingHosts(msg.pairingHosts || msg.hosts || []);
     await requestPairingWithHosts();
@@ -3889,6 +3929,7 @@ function closePeersModal() {
 }
 
 function checkForegroundFreshness() {
+  checkClientBuild();
   if (!token || !ws || ws.readyState !== WebSocket.OPEN || document.hidden) return;
   if (Date.now() - lastForegroundCheckAt < 2000) return;
   lastForegroundCheckAt = Date.now();
@@ -4144,12 +4185,12 @@ function addEncryptedPlaceholder(encryptedData, meta = {}) {
 }
 
 function connectDataWS() {
-  if (!token || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (updateRequired || !token || !ws || ws.readyState !== WebSocket.OPEN) return;
   if (dataWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(dataWs.readyState)) return;
   if (dataWsRetryTimer) { clearTimeout(dataWsRetryTimer); dataWsRetryTimer = null; }
   const generation = roomGeneration;
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}&channel=data&protocolVersion=2`;
+  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(token)}?clientId=${clientId}&channel=data&protocolVersion=2&buildId=${encodeURIComponent(CLIENT_BUILD_ID)}`;
   const socket = new WebSocket(url);
   dataWs = socket;
   socket.binaryType = 'arraybuffer';
@@ -4161,6 +4202,9 @@ function connectDataWS() {
     refreshTransferSources();
   };
   socket.onmessage = event => {
+    if (live() && typeof event.data === 'string') {
+      try { if (JSON.parse(event.data)?.type === 'refresh_required') requireClientRefresh(); } catch {}
+    }
     if (live() && event.data instanceof ArrayBuffer) {
       handleBinaryMessage(event.data, 'ws').catch(error => debugLog('binary-receive-error', { error: error.message }));
     }
@@ -4176,13 +4220,14 @@ function connectDataWS() {
 }
 
 async function connectWS() {
-  if (!token) return;
+  if (!token || updateRequired) return;
+  checkClientBuild();
   if (ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(ws.readyState)) return;
   if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
   const generation = roomGeneration;
   const roomToken = token;
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(roomToken)}?clientId=${clientId}&channel=control&protocolVersion=2`;
+  const url = `${protocol}://${location.host}/ws/${encodeURIComponent(roomToken)}?clientId=${clientId}&channel=control&protocolVersion=2&buildId=${encodeURIComponent(CLIENT_BUILD_ID)}`;
   const passphrase = currentPassphrase || localStorage.getItem('clipshare_passphrase');
   const key = passphrase ? await deriveKey(passphrase, roomToken) : null;
   if (generation !== roomGeneration || token !== roomToken) return;
@@ -4309,7 +4354,7 @@ async function wsSend(msg, keyOverride = null, priority = false, live = () => tr
 async function handleServerMessage(msg, generation = roomGeneration) {
   if (!msg || typeof msg !== 'object' || Array.isArray(msg) || generation !== roomGeneration) return;
   if (msg.type === 'refresh_required') {
-    showToast('ClipShare was updated. Refresh this page to continue.');
+    requireClientRefresh();
     if (ws) ws.onclose = null;
     setDot('error');
     return;
